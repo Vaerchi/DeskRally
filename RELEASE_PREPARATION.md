@@ -22,10 +22,11 @@
 
 - Complete the application migration and verify the published source can be built as documented.
 - Rotate the exposed historical lab credential and address any reused credentials. A fresh repository does not revoke credentials.
-- Select the project license and preserve required attribution.
+- Apply the selected Apache 2.0 license to original work and preserve required third-party attribution; complete the dependency review in `LICENSING.md`.
 - Establish a private security-reporting route and contribution guidance.
 - Review all pages and exported assets, then add the public GitHub URL to the website.
 - Configure the project apex/www domains deliberately; avoid changing an existing application route.
+- Host the project website on Cloudflare Pages Free, configuring Access protection before making any future private draft deployments available. Follow `website/CLOUDFLARE.md`.
 - Enable indexing for the final public website if desired.
 
-The website and repository remain private during this preparation. No historical private documentation or application source is included in this initial batch.
+The repository remains private during this preparation. The reviewed project website is authorized for public hosting. No historical private documentation or application source is included in this initial batch.

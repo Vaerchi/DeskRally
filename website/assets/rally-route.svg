@@ -1,4 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="520" viewBox="0 0 800 520" fill="none">
+<!-- Copyright 2026 DeskRally contributors. SPDX-License-Identifier: Apache-2.0 -->
   <defs>
     <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" stroke="#53736c" stroke-opacity=".2"/></pattern>
     <pattern id="finish" width="20" height="20" patternUnits="userSpaceOnUse"><path fill="#f4f1e8" d="M0 0h20v20H0z"/><path fill="#13283e" d="M0 0h10v10H0zm10 10h10v10H10z"/></pattern>

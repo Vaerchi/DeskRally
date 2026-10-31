@@ -16,4 +16,4 @@ Build the website with `python website/build.py`. The output is `website/dist/`.
 
 The application source has not yet been migrated into this repository. Website content and documentation are the first reviewed batch. See `RELEASE_PREPARATION.md` for the remaining work. This repository is not yet a complete application source release, and the website does not advertise a public installer or claim that a public source release is available.
 
-Keep this repository private until the source, attribution, licensing, credentials, and final release artifact have been reviewed. No open-source license has been selected here yet.
+Keep this repository private until the source, attribution, licensing, credentials, and final release artifact have been reviewed. Apache License 2.0 is selected for original project work; see `LICENSE`, `NOTICE`, and `LICENSING.md`. Third-party components retain their own terms.
