@@ -33,7 +33,7 @@ The license does not grant a general right to use project trade names or tradema
 
 The site may describe Apache 2.0 as the chosen project license, while stating honestly that the public source release is still being prepared. The repository remains private during this work. No license choice changes repository or website access settings.
 
-Before public release, review the complete source and distributions, required notices, reporting route, and ownership questions. A Florida-qualified attorney can advise on the specific liability and hosting situation; this plan is not a legal opinion.
+Before public release, review the complete source and distributions, required notices, reporting route, and ownership questions. A qualified attorney in the relevant jurisdiction can advise on the specific liability and hosting situation; this plan is not a legal opinion.
 
 Official references:
 
