@@ -1,15 +1,9 @@
-# Project website deployment
+# Product deployment documentation
 
-The project website is public on Cloudflare Pages using static assets only. No paid services or plan upgrades were enabled for this launch.
+The reviewed product-source import will include server, client, self-hosted web-console and deployment instructions together with the matching application source.
 
-- Primary domain: https://deskrally.com
-- Alternate domain: https://www.deskrally.com
-- Pages address: https://deskrally.pages.dev
-- Deployment mode: Direct Upload, with no automatic Git deployment configured.
-- Source directory: `website/`; build with `python3 build.py` and deploy only `website/dist/`.
+Public installation and technical guides are published at https://www.deskrally.com/docs/. Their source revision is displayed on the page so an operator can match instructions to the development snapshot or selected release. The website contains introductory guides, Docker/native server installation, the full build reference, configuration variables, backups and connection troubleshooting.
 
-Both custom domains are active in Cloudflare, and valid HTTPS plus the expected homepage content were verified using public DNS answers. The local resolver retained older negative answers during verification; this does not affect the Pages address.
+The project website is maintained independently at https://github.com/Vaerchi/DeskRally-Website. That repository owns its static-site build and Cloudflare Pages deployment procedure. Documentation updates are exported from an explicit publication list at a reviewed source revision, checked and published with the website.
 
-The account's existing Cloudflare Pages Git integration returned error 8000011, so it was left untouched. See `website/CLOUDFLARE.md` for deployment and future automation notes. No credentials are stored in this repository.
-
-The GitHub repository remains private. Apache 2.0 is selected for original project work; application source migration and third-party review remain separate release-preparation tasks.
+The application import and final release validation are tracked in RELEASE_PREPARATION.md.
