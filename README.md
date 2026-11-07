@@ -4,6 +4,6 @@ This repository is being prepared for the reviewed DeskRally product release. It
 
 Application source migration is in progress. The current committed tree contains the release-preparation and licensing documents. Reviewed application batches will add their source, reproducible build instructions and required dependency notices.
 
-The public project website has a separate source repository at https://github.com/Vaerchi/DeskRally-Website. Its public documentation destination is https://www.deskrally.com/docs/. Introductory guides are live, and the expanded technical library is prepared for the next website deployment. The website publishes a reviewed documentation snapshot pinned to a product/development source revision, with the revision shown on each technical page.
+The public project website has a separate source repository at https://github.com/Vaerchi/DeskRally-Website. Its public documentation destination is https://www.deskrally.com/docs/. Introductory guides and the expanded technical library are live without a login. The website publishes a reviewed documentation snapshot pinned to a product/development source revision, with the revision shown on each technical page.
 
 Read RELEASE_PREPARATION.md for the remaining product-source work. Apache License 2.0 is selected for original project work. LICENSE, NOTICE and LICENSING.md cover the release's licensing and attribution preparation.
