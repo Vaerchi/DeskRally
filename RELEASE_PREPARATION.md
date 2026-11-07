@@ -3,9 +3,8 @@
 ## Completed initial batch
 
 - New private repository with fresh history.
-- Original project website and visitor documentation, written without private operational notes.
-- Portrait-free rally artwork and synthetic console illustration.
-- Website links checked; responsive rendering and documentation search checked.
+- Original project website and visitor documentation prepared and moved to the separate DeskRally-Website repository.
+- Public user guides and technical references are maintained by the website, using reviewed snapshots of the canonical product documentation.
 
 ## Before importing application code
 
@@ -18,15 +17,13 @@
 - Add working generic build/setup instructions and run the application checks against the exported tree.
 - Scan source and generated distributions for secrets and identifying information before each migration batch.
 
-## Before making the repository or site public
+## Before publishing the product source
 
 - Complete the application migration and verify the published source can be built as documented.
 - Rotate the exposed historical lab credential and address any reused credentials. A fresh repository does not revoke credentials.
 - Apply the selected Apache 2.0 license to original work and preserve required third-party attribution; complete the dependency review in `LICENSING.md`.
 - Establish a private security-reporting route and contribution guidance.
-- Review all pages and exported assets, then add the public GitHub URL to the website.
-- Configure the project apex/www domains deliberately; avoid changing an existing application route.
-- Host the project website on Cloudflare Pages Free, configuring Access protection before making any future private draft deployments available. Follow `website/CLOUDFLARE.md`.
-- Enable indexing for the final public website if desired.
+- Review the exported source and release assets, then give the website the public product repository URL.
+- Coordinate the website documentation snapshot with the selected product release.
 
-The repository remains private during this preparation. The reviewed project website is authorized for public hosting. No historical private documentation or application source is included in this initial batch.
+The product repository is private during release preparation. The separate website publishes the reviewed introductory and technical documentation. Application source migration continues through reviewed batches.

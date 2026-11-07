@@ -2,7 +2,7 @@
 
 ## Selected license
 
-Apache License 2.0 is selected for original DeskRally project work. The unmodified license text is in `LICENSE`, with project attribution in `NOTICE`. This includes the original website source, documentation, and vector artwork currently in this private repository, unless a file states otherwise.
+Apache License 2.0 is selected for original DeskRally product work. The unmodified license text is in `LICENSE`, with project attribution in `NOTICE`. The separately maintained DeskRally-Website repository carries its own project license and notices.
 
 Apache 2.0 is a permissive license. It permits commercial and noncommercial use and modification subject to its conditions, and includes explicit contributor patent terms, a warranty disclaimer, and a limitation of liability. It does not require downstream users to publish their modifications. The actual license text controls.
 
