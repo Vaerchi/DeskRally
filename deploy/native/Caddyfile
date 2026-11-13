@@ -1,0 +1,66 @@
+{$SITE_ADDRESS} {
+    @encodable not path /download/* /cp/recordings/*/download /cp/recordings/*/segments/*/stream
+    encode @encodable zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        Strict-Transport-Security "max-age=31536000"
+        # The console must never be framed: it holds a live remote-desktop session, so a clickjacked
+        # frame is a clickjacked mouse on a customer's machine (same headers as deploy/Caddyfile).
+        Content-Security-Policy "frame-ancestors 'none'"
+        X-Frame-Options "DENY"
+        # Observational only, as in deploy/Caddyfile, which explains each directive and when to enforce it.
+        Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self' wss: https:; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; report-uri /cp/csp-report"
+    }
+    @internal path /cp/internal /cp/internal/*
+    handle @internal {
+        respond 404
+    }
+    handle_path /cp/* {
+        # docs/63 R4: central recording routes (inert while storage is off; same reasoning as deploy/Caddyfile, which has the long
+        # version). Upload: one chunk is at most RecChunkSize = 1 MiB, so the cap is that plus 64 KiB (never lower than the server's
+        # own), and the transport outlasts the server's 3 minute chunk and 10 minute finish deadlines. Stream/download: no read or
+        # write timeout (a long video or ZIP), unbuffered. Everything else falls to the last handle, unchanged.
+        @recUpload path /agent/recordings /agent/recordings/*
+        handle @recUpload {
+            request_body {
+                max_size 1088KiB
+            }
+            reverse_proxy 127.0.0.1:8081 {
+                transport http {
+                    dial_timeout 5s
+                    write_timeout 4m
+                    response_header_timeout 12m
+                    read_timeout 12m
+                }
+            }
+        }
+        @recStream path_regexp recStream ^/recordings/[^/]+/(segments/[^/]+/stream|download)$
+        handle @recStream {
+            reverse_proxy 127.0.0.1:8081 {
+                flush_interval -1
+                transport http {
+                    dial_timeout 5s
+                    response_header_timeout 2m
+                }
+            }
+        }
+        handle {
+            reverse_proxy 127.0.0.1:8081
+        }
+    }
+    handle /ws {
+        reverse_proxy 127.0.0.1:8080
+    }
+    # Missing downloads must return 404, never the console HTML.
+    handle_path /download/* {
+        root * "{$DOWNLOAD_ROOT}"
+        file_server
+    }
+    handle {
+        root * "{$VIEWER_ROOT}"
+        try_files {path} {path}/ /index.html
+        header Cache-Control no-cache
+        file_server
+    }
+}

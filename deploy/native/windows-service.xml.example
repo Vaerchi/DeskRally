@@ -1,0 +1,20 @@
+<!-- Copy this file AND a trusted WinSW binary to the package root as
+     deskrally-controlplane.xml and deskrally-controlplane.exe.
+     Repeat for signaling/relay/caddy, changing id, name, -Service and the logpath folder.
+     Set the full PowerShell 7 path if it is not installed in the standard location.
+     Configure a dedicated service account using your Windows service management policy. -->
+<service>
+  <id>DeskRallyControlPlane</id>
+  <name>DeskRally Control Plane</name>
+  <description>DeskRally native control plane</description>
+  <executable>C:\Program Files\PowerShell\7\pwsh.exe</executable>
+  <arguments>-NoLogo -NoProfile -NonInteractive -File "%BASE%\run-service.ps1" -Service controlplane</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="5 sec" />
+  <stoptimeout>30 sec</stoptimeout>
+  <!-- The service account cannot write the (locked) installation folder, so logs go to a folder only it can write:
+       docs/guides/native-server.md "Keep Windows services running". Change the last part per service. -->
+  <logpath>C:\ProgramData\DeskRally\logs\controlplane</logpath>
+  <log mode="roll" />
+</service>

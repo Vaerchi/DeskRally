@@ -1,0 +1,1829 @@
+{
+ "_doc": "Golden vectors for the PUBLIC branding field rules (control-plane/brandtext.go). Read by control-plane/brandtext_golden_test.go AND web/viewer/src/lib/brand_text.test.ts so the console's inline validation cannot drift from the server's. Expected values were taken from the SERVER: where the two disagree the server is right and the console is the bug.",
+ "names": [
+  {
+   "input": "Acme Support",
+   "ok": true,
+   "normalized": "Acme Support"
+  },
+  {
+   "input": "  Acme   Support  ",
+   "ok": true,
+   "normalized": "Acme Support"
+  },
+  {
+   "input": "Acme\u00a0Support",
+   "ok": true,
+   "normalized": "Acme Support"
+  },
+  {
+   "input": "Cafe\u0301 IT",
+   "ok": true,
+   "normalized": "Caf\u00e9 IT"
+  },
+  {
+   "input": "A1B",
+   "ok": true,
+   "normalized": "A1B"
+  },
+  {
+   "input": "123",
+   "ok": true,
+   "normalized": "123"
+  },
+  {
+   "input": "\ud83d\ude00 Acme",
+   "ok": true,
+   "normalized": "\ud83d\ude00 Acme"
+  },
+  {
+   "input": "M\u00fcller IT",
+   "ok": true,
+   "normalized": "M\u00fcller IT"
+  },
+  {
+   "input": "Ab",
+   "ok": false,
+   "error": "must be 3 to 100 characters"
+  },
+  {
+   "input": "",
+   "ok": false,
+   "error": "must be 3 to 100 characters"
+  },
+  {
+   "input": "ababababababababababababababababababababababababababababababababababababababababababababababababababc",
+   "ok": false,
+   "error": "must be 3 to 100 characters"
+  },
+  {
+   "input": "!!!",
+   "ok": false,
+   "error": "must contain a letter or digit"
+  },
+  {
+   "input": "Acme\u202eSupport",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+202E)"
+  },
+  {
+   "input": "Acme\u200bSupport",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+200B)"
+  },
+  {
+   "input": "Acme\u00adSupport",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+00AD)"
+  },
+  {
+   "input": "Acme\ue000Support",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+E000)"
+  },
+  {
+   "input": "Acme\ufffdSupport",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+FFFD)"
+  },
+  {
+   "input": "Acme\u0378Support",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+0378)"
+  },
+  {
+   "input": "Acme\u2028Support",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+2028)"
+  },
+  {
+   "input": "Acme\tSupport",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+0009)"
+  },
+  {
+   "input": "Acme\nSupport",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+000A)"
+  },
+  {
+   "input": "Acmeeeeee Support",
+   "ok": false,
+   "error": "repeats one character more than 4 times in a row"
+  },
+  {
+   "input": "Acmeeee Support",
+   "ok": true,
+   "normalized": "Acmeeee Support"
+  },
+  {
+   "input": "q\u0303\u0302\u0301\u0300cme",
+   "ok": false,
+   "error": "has too many combining marks (at most 3 in a row, 8 in all)"
+  },
+  {
+   "input": "x\u0303\u0302 x\u0303\u0302 x\u0303\u0302 x\u0303\u0302 x\u0303\u0302 ",
+   "ok": false,
+   "error": "has too many combining marks (at most 3 in a row, 8 in all)"
+  },
+  {
+   "input": "\u4e00\u4e01\u4e02\u4e03\u4e04\u4e05\u4e06\u4e07\u4e08\u4e09\u4e0a\u4e0b\u4e0c\u4e0d\u4e0e\u4e0f\u4e10\u4e11\u4e12\u4e13\u4e14\u4e15\u4e16\u4e17\u4e18\u4e19\u4e1a\u4e1b\u4e1c\u4e1d\u4e1e\u4e1f\u4e20\u4e21\u4e22\u4e23\u4e24\u4e25\u4e26\u4e27\u4e28\u4e29\u4e2a\u4e2b\u4e2c\u4e2d\u4e2e\u4e2f\u4e30\u4e31\u4e32\u4e33\u4e34\u4e35\u4e36\u4e37\u4e38\u4e39\u4e3a\u4e3b\u4e3c",
+   "ok": false,
+   "error": "is too wide to display (estimated 122 cells, at most 120)"
+  },
+  {
+   "input": "\u4e00\u4e01\u4e02\u4e03\u4e04\u4e05\u4e06\u4e07\u4e08\u4e09\u4e0a\u4e0b\u4e0c\u4e0d\u4e0e\u4e0f\u4e10\u4e11\u4e12\u4e13\u4e14\u4e15\u4e16\u4e17\u4e18\u4e19\u4e1a\u4e1b\u4e1c\u4e1d\u4e1e\u4e1f\u4e20\u4e21\u4e22\u4e23\u4e24\u4e25\u4e26\u4e27\u4e28\u4e29\u4e2a\u4e2b\u4e2c\u4e2d\u4e2e\u4e2f\u4e30\u4e31\u4e32\u4e33\u4e34\u4e35\u4e36\u4e37\u4e38\u4e39\u4e3a\u4e3b",
+   "ok": true,
+   "normalized": "\u4e00\u4e01\u4e02\u4e03\u4e04\u4e05\u4e06\u4e07\u4e08\u4e09\u4e0a\u4e0b\u4e0c\u4e0d\u4e0e\u4e0f\u4e10\u4e11\u4e12\u4e13\u4e14\u4e15\u4e16\u4e17\u4e18\u4e19\u4e1a\u4e1b\u4e1c\u4e1d\u4e1e\u4e1f\u4e20\u4e21\u4e22\u4e23\u4e24\u4e25\u4e26\u4e27\u4e28\u4e29\u4e2a\u4e2b\u4e2c\u4e2d\u4e2e\u4e2f\u4e30\u4e31\u4e32\u4e33\u4e34\u4e35\u4e36\u4e37\u4e38\u4e39\u4e3a\u4e3b"
+  }
+ ],
+ "texts": [
+  {
+   "input": "",
+   "ok": true,
+   "normalized": ""
+  },
+  {
+   "input": "   ",
+   "ok": true,
+   "normalized": ""
+  },
+  {
+   "input": "Call us any time",
+   "ok": true,
+   "normalized": "Call us any time"
+  },
+  {
+   "input": "Line one\r\nLine two",
+   "ok": true,
+   "normalized": "Line one\nLine two"
+  },
+  {
+   "input": "  padded  \n\n  text  ",
+   "ok": true,
+   "normalized": "padded\n\ntext"
+  },
+  {
+   "input": "a\nb\nc\nd",
+   "ok": true,
+   "normalized": "a\nb\nc\nd"
+  },
+  {
+   "input": "a\nb\nc\nd\ne",
+   "ok": false,
+   "error": "must be at most 4 lines"
+  },
+  {
+   "input": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij",
+   "ok": true,
+   "normalized": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+  },
+  {
+   "input": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghija",
+   "ok": false,
+   "error": "must be 0 to 280 characters"
+  },
+  {
+   "input": "Hello\u202eworld",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+202E)"
+  },
+  {
+   "input": "tab\there",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+0009)"
+  },
+  {
+   "input": "Hello\u2029world",
+   "ok": false,
+   "error": "contains a control, formatting (bidirectional or zero-width), private-use or unassigned character (U+2029)"
+  },
+  {
+   "input": "Wow!!!!!",
+   "ok": false,
+   "error": "repeats one character more than 4 times in a row"
+  }
+ ],
+ "contacts": [
+  {
+   "kind": "",
+   "value": "",
+   "ok": true,
+   "normalized": {
+    "kind": "",
+    "value": ""
+   }
+  },
+  {
+   "kind": "phone",
+   "value": "+1 (555) 010-0199",
+   "ok": true,
+   "normalized": {
+    "kind": "phone",
+    "value": "15550100199"
+   }
+  },
+  {
+   "kind": "phone",
+   "value": "555.010.0199",
+   "ok": true,
+   "normalized": {
+    "kind": "phone",
+    "value": "5550100199"
+   }
+  },
+  {
+   "kind": "phone",
+   "value": "123",
+   "ok": false,
+   "error": "a phone number is 5 to 15 digits; spaces, dashes, dots, one balanced pair of parentheses and a leading + are accepted and removed"
+  },
+  {
+   "kind": "phone",
+   "value": "((12345",
+   "ok": false,
+   "error": "a phone number is 5 to 15 digits; spaces, dashes, dots, one balanced pair of parentheses and a leading + are accepted and removed"
+  },
+  {
+   "kind": "phone",
+   "value": "12345 ext 6",
+   "ok": false,
+   "error": "a phone number is 5 to 15 digits; spaces, dashes, dots, one balanced pair of parentheses and a leading + are accepted and removed"
+  },
+  {
+   "kind": "phone",
+   "value": "1234567890123456",
+   "ok": false,
+   "error": "a phone number is 5 to 15 digits; spaces, dashes, dots, one balanced pair of parentheses and a leading + are accepted and removed"
+  },
+  {
+   "kind": "email",
+   "value": "Help@Example.COM",
+   "ok": true,
+   "normalized": {
+    "kind": "email",
+    "value": "Help@example.com"
+   }
+  },
+  {
+   "kind": "email",
+   "value": "first.last+tag@sub.example.org",
+   "ok": true,
+   "normalized": {
+    "kind": "email",
+    "value": "first.last+tag@sub.example.org"
+   }
+  },
+  {
+   "kind": "email",
+   "value": "help@localhost",
+   "ok": false,
+   "error": "is not a valid email address"
+  },
+  {
+   "kind": "email",
+   "value": "help@1.2.3.4",
+   "ok": false,
+   "error": "is not a valid email address"
+  },
+  {
+   "kind": "email",
+   "value": "help@example.com:443",
+   "ok": false,
+   "error": "is not a valid email address"
+  },
+  {
+   "kind": "email",
+   "value": "@example.com",
+   "ok": false,
+   "error": "is not a valid email address"
+  },
+  {
+   "kind": "email",
+   "value": "a..b@example.com",
+   "ok": false,
+   "error": "is not a valid email address"
+  },
+  {
+   "kind": "email",
+   "value": "h\u00e9lp@example.com",
+   "ok": false,
+   "error": "must be plain ASCII without control characters (use punycode for a domain)"
+  },
+  {
+   "kind": "url",
+   "value": "https://Support.Example.com/help?x=1",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://support.example.com/help?x=1"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "HTTPS://example.com",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "http://example.com",
+   "ok": false,
+   "error": "a URL must start with https://"
+  },
+  {
+   "kind": "url",
+   "value": "example.com",
+   "ok": false,
+   "error": "a URL must start with https://"
+  },
+  {
+   "kind": "url",
+   "value": "https://user@example.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#frag",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:8443/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://127.0.0.1/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://localhost/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a b",
+   "ok": false,
+   "error": "is not a valid URL"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a\\b",
+   "ok": false,
+   "error": "is not a valid URL"
+  },
+  {
+   "kind": "",
+   "value": "x",
+   "ok": false,
+   "error": "needs both a kind and a value"
+  },
+  {
+   "kind": "phone",
+   "value": "",
+   "ok": false,
+   "error": "needs both a kind and a value"
+  },
+  {
+   "kind": "sms",
+   "value": "12345",
+   "ok": false,
+   "error": "kind must be phone, email or url"
+  },
+  {
+   "kind": "email",
+   "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@example.com",
+   "ok": false,
+   "error": "is at most 200 characters"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%zz",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%4",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%2",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%41",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%41"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%7e%7E",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%7e%7E"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%2f%2F",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%2f%2F"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%ff",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%ff"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%e2%82%ac",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%e2%82%ac"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%00",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%00"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a\"b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%22b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a\"%41",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%22A"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a<b>",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%3Cb%3E"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a{b}|^`",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%7Bb%7D%7C%5E%60"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/!*'()",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/!*'()"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/[x]",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/[x]"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a,b;c=d:e@f$g&h+i",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a,b;c=d:e@f$g&h+i"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/~-_.",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/~-_."
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?q=%zz",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?q=%zz"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?q=a b",
+   "ok": false,
+   "error": "is not a valid URL"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com?",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com?"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com?x",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com?x"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?a?",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?a?"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?a?b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?a?b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?\"<>",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?\"<>"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a?b=%41&c=\"",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a?b=%41&c=\""
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#%zz",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#a",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com#",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a##",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:abc/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:443/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:99999999999/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:80:80/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://exampl%65.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com%2f/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.%e2.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com%25/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://exa_mple.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex{ample.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex|ample.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex^ample.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex`ample.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex\"ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex<ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex!ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex*ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex(ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex'ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex,ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex;ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex=ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex+ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex$ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex&ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex~ample.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]:443/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]:x/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[example.com]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%25en0]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%en0]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]x/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://a]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://a[b/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[fe80::1%25en0]:80/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[v1.x]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::zz]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1.2.3.4]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://@/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://a@b.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://:@b.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://a:b@c.com/%zz",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com@/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%zz#",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%zz#frag",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https:///x",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://?x",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://#",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://:443",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com./",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com../",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://Example.COM/Path/%7e",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/Path/%7e"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a//b/../c",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a//b/../c"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com//",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com//"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%252f",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%252f"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%25",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%25"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%aF",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%aF"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/\u007f",
+   "ok": false,
+   "error": "must be plain ASCII without control characters (use punycode for a domain)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/x%2",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%%41",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%4%41",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://1.2.3.4/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.123/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?a=%",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?a=%"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#%",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://ex%41mple.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://%65xample.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:%34/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:4 4/",
+   "ok": false,
+   "error": "is not a valid URL"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%e",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://xn--bcher-kva.example/",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://xn--bcher-kva.example/"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%20b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%20b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%2Bb",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%2Bb"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a+b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a+b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%3Fb",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%3Fb"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%23b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%23b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%7B",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%7B"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%22",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%22"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%3c%3E",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%3c%3E"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://[::]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1::]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1:2:3:4:5:6:7]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1:2:3:4:5:6:7:8]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1:2:3:4:5:6:7:8:9]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1:2:3:4:5:6:7::8]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1::2::3]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::ffff:1.2.3.4]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::ffff:01.2.3.4]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1.2.3.4::]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[12345::]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%25]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%25en%30]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%25en%2f]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%25 x]/",
+   "ok": false,
+   "error": "is not a valid URL"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%25en0]x/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1%2541]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[%25en0]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]:/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]:99999/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[[::1]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://x[::1]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1]@a.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[:1]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1:]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[g::]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::%25a]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[a:b:c:d:e:f:1.2.3.4]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1.2.3.4]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1.2.3]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[::1.2.3.4.5]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1:2:3:4:5:6:1.2.3.4]/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://[1:2:3:4:5:6:7:1.2.3.4]/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%7E%7e%41%5a",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%7E%7e%41%5a"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%5Bb%5D",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%5Bb%5D"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%21%27%28%29%2A",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%21%27%28%29%2A"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%80",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%80"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%c3%a9?q=\u00e9",
+   "ok": false,
+   "error": "must be plain ASCII without control characters (use punycode for a domain)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a%zzb?x=1",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/p/%zz?x=%zz",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://EXAMPLE.com/%41/?Q=%41",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%41/?Q=%41"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a|b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%7Cb"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a^b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%5Eb"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a`b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%60b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a\"%2f",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a%22/"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/ok/%",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%\"",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%2",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%a%",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%0a",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%0a"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%25zz",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%25zz"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%2525",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%2525"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://a.example.com:443/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:0/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:65536/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:+80/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:-1/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:8o/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com:0x50/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://exa%80mple.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://exa%7fmple.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://exa%mple.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://exa%8mple.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://%25.com/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://%2e.com/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://.%e2/",
+   "ok": false,
+   "error": "must name a public DNS host (no port, no IP literal)"
+  },
+  {
+   "kind": "url",
+   "value": "https://xn--a.b/a%2Fb",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://xn--a.b/a%2Fb"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/.",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/."
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/..",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/.."
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%2e%2e/",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/%2e%2e/"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/;a=b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/;a=b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a@b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a@b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/a:b",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/a:b"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com//a//",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com//a//"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?%",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?%"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?%zz#",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?%zz"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/??",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/??"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?#",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?x#",
+   "ok": true,
+   "normalized": {
+    "kind": "url",
+    "value": "https://example.com/?x"
+   }
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/?x#y",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#?",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#/",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/#%41",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%#",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  },
+  {
+   "kind": "url",
+   "value": "https://example.com/%zz?#",
+   "ok": false,
+   "error": "must be a plain https URL on a public host (no user-info, no fragment)"
+  }
+ ]
+}

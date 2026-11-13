@@ -1,0 +1,24 @@
+name: Windows desktop client
+on:
+  pull_request:
+    paths: ['clients/windows/**', '.github/workflows/windows-client.yml']
+  push:
+    branches: [ci/github-actions]
+    paths: ['clients/windows/**', '.github/workflows/windows-client.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Build release and smoke binaries; run policy tests
+        shell: powershell
+        working-directory: clients/windows
+        run: ./build-client.ps1 -OutDir "${{ runner.temp }}/deskrally-client" -SmokeTestBuild
+      - name: Installer transaction tests
+        shell: powershell
+        run: ./clients/windows/test-installer.ps1

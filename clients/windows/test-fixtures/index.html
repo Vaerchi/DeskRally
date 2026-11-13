@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>DeskRally Smoke</title>
+<style>body{margin:0;padding:8px;font-family:sans-serif;}
+button{padding:8px 16px;font-size:14px;}</style>
+</head>
+<body>
+<button id="b">Open Popup</button>
+<button id="b2">Close during initialization</button>
+<div id="log"></div>
+<script>
+function post(obj) {
+    window.chrome.webview.postMessage(JSON.stringify(obj));
+    var d = document.getElementById('log');
+    if (d) d.innerHTML += '<br>' + JSON.stringify(obj);
+}
+document.getElementById('b').addEventListener('click', function() {
+    var w = window.open('about:blank', '', 'width=400,height=300');
+    if (!w) {
+        post({test:'popup_open', result:'FAIL', reason:'window.open returned null'});
+        return;
+    }
+    post({test:'popup_open', result:'PASS'});
+    try {
+        w.document.write('<p>smoke content</p>');
+        if (!w.document.body.textContent.includes('smoke content')) throw new Error('DOM write missing');
+        post({test:'dom_access', result:'PASS'});
+        post({control:'REQUEST_CLIPBOARD_TEST'});
+    } catch(e) {
+        post({test:'dom_access', result:'FAIL', reason: String(e)});
+    }
+    var ready = setInterval(function() {
+        if (!window.__clipTestDone) return;
+        clearInterval(ready);
+        w.close();
+        var until = Date.now() + 3000;
+        var check = setInterval(function() {
+            if (w.closed || Date.now() > until) {
+                clearInterval(check);
+                post({test:'popup_close', result:w.closed ? 'PASS' : 'FAIL'});
+                post({control:'ARM_CLOSE_PENDING'});
+            }
+        }, 30);
+    }, 30);
+});
+document.getElementById('b2').onclick = function() { window.open('about:blank', '', 'width=400,height=300'); };
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Build output and local machine state
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+
+# Signing material: NEVER commit. The dev keystore lives outside the repo
+# (C:\Users\<you>\.secrets\deskrally-android\); keystore.properties points at it.
+keystore.properties
+*.jks
+*.keystore

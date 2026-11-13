@@ -1,0 +1,11 @@
+<resources>
+    <!-- Android 12+ draws a system splash before our activity; match it to the console. -->
+    <style name="Theme.DeskRally" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/console_bg</item>
+        <item name="android:statusBarColor">@color/console_bg</item>
+        <item name="android:navigationBarColor">@color/console_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowSplashScreenBackground">@color/console_bg</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash</item>
+    </style>
+</resources>

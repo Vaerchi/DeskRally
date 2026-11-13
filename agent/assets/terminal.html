@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Backstage Shell</title>
+<link rel="stylesheet" href="/vendor/xterm.css" />
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0e14; }
+  #bar { color: #9aa5b1; font: 12px system-ui, sans-serif; padding: 6px 10px; border-bottom: 1px solid #1c2230; }
+  #bar b { color: #d7dce5; }
+  #status { float: right; }
+  #term { height: calc(100% - 30px); padding: 6px; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <b>Backstage</b> — live PowerShell over ConPTY + WebSocket
+    <span id="status">connecting…</span>
+  </div>
+  <div id="term"></div>
+
+  <script src="/vendor/xterm.js"></script>
+  <script src="/vendor/xterm-addon-fit.js"></script>
+  <script>
+    // Wire format mirrors rmt_agent::transport::shell_ws (1-byte tag + payload).
+    const TAG_DATA = 0x00, TAG_RESIZE = 0x01, TAG_CLOSE = 0x02, TAG_EXIT = 0x03;
+
+    const term = new Terminal({
+      fontFamily: 'Cascadia Mono, Consolas, monospace',
+      fontSize: 14,
+      theme: { background: '#0b0e14', foreground: '#d7dce5' },
+      cursorBlink: true,
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('term'));
+    fit.fit();
+
+    const status = document.getElementById('status');
+    // The token comes from the URL the operator opened and is forwarded to the socket
+    // (docs/25 F16). A browser's WebSocket constructor cannot set headers, so the query string is
+    // the only channel the page has. Without it the server answers 403 and opens no shell.
+    const token = new URLSearchParams(location.search).get('t') ?? '';
+    const ws = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(token)}`);
+    ws.binaryType = 'arraybuffer';
+
+    const enc = new TextEncoder();
+    function sendData(str) {
+      const body = enc.encode(str);
+      const frame = new Uint8Array(1 + body.length);
+      frame[0] = TAG_DATA;
+      frame.set(body, 1);
+      ws.send(frame);
+    }
+    function sendResize(cols, rows) {
+      const body = enc.encode(JSON.stringify({ cols, rows }));
+      const frame = new Uint8Array(1 + body.length);
+      frame[0] = TAG_RESIZE;
+      frame.set(body, 1);
+      ws.send(frame);
+    }
+
+    ws.onopen = () => {
+      status.textContent = 'connected';
+      status.style.color = '#7ee787';
+      sendResize(term.cols, term.rows);
+    };
+    ws.onclose = () => { status.textContent = 'disconnected'; status.style.color = '#ff7b72'; };
+    ws.onmessage = (ev) => {
+      const frame = new Uint8Array(ev.data);
+      const tag = frame[0];
+      const payload = frame.subarray(1);
+      if (tag === TAG_DATA) {
+        term.write(payload);                 // binary write; xterm reassembles UTF-8
+      } else if (tag === TAG_EXIT) {
+        term.write('\r\n\x1b[90m[shell exited]\x1b[0m\r\n');
+      }
+    };
+
+    term.onData((d) => sendData(d));
+    window.addEventListener('resize', () => {
+      fit.fit();
+      if (ws.readyState === WebSocket.OPEN) sendResize(term.cols, term.rows);
+    });
+  </script>
+</body>
+</html>

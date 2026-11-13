@@ -1,0 +1,23 @@
+-- Machine device ids become GLOBALLY unique — the schema half of the cross-tenant session-ticket
+-- fix. Extends migrations/0001_core.sql.
+--
+-- WHY (this is a security constraint, not a tidiness one): the control plane mints an Ed25519
+-- session ticket bound to a machine's `device_id` (control-plane/ticket.go), and the signaling
+-- server brokers a WebRTC session to whichever agent is registered under that device id
+-- (server/signaling/registry.go keys on the device id alone). While `device_id` was only
+-- UNIQUE (tenant_id, device_id), an admin of tenant B could enroll a machine carrying tenant A's
+-- device id, ask for a session on it, and receive a VALID ticket naming A's agent — cross-tenant
+-- remote control of another tenant's machine, needing only knowledge of the device id (an
+-- identifier that appears in machine listings, agent config and logs — never a secret).
+--
+-- With this index a device id exists in at most ONE tenant, so a ticket for a device id can only
+-- ever be minted by the tenant that actually owns that agent. The per-tenant UNIQUE (tenant_id,
+-- device_id) from 0001 stays: it is the constraint the in-tenant duplicate-enroll 409 maps to, and
+-- it keeps the composite lookups indexed.
+--
+-- MIGRATING AN EXISTING DEPLOYMENT: this fails loudly if two tenants already share a device id.
+-- That collision IS the vulnerability, so resolve it deliberately — re-enroll one side with a
+-- fresh device id — rather than dropping the constraint:
+--   SELECT device_id, count(*) FROM machine GROUP BY device_id HAVING count(*) > 1;
+
+CREATE UNIQUE INDEX machine_device_id_global ON machine (device_id);

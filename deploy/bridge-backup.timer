@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Bridge Postgres backup
+
+[Timer]
+# 03:20 local, with an hour of jitter. The jitter is not cosmetic: a fixed time means the backup and
+# every other nightly job on the box contend for the same disk, and a home server has one disk.
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=1h
+# Run on next boot if the machine was off when it was due. A home server is not always on, and a
+# backup schedule that silently skips every powered-off night is not a schedule.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,76 @@
+# Real WebRTC data-plane transport (ADR-001/002): implements `rmt_agent_core::Transport` over a
+# webrtc-rs peer connection + data channels, with SDP/ICE exchanged through the Go signaling
+# server. Kept in its own crate so the heavy webrtc-rs dep tree doesn't touch agent-core/protocol.
+[package]
+name = "rmt-transport-webrtc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "WebRTC data-channel transport for the agent (implements the agent-core Transport seam)."
+
+[dependencies]
+rmt-protocol = { path = "../protocol" }
+rmt-agent-core = { path = "../agent-core" }
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The CONTROL-PLANE session id `brokered` carries (loop 86): retained on the transport so the agent
+# can bind a signed session policy to the session it is actually serving. Same workspace uuid the
+# protocol crate's DeviceId/SessionId newtypes wrap, so the types are interchangeable.
+uuid.workspace = true
+# M3 agent auth: the challenge nonce and the proof signature are hex on the signaling wire.
+hex = "0.4"
+webrtc = "0.11"
+# TURN over TCP/TLS (turn_stream.rs): the dialer trait is async, and TURNS needs a tokio TLS stream.
+# `ring` provider like everything else here; no aws-lc.
+async-trait = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# The signaling client dials the rendezvous server over WebSocket. A rustls feature is REQUIRED: with
+# no TLS feature at all, `connect_async` cannot dial `wss://` ("TLS support not compiled in"). The
+# roots it trusts are NOT the feature's, though — `signaling.rs` passes the `tls_trust` config
+# explicitly (see below); the feature only compiles the rustls stream in.
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
+# `tls_trust`: ONE rustls client config for every agent HTTPS/WSS dial (enroll, attend, updater,
+# signaling). Trust = the OS store (rustls-native-certs: a self-hosted deployment's private CA in
+# `LocalMachine\Root`) UNION Mozilla's bundled roots (webpki-roots). Native-only failed on a fresh
+# machine (MSI-Night, 2026-10-09): Windows installs ISRG Root X1 into the store only ON DEMAND, when a
+# CryptoAPI chain build asks for it, and rustls-native-certs only enumerates — so enrollment died
+# before HTTP. Same `ring` provider reqwest and tokio-tungstenite already use; no aws-lc.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+futures-util = "0.3"
+# Software **VP8** encoder for the WebRTC video media track. libvpx is BSD-3-Clause with an
+# explicit patent grant (unlike H.264, which carries MPEG-LA licensing exposure), and every WebRTC
+# browser decodes VP8. `env-libvpx-sys` ships PRE-GENERATED bindings, so clang/bindgen are NOT
+# needed — but libvpx itself is NOT vendored: it is a build prerequisite. See ../../.cargo/config.toml
+# for how it is located and docs/10-deployment.md for the install command.
+env-libvpx-sys = "5.1.3"
+# OPTIONAL alternate encoder behind the `VideoEncoder` seam. Off by default so the shipping build
+# carries no H.264 patent exposure; `--features h264` compiles the openh264 implementation and is
+# what proves the seam is real rather than decorative.
+openh264 = { version = "0.6", features = ["source"], optional = true }
+
+[features]
+default = []
+# Compile the (bundled-source) OpenH264 implementation of `video::VideoEncoder` alongside VP8.
+h264 = ["dep:openh264"]
+
+# route_iface.rs: the network adapters as address groups (GetAdaptersAddresses), for the ICE
+# host-candidate restriction. webrtc-util names every Windows interface "", so it cannot group them.
+# Same windows version agent-windows uses; only the IpHelper/WinSock features are added.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+# e2e_ticket only: mints a real RMTTICKETv1 (the control plane's job in production) so the
+# ticketed brokered path can be exercised against an ENFORCING signaling server.
+ed25519-dalek = "2"
+# tls_trust tests: a throwaway private CA + leaf for in-memory handshakes (already in the lock via webrtc).
+rcgen = "0.13"
+ring = "0.17"

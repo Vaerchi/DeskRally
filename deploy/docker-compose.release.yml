@@ -1,0 +1,30 @@
+# Run DeskRally from a SERVER RELEASE PACKAGE: prebuilt images, no source tree, no build tools.
+#
+# Use it together with the production overlay, always in this order:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml \
+#                  -f deploy/docker-compose.release.yml up -d
+# (add -f deploy/docker-compose.turn.yml / docker-compose.installer.yml as you would otherwise).
+#
+# The package's install.sh loads the images (`docker load`) and writes DESKRALLY_VERSION into
+# deploy/.env. Every service built from source in the base files is switched to the loaded image
+# and its `build:` section removed (`!reset`, Compose >= 2.24.4 — already required by the prod
+# overlay), so Compose never looks for the source directories the package does not contain.
+# `pull_policy: never`: these images exist only locally; never let Compose try a registry.
+
+services:
+  controlplane:
+    image: "deskrally/controlplane:${DESKRALLY_VERSION:?set DESKRALLY_VERSION (install.sh writes it to deploy/.env)}"
+    pull_policy: never
+    build: !reset null
+  migrate:
+    image: "deskrally/controlplane:${DESKRALLY_VERSION:?set DESKRALLY_VERSION}"
+    pull_policy: never
+    build: !reset null
+  signaling:
+    image: "deskrally/signaling:${DESKRALLY_VERSION:?set DESKRALLY_VERSION}"
+    pull_policy: never
+    build: !reset null
+  relay:
+    image: "deskrally/relay:${DESKRALLY_VERSION:?set DESKRALLY_VERSION}"
+    pull_policy: never
+    build: !reset null

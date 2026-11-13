@@ -1,0 +1,56 @@
+# Brand names a tenant hostname label must not imitate (docs/66 section 3 item 3, 2a.7).
+#
+# A checked-in list, changed by pull request, not a service. One name per line, lowercase; blank lines and
+# lines starting with '#' are ignored. Each entry is compared by its confusable SKELETON (hostlabel.go:
+# lowercase, hyphens dropped, 0->o, 1->l, rn->m, vv->w), so "micr0soft" and "rnicrosoft" collide with
+# "microsoft". A collision is a WARNING the platform operator must acknowledge with a reason (recorded on both
+# audit chains); it never silently refuses and never silently passes.
+microsoft
+windows
+office365
+outlook
+azure
+google
+gmail
+apple
+icloud
+amazon
+paypal
+stripe
+netflix
+facebook
+instagram
+whatsapp
+linkedin
+twitter
+dropbox
+docusign
+zoom
+adobe
+cisco
+vmware
+dell
+hp
+lenovo
+geeksquad
+norton
+mcafee
+kaspersky
+antivirus
+supportdesk
+helpdesk
+techsupport
+securitycenter
+bank
+chase
+wellsfargo
+bankofamerica
+citibank
+barclays
+hsbc
+santander
+irs
+usps
+fedex
+ups
+dhl

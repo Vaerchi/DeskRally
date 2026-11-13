@@ -1,0 +1,210 @@
+# TURN relay for WAN NAT traversal (docs/20 §9). OPT-IN: layer this file ON TOP of the base + prod
+# overlay ONLY when enabling TURN, so a LAN bring-up and CI (which don't include it) are unaffected
+# and never need a TURN secret:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.turn.yml \
+#     up -d --force-recreate signaling coturn
+#
+# The signaling service (base file) already reads SIGNALING_STUN_URLS / SIGNALING_TURN_URLS /
+# SIGNALING_TURN_SECRET from the environment and issues short-lived per-session credentials to both
+# peers in its `ice_servers` message — nothing is configured on the agents. So enabling TURN is:
+#   1. set TURN_* in .env (see .env.example),
+#   2. bring the stack up WITH this file,
+#   3. open the ports on the SERVER's gateway (NEVER any end user's firewall).
+#
+# WHY: with no TURN, signaling hands the browser an EMPTY ice_servers list, so a remote controller
+# behind a firewall gets only mDNS host candidates and cannot connect (measured 2026-08-31, first WAN
+# connect). The operator requirement is that this work with ZERO changes on end-user firewalls —
+# server-side TURN delivers that, because clients dial OUT to it.
+#
+# =================================================================================================
+# THE TRAP — destination-scoped forwarding is NOT 1:1 NAT, so coturn MUST be told its public address.
+# =================================================================================================
+# This deployment's gateway forwards a spare public IP to the box on REMAPPED ports (measured by the
+# deployment session):
+#     turn.example.com -> 203.0.113.10
+#     udp 3478          .59 -> box:3478
+#     tcp 3478          .59 -> box:3478
+#     tcp 443           .59 -> box:5349     <- TURNS on 443 externally, no Caddy conflict (Caddy keeps .58:443)
+#     udp 49160-49200   .59 -> box:49160-49200   (relay range, deliberately narrow)
+# Because that is destination-scoped forwarding, coturn cannot infer its public IP and MUST be given
+# `--external-ip=<public>/<private>`. Get it wrong and it fails SILENTLY: coturn starts, allocations
+# succeed, and the relay candidates it hands out are unroutable 192.168.x that never connect. docs/20
+# §9 warns that TURN's misconfiguration fails silently where its absence fails visibly — this is it.
+
+services:
+  coturn:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    image: coturn/coturn:4.6
+    # TURN needs the host network so its relayed UDP port range is reachable without per-port
+    # publishing. The listening + relay ports below must be opened on the SERVER gateway.
+    network_mode: host
+    restart: unless-stopped
+    # NON-ROOT (audit #19). coturn runs as `nobody` (65534) with no capabilities and never sees
+    # Caddy's volume: it mounts ONLY the dedicated `turncerts` volume (read-only), into which the
+    # one-shot `turn-cert-export` service below copies the TURN hostname's own cert + key, owned by
+    # 65534. Before this, coturn ran as uid 0 with the WHOLE caddydata volume mounted (every key
+    # Caddy holds, the main site's included) because Caddy writes its keys 0600 root and coturn does
+    # not fail on an unreadable cert - it silently skips the TLS listener (TURNS off, reports
+    # healthy). That trap is why the entrypoint guard below stays: an empty or unreadable turncerts
+    # volume is a crash, not a downgrade. Migration + rollback: docs/20-ubuntu-host-runbook.md
+    # section 9, "Hardening: non-root coturn".
+    user: "65534:65534"
+    cap_drop:
+      - ALL
+    # PORTS BELOW 1024 (e.g. TURN_TLS_PORT=443 on host networking). cap_add alone does NOT let a
+    # non-root process bind them: Docker puts added caps in the bounding set but (as of the Docker
+    # versions this deployment uses - moby/moby#8460) does not set AMBIENT caps, so uid 65534 loses
+    # NET_BIND_SERVICE at execve; and a setcap'd binary is ignored under no-new-privileges. With
+    # network_mode: host the per-container net.ipv4.ip_unprivileged_port_start sysctl is not
+    # allowed either. So the supported mechanisms are, in order of preference:
+    #   (1) keep TURN_TLS_PORT >= 1024 (default 5349) and let the gateway remap external 443 -> 5349
+    #       (this deployment's documented layout; nothing to do), or
+    #   (2) lower the HOST sysctl:  net.ipv4.ip_unprivileged_port_start=443  (persist in
+    #       /etc/sysctl.d/; it lets every local user bind >=443, a small, documented widening).
+    # NET_BIND_SERVICE is still added (harmless; it makes the bounding set permit it if a runtime
+    # does set ambient caps) and the entrypoint below REFUSES TO START, loudly, if a configured port
+    # is below the host's unprivileged threshold instead of silently losing the TLS listener.
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    # NOTE (60-day time bomb): coturn reads the cert ONCE at startup and serves it from memory. Caddy
+    # renews the TURN hostname's certificate automatically, and coturn keeps serving the OLD cert until something
+    # restarts it — so TURNS breaks ~60 days out, silently, on a box where nothing restarts coturn.
+    # deploy/turn-cert-sync.sh (daily timer) re-runs the export and restarts coturn ONLY when the
+    # exported cert changed. See docs/20 section 9, "Hardening: non-root coturn".
+    environment:
+      TURN_TLS_PORT: ${TURN_TLS_PORT:-5349}
+      TURN_LISTEN_PORT: ${TURN_LISTEN_PORT:-3478}
+    # REFUSE TO START on an unreadable/absent cert or an unbindable port instead of silently
+    # downgrading to no-TLS (the trap above). Same philosophy as the ${...:?} guards: loud beats
+    # silent. The cert pair is read from ONE generation: `current` is resolved ONCE here (the
+    # exporter flips it atomically), so cert and key can never come from different generations.
+    # The turnserver flags in `command` are passed straight through as "$@" (the trailing
+    # `turnserver` here is just $0 for `sh -c`).
+    entrypoint:
+      - /bin/sh
+      - -euc
+      - |
+        G=$$(readlink /turn-certs/current) || { echo "coturn: /turn-certs/current is missing -- refusing to start; TURNS would be SILENTLY off (run deploy/turn-cert-sync.sh first)" >&2; exit 1; }
+        C="/turn-certs/$$G/turn.crt"; K="/turn-certs/$$G/turn.key"
+        test -r "$$C" || { echo "coturn: cannot read cert $$C -- refusing to start (is it owned by uid 65534? re-run deploy/turn-cert-sync.sh)" >&2; exit 1; }
+        test -r "$$K" || { echo "coturn: cannot read key $$K -- refusing to start" >&2; exit 1; }
+        T=$$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+        for P in "$$TURN_TLS_PORT" "$$TURN_LISTEN_PORT"; do
+          if [ "$$(id -u)" != 0 ] && [ "$$P" -lt "$$T" ]; then
+            echo "coturn: port $$P is below the host's unprivileged-port threshold ($$T) and coturn is non-root -- refusing to start. Use a port >= 1024 and remap at the gateway, or set the HOST sysctl net.ipv4.ip_unprivileged_port_start=$$P (docs/20 section 9)." >&2
+            exit 1
+          fi
+        done
+        echo "coturn: using certificate generation $$G"
+        exec turnserver "$$@" --cert="$$C" --pkey="$$K"
+      - turnserver
+    command:
+      - -n
+      - --realm=${TURN_REALM:-main.deskrally.com}
+      - --fingerprint
+      - --use-auth-secret
+      # Shared with SIGNALING_TURN_SECRET; signaling derives short-lived per-session creds from it,
+      # so no TURN password is ever stored on an agent. (No --lt-cred-mech: the shared-secret/TTL
+      # scheme is what signaling issues against.)
+      - --static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET before enabling coturn}
+      # THE public/private mapping — see THE TRAP above. Public IP the clients reach / private IP the
+      # box actually holds.
+      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP=<public>/<private>, e.g. 203.0.113.10/10.0.0.6}
+      # THE SECOND HALF OF THE TRAP — and it needs `network_mode: host` to understand. On the host
+      # network coturn discovers EVERY interface (the box's other LAN IPs, the docker bridges
+      # 172.17/172.18, ::1) and, by default, listens and RELAYS on all of them. `--external-ip` remaps
+      # exactly ONE of them (the private half above); an allocation that draws any other interface is
+      # advertised with that address verbatim → unroutable. So it fails INTERMITTENTLY, per-allocation
+      # ("worked yesterday, fails today, same config") — the nastiest shape of the docs/20 §9 trap.
+      # `--relay-ip` forces every relay onto the one address `--external-ip` maps; `--listening-ip`
+      # stops it listening on unrelated interfaces (e.g. another service's LAN IP). REQUIRED with `:?`
+      # for the same reason `--external-ip` is: it decides whether candidates are routable, and being
+      # SET is not being CORRECT — confirm from an actual allocation's relay candidate, not the config.
+      - --relay-ip=${TURN_RELAY_IP:?set TURN_RELAY_IP to the PRIVATE address TURN_EXTERNAL_IP maps, e.g. 10.0.0.6}
+      - --listening-ip=${TURN_RELAY_IP}
+      # Plain TURN/STUN. UDP is the fast path; TCP is the one that saves you where outbound UDP is
+      # blocked (the corporate firewalls that need TURN in the first place).
+      - --listening-port=${TURN_LISTEN_PORT:-3478}
+      # TLS/DTLS TURN (turns:). Internally 5349; externally the gateway forwards tcp 443 -> :5349, so
+      # clients reach turns on 443 (looks like HTTPS -> clears almost any firewall) with no Caddy
+      # conflict. Needs a real cert for the turns hostname (mounted below).
+      - --tls-listening-port=${TURN_TLS_PORT:-5349}
+      # Relay port range — narrow, and open exactly this range on the gateway.
+      - --min-port=${TURN_MIN_PORT:-49160}
+      - --max-port=${TURN_MAX_PORT:-49200}
+      # Anti-open-proxy: a TURN server open to the internet is an open proxy into whatever it can
+      # reach. Refuse to relay to loopback/link-local/private ranges.
+      # Sizing (audit #14/#16): the relay port range (min-port..max-port, 41 ports) is the hard
+      # ceiling, so total-quota must stay <= that. user-quota applies PER USERNAME and each username
+      # is bound to one session (<expiry>:<session>:rmt), so it stops one credential taking the whole
+      # pool. Do NOT size it as one allocation per peer: on this image user-quota 2 refused a
+      # session's 3rd allocation (486), and the production log shows every brokered session raising
+      # coturn's allocation counter by 18-21. 8 is what production has run; re-measure (486s in the
+      # coturn log) before lowering it. Signaling separately caps OUTSTANDING credentials per
+      # technician and tenant (20 / 80 by default; TURN_MAX_PER_USER / TURN_MAX_PER_TENANT in .env,
+      # passed through deploy/docker-compose.yml). Widen the port range AND total-quota together.
+      - --user-quota=${TURN_USER_QUOTA:-8}
+      - --total-quota=${TURN_TOTAL_QUOTA:-40}
+      - --max-bps=${TURN_MAX_BPS:-1250000}
+      - --bps-capacity=${TURN_BPS_CAPACITY:-12500000}
+      - --no-tcp-relay
+      - --no-multicast-peers
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --no-cli
+    volumes:
+      # ONLY the exported TURN cert + key, read-only. Never caddydata.
+      - turncerts:/turn-certs:ro
+
+  # One-shot cert export (profile "tools": never started by `up`; run by deploy/turn-cert-sync.sh,
+  # first before enabling coturn and then daily). Logic and guarantees: deploy/turn-cert-export/
+  # export.sh (stage + re-read + validate with openssl, publish as an immutable generation by one
+  # atomic symlink flip). Image = deploy/turn-cert-export/Dockerfile (debian-slim + openssl, built
+  # once WITH network by `docker compose build turn-cert-export`; the service itself has none).
+  # Only the capabilities it needs: CHOWN (to 65534, done LAST) and DAC_READ_SEARCH (read Caddy's
+  # 0600 files, and the 0400 key it already published). It deliberately has NO CAP_FOWNER, so the
+  # script sets modes before chown and never chmods after it.
+  turn-cert-export:
+    build: ./turn-cert-export
+    image: deskrally/turn-cert-export:1
+    profiles: ["tools"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TURN_SITE_ADDRESS: ${TURN_SITE_ADDRESS:-turn.deskrally.com}
+    entrypoint: ["/bin/bash", "/export.sh"]
+    volumes:
+      - ./turn-cert-export/export.sh:/export.sh:ro
+      - caddydata:/caddy-data:ro
+      - turncerts:/out
+
+volumes:
+  # Declared so this file resolves standalone; when layered with the prod overlay (which owns the
+  # real caddydata) compose merges to the SAME named volume. Read ONLY by turn-cert-export.
+  caddydata:
+    external: true
+    name: ${CADDYDATA_VOLUME:-deploy_caddydata}
+  # The only thing coturn can see: the TURN hostname's cert + key. Created by compose on first use.
+  turncerts:
+    name: ${TURNCERTS_VOLUME:-deploy_turncerts}

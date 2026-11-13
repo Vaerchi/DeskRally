@@ -1,0 +1,36 @@
+// Mock-backed browser coverage for App navigation and viewer chrome; no Go/Rust builds.
+import { defineConfig } from "@playwright/test";
+export default defineConfig({
+  testDir: "./e2e", testMatch: [
+    "app_overflow.spec.ts",
+    "auth_expiry.spec.ts",
+    "change_email.spec.ts",
+    "clipboard_consent.spec.ts",
+    "clipboard_popout.spec.ts",
+    "connection_diagnostics.spec.ts",
+    "desktop_launch.spec.ts",
+    "download_approval.spec.ts",
+    "download_delivery.spec.ts",
+    "download_wiring.spec.ts",
+    "file_transfer_limits.spec.ts",
+    "keyboard_focus.spec.ts",
+    "fleet_end_session.spec.ts",
+    "machine_end_session.spec.ts",
+    "remembered_login.spec.ts",
+    "single_row_chrome.spec.ts",
+    "supervisor_fit_height.spec.ts",
+    "supervisor_session_recovery.spec.ts",
+    "supervisor_sso.spec.ts",
+    "supervisor_toolbox_session.spec.ts",
+    "supervisor_bulk_run.spec.ts",
+    "supervisor_support_home.spec.ts",
+    "support_flow.spec.ts",
+    "zoom_race.spec.ts",
+    "toolbar_input.spec.ts",
+    "viewer_chrome.spec.ts"
+  ], workers: 1,
+  retries: 0, timeout: 30000, reporter: "list",
+  use: { baseURL: "http://127.0.0.1:5173" },
+  webServer: { command: "npm run dev -- --port 5173 --strictPort --host 127.0.0.1",
+    url: "http://127.0.0.1:5173", reuseExistingServer: false },
+});

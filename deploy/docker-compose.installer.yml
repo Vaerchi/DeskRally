@@ -1,0 +1,24 @@
+# Optional managed installer overlay. Apply AFTER the base and production files.
+# Keep MANAGED_INSTALL_HOST_DIR outside the public viewer/download directories.
+# It contains only DeskRallySetup.exe, DeskRallyAgent.msi and installer-manifest.json;
+# enrollment tokens are minted per authorized request, never stored in this directory.
+# The control plane verifies hashes and deployment identity at startup and snapshots
+# the release. Recreate it after changing releases; do not edit artifacts in place.
+services:
+  controlplane:
+    environment:
+      CP_MANAGED_INSTALL_DIR: /opt/deskrally/managed-installer
+      CP_MANAGED_INSTALL_CONTROL_PLANE_URL: "${CP_MANAGED_INSTALL_CONTROL_PLANE_URL:?set the public HTTPS control-plane URL baked into Setup}"
+      # Deployment-pass mode (docs/48 C) for GENERIC signed binaries: put deployment-pass.json and
+      # agent-release.json from DeskRally in MANAGED_INSTALL_HOST_DIR and set both to their paths
+      # inside the container, e.g. /opt/deskrally/managed-installer/deployment-pass.json. Leave
+      # both empty for a baked release. A renewed pass needs a control-plane restart.
+      CP_DEPLOYMENT_PASS_FILE: "${CP_DEPLOYMENT_PASS_FILE:-}"
+      CP_AGENT_RELEASE_ATTESTATION_FILE: "${CP_AGENT_RELEASE_ATTESTATION_FILE:-}"
+    volumes:
+      - type: bind
+        source: "${MANAGED_INSTALL_HOST_DIR:?set an absolute path to the verified managed-installer release}"
+        target: /opt/deskrally/managed-installer
+        read_only: true
+        bind:
+          create_host_path: false

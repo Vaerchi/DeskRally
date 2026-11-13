@@ -1,0 +1,522 @@
+# =================================================================================================
+# LIVE. This file serves main.deskrally.com in production as of 2026-08-30.
+# It was marked UNVERIFIED until loop 96; the deployment disproved that and the stale line is the
+# reason this banner is now dated. docs/18-selfhost-deployment.md is the reasoning,
+# docs/20-ubuntu-host-runbook.md is the box it runs on.
+#
+# VALIDATE BEFORE RELOADING — a parse error here takes the whole site down:
+#   docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
+# =================================================================================================
+#
+# One public origin serving the whole console: the static viewer, the control-plane API under /cp,
+# and the signaling WebSocket at /ws. Caddy terminates TLS and obtains its own certificate.
+#
+# WHY ONE ORIGIN. The console defaults its control-plane base URL to the PATH PREFIX `/cp`
+# (web/viewer/src/lib/controlplane.ts) and the Vite dev proxy STRIPS that prefix before forwarding
+# (web/viewer/vite.config.ts: `rewrite: path.replace(/^\/cp/, "")`). Reproducing exactly that here
+# means the shipped bundle works UNMODIFIED — no VITE_CONTROL_PLANE_URL, no per-deployment rebuild.
+# Same origin also means no CORS and no third-party-cookie question for the session cookie.
+#
+# Set SITE_ADDRESS in the environment, e.g. remote.example.com.
+#
+# TLS IS NOT OPTIONAL, and not only for the usual reasons. The console calls `crypto.randomUUID()`
+# in its CONNECT path (web/viewer/src/App.tsx, registering the controller identity before
+# connect_request) with no fallback, and that API is SECURE-CONTEXT ONLY. Served over plain http://
+# to anything but localhost it is `undefined`, so the console THROWS on connect rather than
+# degrading — an obscure failure that looks nothing like "you forgot TLS".
+#
+# So do NOT set this to `:80` or a bare IP for a "quick trial". The only two safe non-public options
+# are `localhost` (a secure context by definition, browsed on the server itself) or a real hostname
+# with `tls internal`, whose local CA you then trust on the client.
+
+# --- OPTIONAL: an ACME contact address --------------------------------------------------------
+#
+# Uncomment this global block AND set ACME_EMAIL in .env to receive Let's Encrypt expiry warnings.
+# (The caddy service forwards ACME_EMAIL — docker-compose.prod.yml. It did NOT at first, so
+# following these instructions produced the parse error below instead of the fix.)
+# Left as-is, Caddy creates the ACME account anonymously and LE has no address to warn.
+#
+# It is commented rather than live because an EMPTY `{$ACME_EMAIL}` is a Caddyfile parse error, which
+# would take the whole site down at restart — a worse failure than the missing warnings it fixes.
+# Uncomment only together with a real value, and validate before reloading:
+#
+#   docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
+#
+# {
+# 	email {$ACME_EMAIL}
+# }
+
+# The site body is a SNIPPET so that the opt-in block below can serve the same routes under a second site
+# (a request whose Host carries one trailing dot never matches the SITE_ADDRESS site; docs/66 2b.6, 2i). Left as
+# shipped, `caddy adapt` of this file is byte-identical to the file without the snippet.
+(deskrally_site) {
+	# Compress everything EXCEPT the download route. A compressed body drops Content-Length and adds
+	# Content-Encoding, which breaks a client that streams the exe against the advertised size and
+	# makes the served bytes differ from the file on disk — so the SHA-256 the page shows would never
+	# match what the wire delivered. /download/* is served raw; see the handle_path block below.
+	# docs/63 R4 adds the two recording playback/download paths to the exclusion: a WebM stream (Range replies) and a
+	# stored ZIP are already incompressible, and compressing them would drop Content-Length for no gain.
+	@encodable not path /download/* /cp/recordings/*/download /cp/recordings/*/segments/*/stream
+	encode @encodable zstd gzip
+
+	# --- ACCESS LOGGING --------------------------------------------------------------------------
+	# There was NO logging here at all until loop 96, so the box kept no record of who touched it:
+	# no forensics after an incident, no input for fail2ban, and no way to notice being probed. The
+	# deployment session found this by turning logging on and immediately seeing scanner traffic that
+	# had been arriving unrecorded since the day the site went up.
+	#
+	# /data is the existing caddydata volume, so this persists across restarts and needs no compose
+	# change. On the host: /var/lib/docker/volumes/deploy_caddydata/_data/access.log
+	# JSON because fail2ban parses it and a human never reads it raw.
+	log {
+		output file /data/access.log {
+			roll_size 20MiB
+			roll_keep 10
+		}
+		format json
+	}
+
+	# --- BROWSER SECURITY HEADERS (docs/25 F10) ---------------------------------------------------
+	# There was no `header` directive at site level at all, so the console shipped with no HSTS, no
+	# framing restriction, no nosniff and no referrer policy. A site-level block applies to every
+	# response in this site; the per-route `header` lines further down (the download handlers) add
+	# their own on top and are deliberately left alone.
+	header {
+		# HSTS. Caddy already serves this site over HTTPS with an automatic certificate, so the
+		# "confirm HTTPS readiness first" precondition in F10 is met by construction here.
+		#
+		# NO includeSubDomains AND NO preload, and that is a decision rather than an oversight.
+		# `includeSubDomains` would bind every current and future host under this domain to
+		# HTTPS-only — including any bare-IP or plain-HTTP helper a future deployment stands up —
+		# and `preload` is effectively irreversible: it is baked into browser binaries and cannot
+		# be withdrawn on the timescale of an incident. Neither is ours to choose on the operator's
+		# behalf for their whole domain. One year, this host only.
+		Strict-Transport-Security "max-age=31536000"
+
+		# The console must never be framed: it holds a live remote-desktop session, so a clickjacked
+		# frame is a clickjacked mouse on a customer's machine. `frame-ancestors` is the modern form
+		# and X-Frame-Options is kept for anything that still only understands that.
+		Content-Security-Policy "frame-ancestors 'none'"
+		X-Frame-Options "DENY"
+
+		X-Content-Type-Options "nosniff"
+
+		# Referrers leak the console URL, which can carry a machine id or an attend token, to
+		# whatever a page links out to. Send an origin only, and only same-protocol.
+		Referrer-Policy "strict-origin-when-cross-origin"
+
+		# Nothing here needs a camera, a microphone, geolocation or payments. The remote desktop's
+		# audio arrives over WebRTC as an inbound track, which is NOT gated by these.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+
+		# Caddy advertises itself by default; a version string is free reconnaissance.
+		-Server
+	}
+
+	# THE CONTENT POLICY IS REPORT-ONLY, ON PURPOSE, AND MUST NOT BE PROMOTED UNTIL IT IS OBSERVED.
+	#
+	# F10 asks for a "tested CSP ... with reporting/tests so WebRTC and blob downloads keep working",
+	# and the honest position is that this one is NOT yet tested: Caddy is not installed on the build
+	# box and the Playwright e2e serves the viewer through Vite, not through this file, so nothing in
+	# the gate exercises these headers at all. A wrong `script-src` or `connect-src` here does not
+	# degrade the console, it blanks it — and this is the file where a mistake takes the whole site
+	# down.
+	#
+	# Report-Only cannot break the page, so it can ship immediately and be *measured* on the live
+	# deployment. Promote it to `Content-Security-Policy` only after checking the browser console on:
+	# a login, a live session with video AND audio, a file-transfer download, a screenshot, and the
+	# recording playback. Each directive below is here for a reason worth keeping when it moves:
+	#   * style-src needs 'unsafe-inline' because the viewer sets `style={{ transform: ... }}` on the
+	#     video element every frame — an inline style ATTRIBUTE, which this directive governs.
+	#   * media-src and img-src need blob: for recordings, screenshots and file-transfer downloads.
+	#   * connect-src needs wss: because signaling is a WebSocket that may live on another host.
+	#   * worker-src needs blob: if any bundled dependency spawns a worker from a blob URL.
+	# The frame-ancestors above stays in the ENFORCED header; it is not in doubt and costs nothing.
+	# report-uri sends each would-be violation to the control plane, which logs it as `csp-report:`
+	# (control-plane/csp_report.go: capped, sanitized, at most 30 lines a minute). Promote on that evidence.
+	header Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self' wss: https:; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; report-uri /cp/csp-report"
+
+	# EVERY route lives in a `handle` block, and that is load-bearing rather than tidy.
+	#
+	# The first draft put a bare `try_files … /index.html` at the end, reasoning that it was a
+	# harmless SPA fallback after the two proxies. It is not: Caddy executes directives in its own
+	# FIXED order, not in the order they are written, and `try_files` (a rewrite) is ordered BEFORE
+	# `handle_path`. So every request — `/cp/machines`, `/ws` — was rewritten to `/index.html` before
+	# the proxies ever saw it, and the console would have got the HTML page back from its API calls
+	# and its WebSocket upgrade. The whole thing would have been dead on arrival, in a way that looks
+	# like a backend fault rather than a routing one.
+	#
+	# `handle` blocks are MUTUALLY EXCLUSIVE and evaluated in the order written, so this shape is
+	# correct regardless of the global directive order — which is the point. Do not flatten it back.
+
+	# --- OPT-IN, SHIPS OFF: public-edge hardening for per-tenant hostname theming (docs/66 2a.2, 2b.6, 2i) ----
+	#
+	# Every line of this block, and each `header_up` line inside `handle_path /cp/*` below, starts with `#| `. Left as
+	# shipped, this file does EXACTLY what it did before the block existed (`caddy adapt` of the two files, run
+	# under the same file name on Caddy 2.10.2, is byte-identical JSON), so a routine deploy changes nothing: no
+	# request is refused, no header is sent upstream that was not sent before, and no environment variable is read.
+	#
+	# WHY IT IS NOT LIVE. The first thing it does is REFUSE requests, and a matcher that is wrong in a way nobody
+	# has measured on the real site is an outage; and the marker it sends means something only to a control plane
+	# that has been told to expect it (CP_HOST_THEMING=on, which refuses to start without CP_EDGE_SECRET). Turn
+	# it on together with the control plane, in this order (docs/66 2g and 2i):
+	#
+	#   1. .env: CP_EDGE_SECRET = at least 32 random characters (`openssl rand -hex 32`). docker-compose.prod.yml:
+	#      uncomment its CP_EDGE_SECRET lines in BOTH the `controlplane` and the `caddy` environment, so the two
+	#      read one value (a Caddy that sends a different or empty marker makes the control plane answer 421 to
+	#      every request: loud, not silent).
+	#   2. Enable this block:   sed -i 's/^\(\s*\)#| \{0,1\}/\1/' deploy/Caddyfile
+	#   3. Validate, then reload (a parse error takes the site down):
+	#        docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
+	#   4. Only then set CP_HOST_THEMING=on and CP_PUBLIC_AUTHORITIES (the SITE_ADDRESS hosts, comma separated)
+	#      on the control plane and recreate it. Assign and activate tenant hostnames last.
+	#
+	# WHAT IT DOES
+	#   * Deletes, on EVERY route of this site, what a client may not choose: the edge marker itself (the control
+	#     plane's proof that a request came through this proxy) and the forwarding headers that something
+	#     downstream could mistake for the authority or the scheme. Caddy sets its own X-Forwarded-* on proxied
+	#     requests.
+	#   * Refuses (421), before every other handler, a request whose authority is not exactly the name it was
+	#     connected to: an empty Host, a port other than 443, a TLS server name that is not the Host (no server name
+	#     at all included), an ABSOLUTE-FORM request target (`GET https://host/...`: Go drops the Host header for
+	#     those, so the two authorities cannot be compared and the raw target is refused instead), and, over
+	#     HTTP/2, a `host` header that differs from :authority. A malformed or repeated Host is refused (400) by the
+	#     HTTP server itself before any handler runs. Leading/trailing whitespace around an HTTP/1 Host value is
+	#     stripped by that parser (RFC 9110 OWS), so one clean authority reaches the control plane.
+	#   * Serves ONE trailing dot (`Host: main.deskrally.com.`), which Caddy's host matcher never matches, through
+	#     the catch-all `:443` site below: `@dotHost` rewrites the Host to the TLS server name when it is the same
+	#     name without the dot (any letter case, port absent or 443), then everything proceeds as for the plain name.
+	#     That name must be one of the SITE_ADDRESS hosts (a comma or space list, read from the same variable as the site
+	#     address): a catch-all certificate holder that is not listed (the TURN hostname, dotted or not) is never rewritten,
+	#     and `@edgeRefuse` also answers 421 to any Host outside that list, so nothing but a listed host reaches the routes.
+	#     A dotted Host that does not match its server name is refused like any other.
+	#   * Sends the shared secret as X-DeskRally-Edge on requests proxied to the control plane ONLY (see
+	#     `handle_path /cp/*` below); signaling and the static routes never see it.
+	#
+	# THE MATCHER IS CEL (Caddy's `expression`). `lowerAscii()` is part of Caddy's CEL string extension: `caddy
+	# validate` accepts it on Caddy 2.8.4 and 2.10.2 and rejects an unknown function name, so a Caddy without it
+	# fails the validate step above instead of going live. `{http.request.port}` is an INTEGER when the Host
+	# carries a port and "" when it does not, so it is compared through string(): a bare `!= "443"` compares an
+	# int with a string, is always true, and refused an explicit `Host: main.deskrally.com:443`.
+	#
+	# scripts/test-caddy-edge.mjs runs THIS file with the block enabled, in front of stub upstreams, on a real
+	# Caddy, and probes the refusal matrix of docs/66 2b.6. Run it after any change here.
+	#
+	#| request_header -X-DeskRally-Edge
+	#| request_header -X-Forwarded-Host
+	#| request_header -Forwarded
+	#| request_header -X-Original-Host
+	#| request_header -X-Forwarded-Proto
+	#| @dotHost expression `{http.request.tls.server_name} != "" && {http.request.tls.server_name}.lowerAscii() in "{$SITE_ADDRESS}".lowerAscii().replace(",", " ").split(" ") && {http.request.host}.endsWith(".") && {http.request.host}.substring(0, size({http.request.host}) - 1).lowerAscii() == {http.request.tls.server_name}.lowerAscii() && (string({http.request.port}) == "" || string({http.request.port}) == "443")`
+	#| request_header @dotHost Host {http.request.tls.server_name}
+	#| @edgeRefuse expression `{http.request.host} == "" || (string({http.request.port}) != "" && string({http.request.port}) != "443") || {http.request.tls.server_name}.lowerAscii() != {http.request.host}.lowerAscii() || !{http.request.orig_uri}.startsWith("/") || ({http.request.header.Host} != "" && {http.request.header.Host}.lowerAscii() != {http.request.hostport}.lowerAscii()) || !({http.request.host}.lowerAscii() in "{$SITE_ADDRESS}".lowerAscii().replace(",", " ").split(" "))`
+	#| handle @edgeRefuse {
+	#| 	respond "Misdirected Request" 421
+	#| }
+
+	# --- control-plane API ----------------------------------------------------------------------
+	# handle_path STRIPS the matched prefix, which is what makes this identical to the dev proxy
+	# (vite.config.ts rewrites `^/cp` away). `handle /cp/*` would NOT strip, and every route 404s.
+	# The control plane's service-token routes (/internal/*) are for signaling, which calls the
+	# control plane directly on the compose network (SIGNALING_DEVICE_IDENTITY_URL). Nothing on the
+	# internet has a reason to reach them, and through /cp/* they answered at
+	# https://<host>/cp/internal/... with a leaked CP_DEVICE_IDENTITY_TOKEN as their only guard
+	# (security audit 2026-10-18). Placed before /cp/* because handle blocks match in written order.
+	@cpInternal path /cp/internal /cp/internal/*
+	handle @cpInternal {
+		respond 404
+	}
+	handle_path /cp/* {
+		# --- docs/63 R4: CENTRAL RECORDING ROUTES (two explicit handles, then the unchanged catch-all) -------------
+		# These sit INSIDE this handle_path, so the prefix is already stripped and the matchers name the control
+		# plane's own paths (`/agent/recordings...`, `/recordings/...`; the agent's signed canonical path is the
+		# stripped one too, docs/63 5.1). They are UNCONDITIONAL and INERT while storage is off: with
+		# RECORDING_MASTER_KEY empty the control plane mounts none of these routes and answers them 404 at once.
+		# Everything not matched falls to the last `handle`, which is byte-for-byte the proxy this block used to be.
+		#
+		# UPLOAD (agent -> server): create/finish carry a JSON body the server caps at 16 KiB and a PUT carries ONE
+		# chunk of at most RecChunkSize = 1 MiB (control-plane/recording_store.go; http_recording_upload.go refuses a
+		# larger Content-Length with 413 before it reads a byte). The cap here is that chunk plus 64 KiB of headroom,
+		# so it can never be LOWER than the server's own and the server stays the authority on the exact number; it
+		# exists so a client cannot make Caddy stream megabytes at a route that will refuse them. Change it only
+		# together with RecChunkSize. Timeouts: the server's own deadlines are 15 s for headers, 20 s without a body
+		# byte, 3 min for one chunk and 10 min for a finish's verification (RecordingUploadConfig), so the transport
+		# must outlast the slowest of them or Caddy would cut a legitimate finish at its own shorter clock and the
+		# agent would retry an operation that had in fact succeeded: write_timeout 4m (a slow agent trickling a
+		# chunk), response_header_timeout and read_timeout 12m (finish), dial_timeout 5s (an unreachable control
+		# plane fails fast). Request bodies are NOT buffered (Caddy's default), so a chunk streams through.
+		# Off-state note: with storage off these routes do not exist, so a body over the cap gets 413 from Caddy instead of
+		# 404 from the control plane (unreachable in practice, but not strictly identical).
+		@recUpload path /agent/recordings /agent/recordings/*
+		handle @recUpload {
+			request_body {
+				max_size 1088KiB
+			}
+			reverse_proxy controlplane:8081 {
+				#| header_up X-DeskRally-Edge {$CP_EDGE_SECRET}
+				transport http {
+					dial_timeout 5s
+					write_timeout 4m
+					response_header_timeout 12m
+					read_timeout 12m
+				}
+			}
+		}
+		# PLAYBACK / DOWNLOAD (server -> console): `GET /recordings/{id}/segments/{n}/stream` (a decrypted WebM, with
+		# Range) and `GET /recordings/{id}/download` (a ZIP streamed with no Content-Length). Both can run for as long
+		# as a viewer watches or a download takes, so NO read or write timeout is set on this transport (Caddy's
+		# default is none; stating it here is what stops a later "tidy-up" adding one). The control plane keeps its own
+		# per-write deadlines (30 s / 60 s of no progress), which is the real slow-peer bound. response_header_timeout
+		# 2m covers the audit write + a first decrypted frame. flush_interval -1 sends every write straight on, so a
+		# ZIP is not held in a buffer until it fills. A GET has no request body, so there is no max_size to set;
+		# anything a client does send is refused by the control plane. The listing/detail/playlist routes
+		# (`GET /recordings`, `/recordings/{id}`, `/recordings/{id}/playlist`) are short JSON and stay on the default
+		# proxy below. These two paths are also excluded from `encode` at the top of this site: re-compressing video or
+		# a stored ZIP buys nothing and drops Content-Length, which a download's progress bar and Range replies rely on.
+		@recStream path_regexp recStream ^/recordings/[^/]+/(segments/[^/]+/stream|download)$
+		handle @recStream {
+			reverse_proxy controlplane:8081 {
+				#| header_up X-DeskRally-Edge {$CP_EDGE_SECRET}
+				flush_interval -1
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 2m
+				}
+			}
+		}
+		handle {
+			reverse_proxy controlplane:8081 {
+				#| header_up X-DeskRally-Edge {$CP_EDGE_SECRET}
+			}
+		}
+	}
+
+	# --- signaling WebSocket --------------------------------------------------------------------
+	# Caddy proxies an Upgrade transparently; no websocket-specific directives are needed. The
+	# control plane advertises this same URL to the console via CP_SIGNALING_URL — the console dials
+	# whatever it is told, so the two must agree.
+	handle /ws {
+		reverse_proxy signaling:8080
+	}
+
+	# --- hostile paths: 404 HONESTLY -------------------------------------------------------------
+	# Everything below this point used to fall through to the SPA, so GET /wp-login.php answered 200
+	# with index.html. That is bad twice over: every scanner reads 200 as a live target and keeps
+	# going, and status-based probe detection becomes impossible, which forced the first fail2ban
+	# filter to match URI patterns instead of status codes — a list that must be maintained and will
+	# always lag. These 404s are what make a status-based jail possible.
+	#
+	# Deliberately NOT matching /.well-known/*: Caddy answers ACME challenges itself, and a stray
+	# match here would break certificate renewal ~60 days before anyone noticed.
+	@probe path_regexp (?i)^/(\.git|\.env|\.aws|\.ssh|\.hg|\.svn|\.docker|wp-|wordpress|xmlrpc|phpmyadmin|pma/|adminer|vendor/|cgi-bin/|actuator|solr/|jenkins|owa/|autodiscover|boaform|hudson)
+	handle @probe {
+		respond 404
+	}
+
+	# --- Android technician app (TWA): Digital Asset Links + web app manifest (android/README.md) ---------
+	# Exact-path matches only. NOT /.well-known/*: Caddy answers ACME challenges itself.
+	# assetlinks.json binds com.deskrally.technician to its signing cert so Chrome opens the
+	# console full-screen with no URL bar. It MUST be application/json and MUST NOT fall through to
+	# the SPA catch-all (HTML there makes verification fail silently and the app shows a URL bar).
+	# Short cache: adding the Play App Signing fingerprint must take effect within minutes.
+	@assetlinks path /.well-known/assetlinks.json
+	handle @assetlinks {
+		root * /srv/viewer
+		header Content-Type "application/json"
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+	@webmanifest path /manifest.webmanifest
+	handle @webmanifest {
+		root * /srv/viewer
+		header Content-Type "application/manifest+json"
+		header Cache-Control "no-cache"
+		file_server
+	}
+	# --- the support-client download (docs/27 step 14, docs/28) ----------------------------------
+	# ORDER MATTERS: this block sits BETWEEN @probe and @staticasset on purpose. `handle` blocks are
+	# mutually exclusive and evaluated in written order, and @staticasset below matches ANY path
+	# ending in `.exe`. If this came after it, /download/DeskRallySupport.exe would be swallowed by
+	# @staticasset (served from /srv/viewer, where it does not exist -> 404) and none of the headers
+	# here would apply. Placed here, this claims the whole /download/* space first.
+	#
+	# handle_path STRIPS `/download`, so inside, the artifact is at `/DeskRallySupport.exe`. Only the
+	# support filenames and narrowly matched update feeds are served; other files and directory
+	# listings remain unavailable. Update manifests are published only after their payloads.
+	#
+	# NOTHING IN THIS REPO HAS RUN THIS CONFIG against a live artifact yet: the curl matrix in
+	# docs/27 step 14 must be pasted into docs/20 before any claim about status codes or headers.
+	handle_path /download/* {
+		root * /srv/artifacts
+
+		# Public release metadata contains no tenant configuration or enrollment credentials.
+		# no-store lets operators halt an agent ring by removing its manifest.
+		# Agent auto-update (1.3.0+, docs/33) reads format-2 manifests under /agent/v2/<ring>/ and
+		# downloads the signed MSI below; format 1 paths stay for older agents.
+		@updateManifest path /client/manifest.json /agent/canary/manifest.json /agent/early/manifest.json /agent/general/manifest.json /agent/v2/canary/manifest.json /agent/v2/early/manifest.json /agent/v2/general/manifest.json
+		handle @updateManifest {
+			header Content-Type "application/json"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "no-store"
+			file_server
+		}
+		@updatePayload path_regexp updatePayload ^/(client/releases/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)/DeskRallyClient\.exe|agent/releases/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)/(agent_host\.exe|DeskRallyAgent\.msi))$
+		handle @updatePayload {
+			header Content-Type "application/octet-stream"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "public, max-age=31536000, immutable"
+			file_server
+		}
+
+		# The exe: forced download, opaque type, no sniffing, briefly cacheable.
+		@exe path /DeskRallySupport.exe
+		handle @exe {
+			header Content-Disposition "attachment; filename=\"DeskRallySupport.exe\""
+			header Content-Type "application/octet-stream"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "public, max-age=300"
+			file_server
+		}
+
+		# The sidecar hash: plain text, NO attachment disposition (a customer/technician reads it in
+		# the browser to check it against the page and the read-back).
+		@sha path /DeskRallySupport.exe.sha256.txt
+		handle @sha {
+			header Content-Type "text/plain; charset=utf-8"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "public, max-age=300"
+			file_server
+		}
+
+		# Installation without a build machine (docs/guides): the server release package and the
+		# silent-install provisioning script, each with a plain-text SHA-256 sidecar. Versioned
+		# package names are immutable; latest.json (which names the current one) and the script are
+		# not, so they are briefly cacheable only.
+		@serverRelease path_regexp serverRelease ^/server/deskrally-server-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.tar\.gz$
+		handle @serverRelease {
+			header Content-Type "application/gzip"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "public, max-age=31536000, immutable"
+			file_server
+		}
+		@installText path_regexp installText ^/(server/deskrally-server-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.tar\.gz\.sha256\.txt|agent/new-msi-provisioning\.ps1\.sha256\.txt)$
+		handle @installText {
+			header Content-Type "text/plain; charset=utf-8"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "public, max-age=300"
+			file_server
+		}
+		@serverLatest path /server/latest.json
+		handle @serverLatest {
+			header Content-Type "application/json"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "no-store"
+			file_server
+		}
+		@provisioningScript path /agent/new-msi-provisioning.ps1
+		handle @provisioningScript {
+			header Content-Disposition "attachment; filename=\"new-msi-provisioning.ps1\""
+			header Content-Type "application/octet-stream"
+			header X-Content-Type-Options "nosniff"
+			header Cache-Control "public, max-age=300"
+			file_server
+		}
+
+		# Anything else under /download/* — a probe, a guessed name, a bare directory — is a 404.
+		handle {
+			respond 404
+		}
+	}
+
+	# --- a request that NAMES AN ASSET must resolve to a real file, or 404 -----------------------
+	# The SPA fallback below is correct for ROUTES and wrong for ASSETS. With one `try_files` for
+	# both, GET /download/bridge-guest.exe returned 200 with 445 bytes of HTML — verified live on
+	# 2026-08-30 for four plausible download paths. On Windows that is worse than a 404: the browser
+	# saves an HTML file under an .exe name, the failure surfaces much later as "corrupt download"
+	# or an AV complaint, and it teaches a guest to run a downloaded .exe that is not what it says.
+	#
+	# THE EXTENSION LIST IS EXPLICIT, AND THAT IS THE WHOLE POINT. The first version of this matched
+	# `\.[A-Za-z0-9]{1,8}$` — "the last segment has a dot" — which was measured against real Caddy
+	# and 404'd routes it must not:
+	#     /machines/DESKTOP-ABC123.local   /machines/10.0.0.5   /tenants/acme.co.uk
+	#     /users/user@example.com          /sessions/2026.08.30
+	# Those break on RELOAD and on SHARED LINKS but not on in-app navigation, which is the worst
+	# failure shape there is: intermittent, user-reported, and it looks like a backend fault. A
+	# Windows fleet is full of FQDN-shaped machine names, so this product would have hit it.
+	#
+	# "Has a dot" cannot separate /download/x.exe from /machines/host.local — nothing structural
+	# can. So the list names asset and executable suffixes ONLY, and deliberately excludes anything
+	# TLD-shaped (.local .co .uk .org .io .net) or numeric, which is what keeps app routes working.
+	#
+	# THIS IS A PREREQUISITE for the pre-login guest-download affordance: until a missing artifact
+	# 404s, a download link cannot fail honestly. Note it protects EVERY path, not just a download
+	# prefix — so a future download route added somewhere else cannot reintroduce the HTML-as-.exe
+	# bug by forgetting to register itself here. Measured at an unblessed path:
+	# /anywhere/at/all/payload.ps1 -> 404, and /DOWNLOAD/X.EXE -> 404 (the (?i) works).
+	#
+	# THE LIST IS NOT ABSOLUTE — three known holes, all measured, none a blocker:
+	#   * `.html` is deliberately NOT listed, so it falls to the catch-all and a MISSING .html still
+	#     returns the SPA (/nonexistent.html -> 200). That is what keeps /join.html and /index.html
+	#     working, and it is the one file-shaped family this guarantee does not cover.
+	#   * `.sh` is both an asset suffix and the TLD for Saint Helena, so /machines/host.sh 404s.
+	#   * `.json` would 404 a route ending in a date- or version-shaped segment (/reports/2026.json).
+	# All three are "an app route ends in one of ~40 NAMED suffixes", which is a far smaller and more
+	# predictable target than the "contains a dot" version this replaced. Controls that pass:
+	# /machines/PC.corp.local and /machines/name.with.many.dots both 200.
+	@staticasset path_regexp (?i)\.(exe|msi|msix|dll|ps1|bat|cmd|sh|zip|7z|gz|tgz|tar|pkg|dmg|deb|rpm|ico|png|jpe?g|gif|webp|svg|css|js|mjs|map|woff2?|ttf|eot|json|xml|txt|pdf|wasm)$
+	handle @staticasset {
+		root * /srv/viewer
+		file_server
+	}
+
+	# --- the viewer bundle, and everything else --------------------------------------------------
+	# dist/viewer is index.html + join.html + assets/. `join.html` is a byte-identical copy of
+	# index.html that build-release.ps1 ships deliberately, so the attended-guest /join entry point
+	# resolves on a host that does no rewriting at all — docs/10 §5 records the production outage
+	# that taught us: GET /join returned 404 on a plain static host while working in dev and in e2e.
+	#
+	# `try_files` is now SCOPED to this block, so it can only ever affect requests the two handlers
+	# above did not claim.
+	#
+	# `Cache-Control: no-cache` on everything this block serves (index.html, join.html and every SPA
+	# route that falls back to index.html): revalidate on every load, which costs a 304 when nothing
+	# changed. Without it the response carried only ETag + Last-Modified, so browsers and the desktop
+	# app's WebView2 applied HEURISTIC freshness (a fraction of the file's age) and kept serving the
+	# previous release's index.html, and with it the previous bundle, after a deploy: measured
+	# 2026-10-17 on a desktop app relaunched after the 22a8e4a deploy, which requested no / and
+	# no /assets/* and ran the pre-toolbox console against the new control plane. The hashed
+	# /assets/* files are served by @staticasset above and are untouched: their names change per build.
+	handle {
+		root * /srv/viewer
+		header Cache-Control "no-cache"
+		try_files {path} {path}/ /index.html
+		file_server
+	}
+}
+
+{$SITE_ADDRESS} {
+	import deskrally_site
+}
+
+#| # ONE trailing dot on the Host (`Host: main.deskrally.com.`) is a legal spelling of the same name that Caddy's host
+#| # matcher never matches, so it would never enter the site above. This catch-all site is where it lands (and only
+#| # what the site above did not claim), serving the SAME routes through the snippet; `@dotHost` inside the snippet
+#| # rewrites the dotted Host to the TLS server name before anything else looks at it. Anything else that lands here
+#| # (an unlisted Host whose server name is a listed one) is answered 421 by `@edgeRefuse`.
+#| :443 {
+#| 	import deskrally_site
+#| }
+
+# =================================================================================================
+# The TURN hostname ({$TURN_SITE_ADDRESS}) — TLS cert issuance for the TURN server (docs/20 §9). This block exists ONLY so
+# Caddy obtains and RENEWS the certificate for the TURN hostname; coturn then reads that same cert
+# out of the shared caddydata volume for TURNS (docker-compose.turn.yml). One ACME client, one
+# renewal path, no second cert story.
+#
+# The public IP for this name (the second IP, IP-B) has its :443 forwarded to coturn (:5349), NOT to Caddy,
+# so Caddy CANNOT use TLS-ALPN for it — issuance is over HTTP-01, which needs :80 for this name
+# reaching Caddy (the gateway forwards IP-B:80 -> the box's :80). Until that forward is up, Caddy just
+# retries the cert in the background; the main site is unaffected. Nothing is served here.
+{$TURN_SITE_ADDRESS:turn.deskrally.com} {
+	respond "DeskRally TURN endpoint" 200
+}

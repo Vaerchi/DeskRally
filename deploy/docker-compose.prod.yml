@@ -1,0 +1,487 @@
+# =================================================================================================
+# UNVERIFIED: never run. Docker is not installed on the dev box. Authored 2026-08-25 against the
+# real source; treat it as a draft until a loop stands it up.
+# docs/18-selfhost-deployment.md is the reasoning behind every choice here.
+# =================================================================================================
+#
+# Internet-facing OVERLAY for a single self-hosted Linux box. Layered on top of the base file, which
+# is left untouched — that one is the documented LAN/dev bring-up and publishing 8080/8081/9000/9001
+# on 0.0.0.0 is right for a laptop and wrong for a public host.
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build
+#
+# It does exactly two things:
+#   1. WITHDRAWS the host port publications of signaling, relay and controlplane. They keep talking
+#      to each other over the compose network by service name; they simply stop listening on the
+#      host. On an internet-facing box those four listeners are surface nobody needs — and the relay
+#      in particular is never used by a BROWSER console at all (see below).
+#   2. ADDS Caddy as the single public listener: TLS, the static viewer, /cp -> control-plane and
+#      /ws -> signaling, all on one origin so the shipped bundle needs no rebuild.
+#
+# Required in .env alongside the base file's variables:
+#   SITE_ADDRESS   remote.example.com          (a real hostname; see the TLS note in the Caddyfile —
+#                                              plain http:// breaks the console's connect path)
+#   PUBLIC_IP      the host IP Caddy binds to  (see the ports: block below)
+#   VIEWER_DIST    path to the built viewer    (default ../dist/viewer)
+#
+# And, from the base file, at minimum: POSTGRES_PASSWORD, GRANT_ISSUER_SEED,
+# SIGNALING_TICKET_PUBKEY, plus CP_SECURE_COOKIE=1 / CP_TRUST_PROXY_IP=1 once TLS is on.
+
+# MEASURED, 2026-08-26, by this repo's own CI: a bare `ports: []` withdraws NOTHING. Compose
+# CONCATENATES `ports` across files — it is one of the documented multi-value options (with expose,
+# external_links, dns, dns_search, tmpfs) that merge instead of replace — so the overlay's empty list
+# was appended to the base's and every publication survived. The CI assertion caught it on the first
+# run: `FAIL: signaling still publishes 1 host port(s) under the prod overlay`.
+#
+# `!reset` is the documented way to remove an attribute during a merge, and it REQUIRES
+# Docker Compose v2.24.4 or newer. On an older Compose the tag is a parse error, which is the right
+# failure: loud at bring-up, rather than four silently-published listeners on a public host.
+services:
+  # THE RLS FIX. The base file points DATABASE_URL at ${POSTGRES_USER}, which is the postgres image's
+  # BOOTSTRAP SUPERUSER — and a superuser bypasses row-level security UNCONDITIONALLY. Every one of
+  # the 13 protected tables carries `FORCE ROW LEVEL SECURITY`, but FORCE constrains the table OWNER;
+  # it does not constrain a superuser. So the containerised control plane ran with tenant isolation
+  # silently disarmed, which is the hard rule docs/10 states and 0005's own header warns about.
+  #
+  # Fix, in two halves that must go together: give `rmt_app` a password on first init, and point the
+  # control plane at it. `rmt_app` is created NOSUPERUSER NOBYPASSRLS by 0005, so RLS then applies.
+  postgres:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # DROP the base file's `/docker-entrypoint-initdb.d` mount, KEEPING pgdata. In production the
+    # `migrate` service below owns the schema; leaving initdb to apply the migrations too would mean
+    # the first bring-up finds a fully-migrated database with no ledger, which the runner correctly
+    # REFUSES (ErrNeedsBaseline). One applier, on a fresh database and on an update alike.
+    #
+    # `!override`, NOT `!reset` — the distinction is the difference between this working and silently
+    # destroying the database. `!reset` REMOVES the attribute and IGNORES the value written under it
+    # (the compose spec says a value is required only to satisfy YAML). So `volumes: !reset` with a
+    # pgdata entry beneath it removed the volumes key ENTIRELY: no initdb mount, and no pgdata. The
+    # postgres image declares `VOLUME /var/lib/postgresql/data`, so the database would have landed on
+    # an ANONYMOUS volume — surviving a recreate, but orphaned by `down`, deleted by `volume prune`,
+    # and, worst of all, invisible to any backup aimed at `pgdata`, which compose still creates and
+    # leaves empty. Silent, total, and it only shows up the day you need the backup.
+    #
+    # `!override` REPLACES the merged value with what is written here, which is what was meant.
+    volumes: !override
+      - pgdata:/var/lib/postgresql/data
+
+  # Schema migrations, as a one-shot init container the control plane waits on.
+  #
+  # Same image as the control plane — `controlplane migrate` is a subcommand of the same binary, so
+  # there is no second artifact to keep in step with the schema it applies.
+  #
+  # It uses MIGRATE_DATABASE_URL (the OWNER) while the server uses DATABASE_URL (rmt_app). Not
+  # duplication: rmt_app is NOSUPERUSER with DML grants only and cannot run DDL, and giving the
+  # server DDL rights would undo the least-privilege split RLS depends on (docs/18 §4b).
+  #
+  # Idempotent and incremental — it records what it applied in `schema_migration`, and a second run
+  # is a no-op. That is the property that makes redeploying safe. On a database that predates the
+  # runner it REFUSES and asks for `--baseline` rather than assuming everything was applied.
+  migrate:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    build:
+      context: ../control-plane
+    command: ["migrate"]
+    environment:
+      MIGRATE_DATABASE_URL: "postgres://${POSTGRES_USER:-rmt}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rmt}?sslmode=disable"
+      MIGRATIONS_DIR: "/opt/rmt/migrations"
+      # Provisioned by the runner AFTER the migrations, because 0005 is what creates rmt_app.
+      # Without it the only working DSN is the owner's, and the owner is the bootstrap SUPERUSER,
+      # which bypasses row-level security unconditionally.
+      APP_DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD — without it rmt_app has no password and the only DSN that works bypasses RLS}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  signaling:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports: !reset []
+    environment:
+      # WITHOUT THESE THE CONTAINER CRASH-LOOPS ON BOOT. server/signaling/main.go log.Fatalf's when
+      # neither `-insecure-no-agent-auth` nor this pair is present, because register_agent could not
+      # otherwise be authenticated — "ANY WebSocket client could displace ANY agent and receive its
+      # brokered sessions". Neither compose file set them, so the stack had never been able to start.
+      #
+      # The URL is reached over the COMPOSE NETWORK, not the public hostname: this is a server-to-
+      # server call and must not leave the host. The token must equal the control plane's
+      # CP_DEVICE_IDENTITY_TOKEN below — it is the only thing guarding a cross-tenant device lookup.
+      SIGNALING_DEVICE_IDENTITY_URL: "http://controlplane:8081"
+      SIGNALING_DEVICE_IDENTITY_TOKEN: "${CP_DEVICE_IDENTITY_TOKEN:?set CP_DEVICE_IDENTITY_TOKEN (32+ chars) — signaling refuses to start without it}"
+      # Allowed browser Origins for the signaling WebSocket (docs/25 F09). Without this the Origin
+      # allowlist is in warn-only mode: any browser Origin may connect. Set to the console URL to
+      # enforce it: SIGNALING_ALLOWED_ORIGINS=https://console.example.com (matches SITE_ADDRESS with
+      # https:// scheme). Neither compose file forwarded this before, so existing deployments that
+      # set it in .env were silently running warn-only regardless.
+      # Blank (the default) = derived BY SIGNALING from SIGNALING_SITE_ADDRESS below, which is the
+      # SITE_ADDRESS the Caddyfile site block uses: a bare hostname or a Caddy list separated by
+      # commas/spaces ("main.example.com, loam.example.com"); each host becomes https://host. A
+      # scheme, port, path or wildcard in SITE_ADDRESS is a clear startup error (set the explicit
+      # variable then). Browsers always send Origin, so a page on any other site can no longer drive
+      # visitors' browsers to open /ws. Native clients (the agent, CLI tools) send NO Origin header
+      # and are always admitted. An explicit SIGNALING_ALLOWED_ORIGINS ALWAYS wins: a comma-separated
+      # list; entries may be wildcards ("https://*.example.com" = exactly one subdomain label). When
+      # CP_TENANT_HOST_SUFFIX is set, https://<tenant><suffix> is added automatically (SSO tenant
+      # hosts serve the same console). SIGNALING_ALLOWED_ORIGINS=* knowingly allows any origin
+      # (UNSAFE; logged as such). In production mode an EMPTY effective list is fatal.
+      SIGNALING_ALLOWED_ORIGINS: "${SIGNALING_ALLOWED_ORIGINS:-}"
+      SIGNALING_SITE_ADDRESS: "${SITE_ADDRESS:-}"
+      SIGNALING_ALLOWED_TENANT_HOST_SUFFIX: "${CP_TENANT_HOST_SUFFIX:-}"
+      # Production mode (security audit 2026-11-01 #7). Makes signaling log a POSTURE line + one
+      # WARNING per disabled protection, and REFUSE TO START when a per-IP cap is set without
+      # SIGNALING_TRUSTED_PROXIES (the cap would then put every client in Caddy's single bucket).
+      SIGNALING_PRODUCTION: "1"
+      # Per-source WebSocket connection limit (docs/25 F09). Pair with SIGNALING_TRUSTED_PROXIES so
+      # the real client IP is used; without it all clients share Caddy's IP as their quota bucket.
+      # Default 64 concurrent UNAUTHENTICATED (pre-auth/pending) sockets per real client IP: an
+      # anonymous-flood limit. A socket stops counting against it the moment its peer authenticates,
+      # so an office with hundreds of agents behind one NAT is never locked out by it. Authenticated
+      # sockets per IP are bounded only by the large backstop SIGNALING_MAX_AUTHENTICATED_PER_IP
+      # below. Set this to 0 in .env to disable.
+      SIGNALING_MAX_CONNECTIONS_PER_IP: "${SIGNALING_MAX_CONNECTIONS_PER_IP:-64}"
+      # CIDRs whose TCP peers may set X-Forwarded-For. signaling's port is NOT published (ports are
+      # reset above), so the only peers that can reach it are containers on the compose network, and
+      # the only one that proxies is Caddy. The compose network gets a Docker-assigned subnet that is
+      # not pinned in these files (a bridge from 172.16.0.0/12, or 192.168/16 / 10/8 when Docker's
+      # address pools are customised), so the default trusts exactly the RFC 1918 ranges: never a
+      # public address, so an internet client cannot forge X-Forwarded-For (Caddy overwrites the
+      # header for untrusted clients, and signaling reads the RIGHTMOST hop). Narrow it to your actual
+      # subnet if you prefer (docker network inspect deploy_default | grep Subnet). Leaving it empty
+      # while the per-IP cap is on is refused at startup.
+      SIGNALING_TRUSTED_PROXIES: "${SIGNALING_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
+      # Pre-auth (unauthenticated) sockets one source may hold at once, and new connections per second
+      # per source (burst x6). A source over its pending cap can only replace its OWN oldest pending
+      # socket; a full pool refuses the newcomer instead of evicting someone else's handshake.
+      # At the cap a NEW connection is refused with 503 + Retry-After; an in-progress handshake is
+      # never cancelled (only the pre-auth timeout frees a slot).
+      SIGNALING_MAX_PENDING_PER_SOURCE: "${SIGNALING_MAX_PENDING_PER_SOURCE:-32}"
+      # Backstop on AUTHENTICATED long-lived sockets per real client IP (a very large NAT'd fleet).
+      SIGNALING_MAX_AUTHENTICATED_PER_IP: "${SIGNALING_MAX_AUTHENTICATED_PER_IP:-4096}"
+      SIGNALING_MAX_CONNECTS_PER_SECOND_PER_IP: "${SIGNALING_MAX_CONNECTS_PER_SECOND_PER_IP:-10}"
+      # Per-connection message-rate ceiling (docs/25 F09). docs/26 recorded all four F09 mitigations
+      # as shipped, but neither compose file forwarded this one, so production always ran unlimited
+      # (security audit 2026-10-18). A connection over the ceiling is told why and closed. The
+      # bucket holds one second's worth, so 200 admits a 200-message burst — far above an ICE
+      # trickle, even an agent's single socket carrying several sessions. 0 disables it.
+      SIGNALING_MAX_MESSAGES_PER_SECOND: "${SIGNALING_MAX_MESSAGES_PER_SECOND:-200}"
+      # Ledger-failure posture for session tickets: 1 (default here) = fail-CLOSED (refuse to broker
+      # when the control plane's replay ledger is unreachable, closing the cross-instance replay
+      # window); set it to 0 in .env for the old fail-open behaviour.
+      SIGNALING_STRICT_TICKET_REDEMPTION: "${SIGNALING_STRICT_TICKET_REDEMPTION:-1}"
+
+  controlplane:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports: !reset []
+    # Wait for migrations to COMPLETE SUCCESSFULLY before serving. `service_completed_successfully`
+    # is the load-bearing condition: with a plain `depends_on` the server would start alongside a
+    # failed migration and 500 on every route that touches a column the schema does not have yet.
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # Connect as the LEAST-PRIVILEGE role, never as the owner/superuser. See the postgres service
+      # above for why this is not optional. sslmode stays disable because this hop is the compose
+      # network, not the wire — if you move Postgres off-box, change it.
+      DATABASE_URL: "postgres://rmt_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-rmt}?sslmode=disable"
+      # MUST BE EXPLICITLY CLEARED, and this is not belt-and-braces (docs/25 F13).
+      #
+      # `environment:` maps merge per-key across compose files, so the base file's
+      # CP_INSECURE_ALLOW_PRIVILEGED_DB=1 — which exists so its owner-role LAN bring-up still
+      # starts — would otherwise be INHERITED here and skip the row-level-security role check,
+      # leaving the guard inert in the one deployment it exists for. Empty reads as false.
+      #
+      # NOT MEASURED ON THE BUILD BOX: docker is not installed there, so this pair is validated by
+      # CI's docker job rather than locally. The reasoning it rests on is already load-bearing in
+      # this very file, though — the DATABASE_URL line above is an override of the base file's DSN
+      # by the same per-key mechanism, and if that did not hold, production would already be
+      # connecting as the owner and the "THE RLS FIX" note at the top of this file would be wrong.
+      # Worth confirming with `docker compose config` on the deployment host regardless.
+      CP_INSECURE_ALLOW_PRIVILEGED_DB: ""
+      # Likewise: the insecure full-owner dev mode must never be reachable from a production
+      # overlay, whatever a stale .env or a merged base file happens to carry.
+      CP_INSECURE_DEV: ""
+      CP_INSECURE_DEV_LISTEN_ANY: ""
+      # REQUIRED here, though the base file defaults it to empty for LAN dev.
+      #
+      # Unset, the control plane logs a warning and generates an EPHEMERAL issuer key — and the
+      # damage is delayed and silent. SIGNALING_TICKET_PUBKEY (the key DERIVED from this seed) is
+      # already `:?`-required, so a bring-up harvests a pubkey and pins it; if the seed was empty,
+      # that pubkey is regenerated on the next restart and every enrolled agent rejects every new
+      # grant. Backstage simply stops working, and the only evidence is a warning line in a log from
+      # whenever the stack last started.
+      #
+      # Guarding the derived value while leaving its SOURCE optional is the wrong way round, so:
+      GRANT_ISSUER_SEED: "${GRANT_ISSUER_SEED:?set GRANT_ISSUER_SEED (64 hex chars, openssl rand -hex 32) and NEVER regenerate it — enrolled agents pin the key derived from it}"
+      # Encrypts TOTP secrets at rest (64 hex chars, openssl rand -hex 32). SEPARATE from
+      # GRANT_ISSUER_SEED so one compromised value does not also decrypt every second factor.
+      #
+      # Deliberately `:-` and not `:?`, unlike its neighbour, and the reason is the upgrade path
+      # rather than a judgement that it matters less. Making it required would stop an EXISTING
+      # deployment from starting at the moment it pulled this change, turning a hardening commit
+      # into an outage. The code degrades honestly instead: with no key set, secrets already on disk
+      # still verify and only NEW enrollments are refused, and the control plane says so loudly at
+      # startup. Set it, then run `reencrypt-totp` to convert the existing rows.
+      #
+      # BACK IT UP with GRANT_ISSUER_SEED. Losing it means every enrolled user re-enrols.
+      TOTP_ENCRYPTION_KEY: "${TOTP_ENCRYPTION_KEY:-}"
+      # Marks the session cookie Secure. Mandatory behind TLS: the cookie IS the console's auth.
+      CP_SECURE_COOKIE: "${CP_SECURE_COOKIE:-1}"
+      # Console SSO (docs/34): the public host suffix every tenant lives under (".deskrally.com").
+      # The OIDC routes mount ONLY when this is set; the redirect URI is built from it and the request
+      # Host must match <slug>+suffix. `:-` (optional) so an existing deployment starts unchanged with
+      # SSO simply absent. This service gets its env only from these explicit keys, so a .env line
+      # alone does nothing without this mapping.
+      CP_TENANT_HOST_SUFFIX: "${CP_TENANT_HOST_SUFFIX:-}"
+      # docs/66 hostname theming is OPT-IN and OFF by default (CP_TENANT_HOST_SUFFIX alone never enables it). Set
+      # CP_HOST_THEMING=on together with CP_EDGE_SECRET (>= 32 chars) and the Caddy X-DeskRally-Edge marker; the control
+      # plane refuses to start with theming on and no secret. Uncomment to pass them through:
+      # CP_HOST_THEMING: "${CP_HOST_THEMING:-}"
+      # CP_EDGE_SECRET: "${CP_EDGE_SECRET:-}"
+      # CP_DEFAULT_HOSTS: "${CP_DEFAULT_HOSTS:-}"
+      # CP_LEGACY_UNSCOPED_HOSTS: "${CP_LEGACY_UNSCOPED_HOSTS:-}"
+      # CP_PUBLIC_AUTHORITIES: "${CP_PUBLIC_AUTHORITIES:-}"
+      # Restricts X-Forwarded-For trust to TCP peers whose address falls in these CIDRs
+      # (comma/space/semicolon-separated). PREFER this over CP_TRUST_PROXY_IP: it closes the
+      # spoofing path where a sibling container on the same Docker network forges XFF to bypass
+      # the allow-list or impersonate a throttle bucket. Set to the Caddy container's subnet,
+      # e.g. "172.20.0.0/24". A malformed entry is a hard startup failure.
+      # When set, CP_TRUST_PROXY_IP is ignored (the nets list supersedes the bool).
+      CP_TRUSTED_PROXIES: "${CP_TRUSTED_PROXIES:-}"
+      # Legacy: take the client IP from X-Forwarded-For without restricting which peer may set it.
+      # Only effective when CP_TRUSTED_PROXIES is unset. Prints a startup warning when active.
+      CP_TRUST_PROXY_IP: "${CP_TRUST_PROXY_IP:-1}"
+      # Restrict the AUTHENTICATED console API to these CIDRs. Empty = open (backward compatible).
+      # A malformed entry is a hard startup failure, never a silent widening.
+      # LIMIT, stated so it is not over-trusted: this covers the console API only. Agent-enroll and
+      # guest-attend routes stay open by design — they carry their own bearer authorization.
+      CP_ADMIN_IP_ALLOWLIST: "${CP_ADMIN_IP_ALLOWLIST:-}"
+      # What the console is told to dial for signaling. Must match the Caddyfile's /ws route.
+      CP_SIGNALING_URL: "${CP_SIGNALING_URL:?set CP_SIGNALING_URL, e.g. wss://remote.example.com/ws}"
+      # The other half of the device-identity pair. Unset ⇒ the /internal/devices route is not
+      # mounted at all, and signaling (which refuses to start without it) could not verify an
+      # agent's proof of possession even if it did start.
+      CP_DEVICE_IDENTITY_TOKEN: "${CP_DEVICE_IDENTITY_TOKEN:?set CP_DEVICE_IDENTITY_TOKEN (32+ chars)}"
+      # Documented in .env.example and previously forwarded by neither compose file, so setting it
+      # did nothing and the default silently applied.
+      CP_SESSION_IDLE_MINUTES: "${CP_SESSION_IDLE_MINUTES:-30}"
+      # Operator tunables the control plane reads but neither compose file forwarded, so a .env line
+      # for any of them did nothing (found by TestComposeForwardsEveryEnvVarTheServerReads). Every one
+      # reads an EMPTY value exactly like an UNSET one (the reader's `!= ""` / default branch), so the
+      # empty `:-` pass-through is the built-in behaviour until .env sets it.
+      # Name in TOTP provisioning URIs. Empty = rmt-control-plane.
+      CP_ISSUER_NAME: "${CP_ISSUER_NAME:-}"
+      # Expected agent build, "<semver>+<short-sha>" (docs/01 section 6): GET /agent-version returns it and
+      # the console flags outdated machines. Empty = version tracking off.
+      AGENT_PUBLISHED_VERSION: "${AGENT_PUBLISHED_VERSION:-}"
+      # Concurrent-connection cap (empty = the built-in default) and the whole-request read timeout
+      # (a Go duration such as 60s; empty = the built-in default).
+      CP_MAX_CONNS: "${CP_MAX_CONNS:-}"
+      CP_LOOKUP_DB_CONNS: "${CP_LOOKUP_DB_CONNS:-}"
+      CP_READ_TIMEOUT: "${CP_READ_TIMEOUT:-}"
+      # Argon2 concurrency / queue bounds (docs/25 F01; ~64 MiB per slot). Empty = the built-in defaults.
+      CP_PASSWORD_HASH_CONCURRENCY: "${CP_PASSWORD_HASH_CONCURRENCY:-}"
+      CP_PASSWORD_HASH_QUEUE: "${CP_PASSWORD_HASH_QUEUE:-}"
+      # Concurrent lookups of credentials that have not yet proved themselves, and how many more may wait
+      # (credential_guard.go). Empty = the built-in defaults (a quarter of the database pool; twice that waiting).
+      CP_AUTH_LOOKUP_CONCURRENCY: "${CP_AUTH_LOOKUP_CONCURRENCY:-}"
+      CP_AUTH_LOOKUP_QUEUE: "${CP_AUTH_LOOKUP_QUEUE:-}"
+      # Fleet directives (docs/65): signed with a DEDICATED seed that must differ from GRANT_ISSUER_SEED
+      # (the control plane refuses to start otherwise). Empty = directive routes not mounted. The notify
+      # URL is signaling over the compose network (server-to-server, authenticated by the
+      # device-identity token above); it only matters once the seed is set.
+      DIRECTIVE_SIGNING_SEED: "${DIRECTIVE_SIGNING_SEED:-}"
+      CP_SIGNALING_NOTIFY_URL: "${CP_SIGNALING_NOTIFY_URL:-http://signaling:8080}"
+      # docs/63 R4 -- CENTRAL SESSION-RECORDING STORAGE. OPT-IN AND OFF: every secret below defaults to EMPTY, and
+      # storage turns on only when RECORDING_MASTER_KEY is non-empty (RecordingKeyringFromEnv returns "off" for an
+      # empty value, and nothing below it is then read). So a routine deploy of this file changes nothing the
+      # control plane does; the `recordings` volume and its mount are inert while the key is unset (an empty
+      # directory nothing opens). Turn it on / off and rotate: docs/20 "Turning on central recording storage".
+      #
+      # The master (key-encryption) key that wraps every recording's data key: 64 hex chars (openssl rand -hex 32), SEPARATE from
+      # GRANT_ISSUER_SEED and TOTP_ENCRYPTION_KEY. BACK IT UP FIRST (docs/22 section 0): losing it makes EVERY stored
+      # recording permanently unreadable. Do not set it before the `recordings` volume below exists on the box.
+      RECORDING_MASTER_KEY: "${RECORDING_MASTER_KEY:-}"
+      # Positive integer naming the current key (empty = 1). A new key gets a NEW id; the old one moves to _PREVIOUS.
+      RECORDING_MASTER_KEY_ID: "${RECORDING_MASTER_KEY_ID:-}"
+      # "id:hexkey,id:hexkey": every earlier key that still wraps a stored file (the READ path during and after a
+      # rotation; rotation is a rewrite, docs/63 7 X4, and no rotation command exists yet). Empty = none.
+      RECORDING_MASTER_KEY_PREVIOUS: "${RECORDING_MASTER_KEY_PREVIOUS:-}"
+      # Restore drills ONLY (1/true/yes/on): stops the orphan pass and the quarantine purge so a half-restored volume
+      # is not reorganised underneath the operator (docs/22 section 4). Leave empty in normal operation.
+      RECORDING_RECONCILE_MODE: "${RECORDING_RECONCILE_MODE:-}"
+      # Restore drills ONLY (1/true/yes/on), with RECORDING_RECONCILE_MODE: lets the 'lost' pass mark recordings lost even when
+      # most files are missing or the volume looks empty. Say it only after checking the right volume is mounted (docs/22 section 4).
+      RECORDING_RECONCILE_ACCEPT_MISSING: "${RECORDING_RECONCILE_ACCEPT_MISSING:-}"
+      # Disk floor in whole MiB (docs/63 C11): uploads are refused with 507 while the recordings volume would be left with less
+      # free space than this. EMPTY = the built-in default, 5120 (5 GiB). Valid 512..1048576; anything else stops startup.
+      # The volume shares the root filesystem with Postgres on the reference host, so this floor protects the database too.
+      RECORDING_DISK_FLOOR_MIB: "${RECORDING_DISK_FLOOR_MIB:-}"
+      # The in-container volume root. FIXED, not an .env knob: it must equal the mount target of the `recordings`
+      # volume below and the directory the image creates for uid 10001 (control-plane/Dockerfile), and it is also
+      # the code's own default. Read only when storage is on.
+      RECORDING_DIR: "/var/lib/deskrally/recordings"
+      # The upload-signature AUDIENCE: the exact public https origin agents enrolled against, scheme and host only
+      # (https://remote.example.com), no /cp, no path. REQUIRED once RECORDING_MASTER_KEY is set (startup refuses
+      # without it) and ignored while storage is off, so empty is safe to ship.
+      CP_PUBLIC_ORIGIN: "${CP_PUBLIC_ORIGIN:-}"
+    volumes:
+      # docs/63 R4: the evidence volume, a NAMED volume (not a bind mount: Docker copies the image's app-owned
+      # mount point into a fresh named volume, so uid 10001 can write it; a bind mount would be root-owned or
+      # whatever the host directory is). Mounting it while storage is off is harmless: it is created empty on the
+      # first `up` and nothing opens it until RECORDING_MASTER_KEY is set.
+      #
+      # TWO WARNINGS THAT BELONG NEXT TO THE LINE:
+      #   * `docker compose down -v` (and `docker volume rm`, `docker volume prune` after a `down`) DESTROYS every
+      #     stored recording. Plain `down` / `up` / `--force-recreate` keep it.
+      #   * In v1 this volume is OUTSIDE the backup contract (docs/63 D8, C11): deploy/backup-db.sh dumps Postgres
+      #     only. The tenant retention window is a DELETION policy, not a durability guarantee; losing the volume
+      #     loses the recordings even when the database backup is perfect. That stance is pending the deployment
+      #     owner's explicit acceptance (docs/22 section 4). The master key, by contrast, IS in the must-back-up set.
+      - recordings:/var/lib/deskrally/recordings
+
+  # The relay is the Rust agent's non-ICE fallback over raw TCP (agent-core/src/relay_transport.rs).
+  # A BROWSER console does not implement it at all — web/viewer/src/lib/transport.ts says so — so for
+  # a browser->agent session the NAT fallback is TURN, not this. It therefore needs no host
+  # publication in this topology. If you later add a non-browser controller on a different network,
+  # publish :9000 through an L4 forward (it is raw TCP; it cannot go through Caddy).
+  relay:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports: !reset []
+
+  caddy:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # Bind to ONE host address, not 0.0.0.0. On a box that also runs other public services, giving
+    # this stack its own IP frees 80/443 regardless of what else holds them, gives it its own
+    # hostname and certificate, and lets the gateway scope firewall rules per destination.
+    # Set PUBLIC_IP="" to bind all interfaces.
+    ports:
+      - "${PUBLIC_IP:-}:80:80"
+      - "${PUBLIC_IP:-}:443:443"
+    environment:
+      SITE_ADDRESS: "${SITE_ADDRESS:?set SITE_ADDRESS to a real hostname, e.g. remote.example.com — NOT :80; the console needs a secure context}"
+      # Forwarded even though the Caddyfile block that reads it ships COMMENTED, because the two
+      # files have to change together and only one of them is obvious. Without this line, setting
+      # ACME_EMAIL in .env and uncommenting that block — exactly what .env.example and the
+      # Caddyfile tell you to do — leaves {$ACME_EMAIL} EMPTY inside the container, which is a
+      # Caddyfile PARSE ERROR and takes the site down at the next restart. Found by someone
+      # following those instructions against a live deployment.
+      ACME_EMAIL: "${ACME_EMAIL:-}"
+      # The TURN server's hostname: Caddy only obtains and renews its certificate (coturn reads it
+      # from the shared volume). The default is the hosted service's name; a self-hosted install
+      # sets its own (install.sh writes turn.<SITE_ADDRESS>).
+      TURN_SITE_ADDRESS: "${TURN_SITE_ADDRESS:-turn.deskrally.com}"
+      # docs/66 hostname theming: the edge marker the Caddyfile's OPT-IN block sends to the control plane
+      # (`header_up X-DeskRally-Edge {$CP_EDGE_SECRET}`). COMMENTED, like that block: a routine deploy changes
+      # nothing. To adopt, uncomment this line together with the Caddyfile block and the controlplane service's
+      # CP_EDGE_SECRET above; both services read the SAME .env value. Without this line the variable is EMPTY
+      # inside this container and the block would send an empty marker (docs/66 2i).
+      # CP_EDGE_SECRET: "${CP_EDGE_SECRET:-}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The built console bundle: index.html + join.html + assets/. Produce it with
+      # scripts/build-release.ps1 (or `npm run build` in web/viewer).
+      - ${VIEWER_DIST:-../dist/viewer}:/srv/viewer:ro
+      # The signed support-client artifact directory the Caddyfile's /download route serves from
+      # (docs/27 step 15). Read-only, and SEPARATE from the viewer mount so the download and the
+      # console never share a document root. THE HOST DIRECTORY MUST EXIST BEFORE this container is
+      # (re)created: Docker resolves a bind mount at container-creation time, and a later
+      # `up -d --force-recreate caddy` reuses the stale inode if the path appeared afterwards. See
+      # docs/20's publish section. Default is empty until a deployment publishes a signed client.
+      - ${ARTIFACT_DIR:-../dist/artifacts}:/srv/artifacts:ro
+      # Certificates and ACME state. Losing this volume means re-issuing on every restart, which
+      # will hit Let's Encrypt rate limits.
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      - controlplane
+      - signaling
+
+  # docs/68 + docs/20 section 16: the OPT-IN download-report ingest. A compose PROFILE, so `up -d` neither builds
+  # nor starts it: a routine deploy changes nothing observable. To adopt it, create the DB login (docs/20 section
+  # 16), set REACH_DATABASE_URL in .env, then `docker compose --profile reach up -d --build reach-ingest`.
+  #
+  # WHAT IT TOUCHES, and why each is narrow:
+  #   * caddydata also holds Caddy's TLS and ACME private keys under /data/caddy. An EMPTY mode-0000 tmpfs is mounted
+  #     over that directory, so this container cannot see them. It holds no CAP_SYS_ADMIN, so it cannot unmount the
+  #     mask. Verified on the host with Docker 29.9.2: 0 files visible under /data/caddy, and every access*.log*
+  #     still readable. The mount point must already exist in the volume, so caddy must have started once;
+  #     depends_on below covers that. Residual risk: uid 0 remains (docs/68 section 8).
+  #   * caddydata is mounted READ-ONLY here and is NOT mounted into the control plane (docs/68 section 4: the log
+  #     reader is a separate, small process, so the control plane's blast radius does not grow).
+  #   * the artifact directory, read-only, only to learn artifact sizes for the "completed (approx)" count.
+  #   * a 1 MiB tmpfs for the per-day salt (0700; gone on a restart of the host and never in a backup).
+  #   * its own database login, rmt_reach_ingest, which can write ONLY the two reach tables (migration 0078).
+  # It runs as uid 0 inside the container because Caddy writes access.log 0600 as root (the same-owner read is
+  # what lets it open it); every capability is dropped, the root filesystem is read-only, and it has no listener.
+  reach-ingest:
+    profiles: ["reach"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    build:
+      context: ../control-plane
+    entrypoint: ["/usr/local/bin/reachingest"]
+    restart: unless-stopped
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # The image's HEALTHCHECK probes the control plane's :8081, which this process does not serve.
+    healthcheck:
+      disable: true
+    environment:
+      # EMPTY by default: with the profile on and this unset the process refuses to start (exit 2), loudly.
+      REACH_DATABASE_URL: "${REACH_DATABASE_URL:-}"
+      REACH_LOG_DIR: "/data"
+      REACH_LOG_NAME: "access.log"
+      REACH_ARTIFACT_DIR: "/srv/artifacts"
+      REACH_SALT_FILE: "/run/reach/salt"
+      REACH_INTERVAL: "${REACH_INTERVAL:-1h}"
+    volumes:
+      - caddydata:/data:ro
+      - ${ARTIFACT_DIR:-../dist/artifacts}:/srv/artifacts:ro
+    tmpfs:
+      - /run/reach:mode=0700,size=1m
+      - /data/caddy:mode=0000,size=1k   # hides Caddy's TLS/ACME keys (see above)
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      caddy:
+        condition: service_started
+
+volumes:
+  caddydata:
+  caddyconfig:
+  # docs/63 R4: central recording evidence (controlplane mounts it at /var/lib/deskrally/recordings). EMPTY and
+  # unused until RECORDING_MASTER_KEY is set. Outside the backup contract in v1 and destroyed by `down -v`: see the
+  # warnings on the controlplane mount.
+  recordings:

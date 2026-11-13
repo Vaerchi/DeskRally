@@ -1,0 +1,13 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.deskrally.technician",
+      "sha256_cert_fingerprints": [
+        "FF:0F:94:5F:35:46:A1:E1:B0:CD:94:58:A3:88:F1:12:CB:D3:E7:9B:BE:EA:D8:AE:A1:B2:A1:21:9C:CA:22:95",
+        "84:DF:D4:6C:18:48:55:72:11:64:75:92:FD:10:13:EF:11:C0:9B:7A:AD:39:5D:1B:22:5C:D5:83:F2:98:FD:42"
+      ]
+    }
+  }
+]

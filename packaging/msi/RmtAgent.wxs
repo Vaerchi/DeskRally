@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MSI owns binaries/service transactions; the agent owns config and enrollment.
+     PROVISIONINGFILE contains a path, never an enrollment token. See docs/32.
+     Protected identity/config survive uninstall and rollback for safe retry/reinstallation.
+
+     Auto-update (design v3..v10.1, coordination/designs/agent-auto-update-bootstrap-*.md): this
+     package IS the update. The updater installs it with DESKRALLY_AUTOUPDATE=1 and the attempt's
+     id/nonce/version; HealthGate then runs INSIDE the transaction after StartServices, so a new
+     agent that cannot complete an authenticated registration makes Windows Installer roll the
+     whole transaction back, including the nested removal of the previous product (MajorUpgrade at
+     afterInstallInitialize). Manual installs (property absent) skip HealthGate. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="DeskRally Remote Agent" Manufacturer="RMT" Version="$(Version)"
+           UpgradeCode="7B3E9C2A-4F1D-4E8B-9A6C-2D5E8F1A3B7C" Scope="perMachine">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of DeskRally Remote Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- R1: without Windows Installer rollback the in-transaction health gate cannot restore the
+         previous product, so installing (or updating) is refused. Uninstall stays possible. -->
+    <Launch Condition="REMOVE~=&quot;ALL&quot; OR NOT RollbackDisabled"
+            Message="Windows Installer rollback is disabled on this machine; DeskRally Remote Agent cannot be installed or updated safely." />
+
+    <Property Id="PROVISIONINGFILE" Secure="yes" Hidden="yes" />
+    <!-- docs/65 D-C3: the control plane's DIRECTIVE public key (64 hex chars; a PUBLIC key, not a secret). Pinned by the agent into its
+         ACL-protected config at install and upgrade (set-if-blank); an agent without a pinned key refuses every directive. -->
+    <Property Id="DIRECTIVE_PUBKEY" Secure="yes" />
+    <!-- Mode selector + attempt parameters, set only by the updater. HealthGate re-validates all of
+         them against the protected attempt record; the property is never authentication (M1). -->
+    <Property Id="DESKRALLY_AUTOUPDATE" Secure="yes" />
+    <Property Id="DESKRALLY_ATTEMPT" Secure="yes" />
+    <Property Id="DESKRALLY_NONCE" Secure="yes" Hidden="yes" />
+    <Property Id="DESKRALLY_EXPECTED" Secure="yes" />
+    <!-- The agent root identity the attempt recorded; the E-txn writer refuses any other root. -->
+    <Property Id="DESKRALLY_ANCHOR" Secure="yes" />
+    <!-- Update ring for a NEW policy file (an existing auto-update.json is never changed). The agent
+         allowlists canary/early/general. -->
+    <Property Id="RING" Value="general" Secure="yes" />
+
+    <Property Id="ConfigureAgent" Hidden="yes" />
+    <Binary Id="AgentActions" SourceFile="$(ActionsDll)" />
+
+    <SetProperty Id="ConfigureAgent" Value="[#agent_host.exe]&#10;[PROVISIONINGFILE]&#10;[DIRECTIVE_PUBKEY]"
+                 Before="ConfigureAgent" Sequence="execute" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="ConfigureAgent" BinaryRef="AgentActions" DllEntry="ConfigureAgent"
+                  Execute="deferred" Impersonate="no" Return="check" HideTarget="yes" />
+
+    <!-- Auto-update provisioning: rollback action registered BEFORE the mutation, commit after;
+         all three carry this transaction's id so a rollback restores only its own snapshot. -->
+    <CustomAction Id="NewTxnId" BinaryRef="AgentActions" DllEntry="NewTxnId"
+                  Execute="immediate" Return="check" />
+    <SetProperty Id="AutoUpdateRollback" Value="[#agent_host.exe]&#10;rollback&#10;[DESKRALLY_TXN]"
+                 Before="AutoUpdateRollback" Sequence="execute" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="AutoUpdateRollback" BinaryRef="AgentActions" DllEntry="AutoUpdateCleanup"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <SetProperty Id="AutoUpdateProvision" Value="[#agent_host.exe]&#10;provision&#10;[DESKRALLY_TXN]&#10;[RING]"
+                 Before="AutoUpdateProvision" Sequence="execute" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="AutoUpdateProvision" BinaryRef="AgentActions" DllEntry="AutoUpdateProvision"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <SetProperty Id="AutoUpdateCommit" Value="[#agent_host.exe]&#10;commit&#10;[DESKRALLY_TXN]"
+                 Before="AutoUpdateCommit" Sequence="execute" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="AutoUpdateCommit" BinaryRef="AgentActions" DllEntry="AutoUpdateCleanup"
+                  Execute="commit" Impersonate="no" Return="ignore" />
+    <!-- Intentional uninstall only; never the nested removal inside a major upgrade. -->
+    <SetProperty Id="AutoUpdateDeprovision" Value="[#agent_host.exe]&#10;deprovision"
+                 Before="AutoUpdateDeprovision" Sequence="execute"
+                 Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="AutoUpdateDeprovision" BinaryRef="AgentActions" DllEntry="AutoUpdateCleanup"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- HealthGate: after the new service started, inside the transaction. -->
+    <SetProperty Id="HealthGate"
+                 Value="[#agent_host.exe]&#10;[DESKRALLY_ATTEMPT]&#10;[DESKRALLY_NONCE]&#10;[DESKRALLY_EXPECTED]"
+                 Before="HealthGate" Sequence="execute"
+                 Condition="DESKRALLY_AUTOUPDATE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="HealthGate" BinaryRef="AgentActions" DllEntry="HealthGate"
+                  Execute="deferred" Impersonate="no" Return="check" HideTarget="yes" />
+
+    <!-- E-txn (v10.1 C1): attempt-bound evidence that this transaction reached commit or rollback
+         execution. The rollback action sits right AFTER RemoveExistingProducts: Windows Installer
+         refuses any script-generating action between InstallInitialize and RemoveExistingProducts
+         (error 2613, measured on the acceptance VM 2026-10-15). A failure inside the nested removal
+         itself therefore writes no record, and the attempt stays Unresolved until a reboot, which
+         is slower but never a wrong outcome. -->
+    <SetProperty Id="TxnRolledBack" Value="[DESKRALLY_ATTEMPT]&#10;[DESKRALLY_ANCHOR]" Before="TxnRolledBack" Sequence="execute"
+                 Condition="DESKRALLY_AUTOUPDATE=&quot;1&quot;" />
+    <CustomAction Id="TxnRolledBack" BinaryRef="AgentActions" DllEntry="TxnRolledBack"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <SetProperty Id="TxnCommitted" Value="[DESKRALLY_ATTEMPT]&#10;[DESKRALLY_ANCHOR]" Before="TxnCommitted" Sequence="execute"
+                 Condition="DESKRALLY_AUTOUPDATE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="TxnCommitted" BinaryRef="AgentActions" DllEntry="TxnCommitted"
+                  Execute="commit" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="NewTxnId" Before="InstallInitialize" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="TxnRolledBack" After="RemoveExistingProducts"
+              Condition="DESKRALLY_AUTOUPDATE=&quot;1&quot;" />
+      <Custom Action="AutoUpdateDeprovision" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="ConfigureAgent" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="AutoUpdateRollback" After="ConfigureAgent" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="AutoUpdateProvision" After="AutoUpdateRollback" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="AutoUpdateCommit" After="AutoUpdateProvision" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="HealthGate" After="StartServices"
+              Condition="DESKRALLY_AUTOUPDATE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="TxnCommitted" Before="InstallFinalize"
+              Condition="DESKRALLY_AUTOUPDATE=&quot;1&quot; AND NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RMT Agent">
+        <Component Id="AgentHost" Bitness="always64">
+          <File Id="agent_host.exe" Name="agent_host.exe" Source="$(AgentExe)" KeyPath="yes" />
+          <!-- Provision before service creation/start. Upgrades retain enrolled settings. -->
+          <ServiceInstall Id="RmtAgentService" Name="RmtAgent" DisplayName="DeskRally Remote Agent"
+                          Description="DeskRally remote-support agent (unattended service host)."
+                          Type="ownProcess" Start="auto" ErrorControl="normal"
+                          Arguments="run-service" Vital="yes" />
+          <ServiceControl Id="RmtAgentControl" Name="RmtAgent" Start="install" Stop="both"
+                          Remove="uninstall" Wait="yes" />
+        </Component>
+        <!-- License texts that must travel with the binary: the project license and notice, and the
+             notices of every statically linked third-party component (scripts/third_party_notices.py). -->
+        <Component Id="LicenseText" Bitness="always64">
+          <File Id="LICENSE.txt" Name="LICENSE.txt" Source="$(RepoRoot)\LICENSE" KeyPath="yes" />
+        </Component>
+        <Component Id="NoticeText" Bitness="always64">
+          <File Id="NOTICE.txt" Name="NOTICE.txt" Source="$(RepoRoot)\NOTICE" KeyPath="yes" />
+        </Component>
+        <Component Id="ThirdPartyNotices" Bitness="always64">
+          <File Id="THIRD_PARTY_NOTICES.txt" Name="THIRD-PARTY-NOTICES.txt" KeyPath="yes"
+                Source="$(RepoRoot)\packaging\notices\THIRD-PARTY-NOTICES.txt" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="Main" Title="DeskRally Remote Agent" Level="1">
+      <ComponentRef Id="AgentHost" />
+      <ComponentRef Id="LicenseText" />
+      <ComponentRef Id="NoticeText" />
+      <ComponentRef Id="ThirdPartyNotices" />
+    </Feature>
+  </Package>
+</Wix>

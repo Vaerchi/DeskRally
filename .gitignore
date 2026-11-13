@@ -1,10 +1,59 @@
-website/dist/
-__pycache__/
-*.pyc
-.env
-.env.*
-!.env.example
-*.local.*
-node_modules/
+# Build output
 target/
-.wrangler/
+agent/target/
+dist/
+web/viewer/node_modules/
+web/viewer/dist/
+*.exe
+*.pdb
+
+# Go binaries built in place by the e2e specs / harness
+server/signaling/signaling
+server/signaling/signaling.exe
+server/relay/relay
+server/relay/relay.exe
+control-plane/controlplane
+control-plane/controlplane.exe
+
+# CREDENTIALS — scripts/make-local-ca.ps1 and scripts/sign-release.ps1 write a CA private key,
+# a .pfx and a code-signing key here by default. Committing any of these would let anyone
+# impersonate the control plane to every agent that trusts the CA, or sign binaries as you.
+certs/
+*.pfx
+*.key
+*.p12
+identity.key
+# scripts/vmlab/stack-env.ps1 generates-and-persists the lab's secrets here when the RMT_VMLAB_*
+# environment variables are unset: the Ed25519 GRANT-ISSUER SEED (whose public half installed agents
+# PIN), the enrollment bearer token, and the two machine-to-machine service tokens. It lives inside
+# the tree so the seed stays stable across control-plane restarts, so it must be ignored explicitly —
+# *.local.json above does not match a .psd1.
+scripts/vmlab/.secrets.local.psd1
+*.secrets.local.psd1
+
+# Agent runtime state / local config that may carry real device ids and endpoints
+config.json
+*.local.json
+
+# Test + tooling noise
+web/viewer/test-results/
+web/viewer/playwright-report/
+*.log
+
+# Transient loop-runner lock. It was committed by the initial import and has no business being
+# tracked: it is per-machine scheduler state, so a tracked copy churns the diff every session and
+# would conflict between machines.
+.claude/scheduled_tasks.lock
+
+# Deployment secrets. `deploy/.env.example` is the committed template; the real file holds the
+# Postgres passwords, the grant-issuer seed and the TURN shared secret. Ignored by NAME so a
+# stray .env anywhere in the tree is covered, not just deploy/.
+.env
+*.env
+!.env.example
+!*.env.example
+
+# Operator source images, kept out of git (the optimised copies live in web/viewer/src/assets/).
+web/viewer/assets/
+# Python bytecode (a test run committed two of these by accident, 2026-11-11)/
+*.pyc

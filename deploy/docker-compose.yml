@@ -1,0 +1,215 @@
+# =================================================================================================
+# CONFIG-VERIFIED 2026-08-26 by CI (.github/workflows/ci.yml, job `docker`): all three images build,
+# and this file resolves through `docker compose config` on every push. What is STILL unverified is
+# the RUNNING stack — nothing has brought these services up together and driven a session through
+# them. docs/18-selfhost-deployment.md §6 has the staged bring-up that would close that.
+#
+# This file is the LAN/dev bring-up and publishes 8080/8081/9000/9001 on 0.0.0.0, which is right for
+# a laptop and wrong for a public host. For an internet-facing deployment layer
+# deploy/docker-compose.prod.yml over it — that overlay adds Caddy and withdraws these publications.
+# =================================================================================================
+#
+# Backend stack: signaling + relay + control-plane + Postgres (migrations auto-applied on first
+# init) + a commented coturn service for WAN TURN. The viewer is a static bundle (dist/viewer) and
+# is NOT containerized here — serve it from any static host (see docs/10-deployment.md).
+#
+# Usage (from repo root):
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Secrets below use compose defaults for local bring-up. OVERRIDE them in production via a .env file
+# or your orchestrator's secret store: POSTGRES_PASSWORD and GRANT_ISSUER_SEED at minimum.
+#
+# SIGNALING_TICKET_PUBKEY has NO default on purpose: compose fails the bring-up when it is unset,
+# because a signaling server without it cannot authorize connect_request at all. It is the public
+# half of the control plane's grant issuer — i.e. it comes from the same GRANT_ISSUER_SEED:
+#   GRANT_ISSUER_SEED=$(openssl rand -hex 32)
+#   docker compose -f deploy/docker-compose.yml up -d controlplane
+#   docker compose -f deploy/docker-compose.yml logs controlplane | grep grant_issuer_pubkey
+#   # control-plane: grant_issuer_pubkey=<64 hex chars>   -> paste into SIGNALING_TICKET_PUBKEY
+#
+# READ THE LOG, do not curl the endpoint. `GET /grant/pubkey` is on the PROTECTED router
+# (control-plane/http.go, inside the `if s.Grants != nil` block on the `protected` mux), so an
+# anonymous request answers {"error":"unauthorized"} — on this base compose too, where the port IS
+# published. The port is a red herring: the route would refuse you either way. At this point in a
+# first bring-up there is also no account and no API token in existence yet, so the startup log is
+# genuinely the only source. Once the deployment is up, `curl -H "Authorization: Bearer rmt_api_…"`
+# works and is the form a scripted install should use — see docs/10 §4 step 1 for all four sources.
+
+services:
+  postgres:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rmt}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rmt-dev-password}
+      POSTGRES_DB: ${POSTGRES_DB:-rmt}
+    # Migrations in ../control-plane/migrations are named 0001..0004 and Postgres runs every
+    # *.sql in /docker-entrypoint-initdb.d in lexical order — but ONLY on first init of an empty
+    # data volume. To re-apply after a schema change, drop the volume or apply them manually.
+    volumes:
+      - ../control-plane/migrations:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rmt} -d ${POSTGRES_DB:-rmt}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  signaling:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    build:
+      context: ../server/signaling
+    # The relay address handed to peers; point it at the public relay host in production.
+    command: ["-addr", ":8080", "-relay", "${RELAY_PUBLIC_ADDR:-relay:9000}"]
+    environment:
+      # THE M2 AUTHORIZATION GATE. Without it the server refuses to start (a signaling server that
+      # cannot verify session tickets brokers a session from ANY WebSocket client to ANY agent).
+      # It is the control plane's grant-issuer Ed25519 PUBLIC key, 64 hex chars — the same key pair
+      # GRANT_ISSUER_SEED below produces, readable at `GET /grant/pubkey` on the control plane and
+      # logged at its startup as grant_issuer_pubkey.
+      SIGNALING_TICKET_PUBKEY: "${SIGNALING_TICKET_PUBKEY:?set SIGNALING_TICKET_PUBKEY to the control plane's grant_issuer_pubkey (GET /grant/pubkey)}"
+      # Gates GET /internal/presence, the access panel's online/offline source (migration 0017).
+      # Unset ⇒ the route is NOT mounted (there is no unauthenticated mode: the registry is
+      # cross-tenant, so an open feed enumerates every live agent). Not required to boot — the
+      # console just reports presence as unknown. Must equal the control plane's CP_PRESENCE_TOKEN.
+      SIGNALING_PRESENCE_TOKEN: "${PRESENCE_TOKEN:-}"
+      # --- ICE servers handed to both peers at broker time (WAN) -------------------------------
+      # The signaling server issues these in its `ice_servers` message, which both peers apply
+      # before ICE gathering starts. Leave them unset for a LAN deployment: peers then connect on
+      # host candidates, which is the proven path.
+      #
+      # SIGNALING_TURN_SECRET must equal coturn's --static-auth-secret below; the server derives
+      # short-lived per-session credentials from it (server/signaling/turn.go), so no TURN password
+      # is ever stored on an agent.
+      #
+      # NB the URLs must be reachable BY THE PEERS, not by this container — use the public
+      # hostname/IP of the TURN server, never `coturn:3478`.
+      SIGNALING_STUN_URLS: "${STUN_URLS:-}"
+      SIGNALING_TURN_URLS: "${TURN_URLS:-}"
+      SIGNALING_TURN_SECRET: "${TURN_SHARED_SECRET:-}"
+      SIGNALING_TURN_TTL: "${TURN_TTL:-2h}"
+      # Caps on OUTSTANDING TURN credentials per technician / per tenant (server/signaling/turn.go).
+      # A brokered session holds its credential until it EXPIRES (TURN_TTL), not until it ends, and a
+      # session over either cap connects STUN-only. Empty = the built-in 20 / 80. Size them WITH
+      # TURN_TTL: docs/10, "Configure the signaling server".
+      SIGNALING_TURN_MAX_PER_USER: "${TURN_MAX_PER_USER:-}"
+      SIGNALING_TURN_MAX_PER_TENANT: "${TURN_MAX_PER_TENANT:-}"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  relay:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    build:
+      context: ../server/relay
+    command: ["-tcp", ":9000", "-ws", ":9001"]
+    environment:
+      RELAY_MAX_CONNECTIONS: "${RELAY_MAX_CONNECTIONS:-1024}"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    restart: unless-stopped
+
+  controlplane:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    build:
+      context: ../control-plane
+    environment:
+      CP_LISTEN: ":8081"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-rmt}:${POSTGRES_PASSWORD:-rmt-dev-password}@postgres:5432/${POSTGRES_DB:-rmt}?sslmode=disable"
+      # THIS FILE HAS NO TENANT ISOLATION, and now says so out loud (docs/25 F13).
+      #
+      # The DSN above connects as ${POSTGRES_USER}, the postgres image's superuser. Row-level
+      # security — which IS this product's tenant isolation — does not apply to a superuser or a
+      # BYPASSRLS role, so every tenant-scoped query here can read every tenant's rows. The control
+      # plane verifies that role at startup and REFUSES to serve, because no application code and
+      # no test can tell the difference: the queries succeed either way and only cross-tenant
+      # visibility changes.
+      #
+      # This escape hatch keeps that refusal from breaking the single-tenant local bring-up this
+      # base file is for. `docker-compose.prod.yml` overrides DATABASE_URL to the least-privilege
+      # `rmt_app` role and deliberately does NOT set this, so production gets the check.
+      CP_INSECURE_ALLOW_PRIVILEGED_DB: "1"
+      # Stable Ed25519 issuer seed (64 hex chars = 32 bytes). MUST be set in production so the
+      # grant_issuer_pubkey agents pin stays constant across restarts. Generate one with, e.g.:
+      #   openssl rand -hex 32
+      GRANT_ISSUER_SEED: "${GRANT_ISSUER_SEED:-}"
+      # Encrypts TOTP secrets at rest. A SEPARATE key from GRANT_ISSUER_SEED, so that one
+      # compromised value does not also decrypt every second factor. Generate with:
+      #   openssl rand -hex 32
+      TOTP_ENCRYPTION_KEY: "${TOTP_ENCRYPTION_KEY:-}"
+      # Mark the session cookie Secure when serving over HTTPS (behind a TLS-terminating proxy).
+      CP_SECURE_COOKIE: "${CP_SECURE_COOKIE:-0}"
+      # Machine presence for the access panel: read live from signaling's agent registry. Both must
+      # be set (and the token must match SIGNALING_PRESENCE_TOKEN above) or GET /machines reports
+      # "presence_known": false. Fails SOFT by design — nothing is authorized on presence.
+      CP_PRESENCE_URL: "${CP_PRESENCE_URL:-http://signaling:8080/internal/presence}"
+      CP_PRESENCE_TOKEN: "${PRESENCE_TOKEN:-}"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------------------------
+  # coturn — TURN/STUN relay for WAN NAT traversal (symmetric NAT, and any network blocking UDP
+  # between the peers). Commented out by default: it needs a PUBLIC IP and opened ports, so it is
+  # an explicit decision rather than something a local bring-up should start.
+  #
+  # To enable, uncomment this service AND set, in your .env:
+  #
+  #   TURN_SHARED_SECRET=$(openssl rand -hex 32)
+  #   TURN_URLS=turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp
+  #   STUN_URLS=stun:turn.example.com:3478
+  #
+  # The secret is shared with the SIGNALING service above, which derives short-lived per-session
+  # credentials from it and hands them to both peers in its `ice_servers` message. Nothing needs to
+  # be configured on the agents — that is the point of the shared-secret scheme.
+  #
+  # Include the `transport=tcp` URL. It is the one that saves you on a corporate network that blocks
+  # outbound UDP, which is a common reason to need TURN in the first place.
+  # See docs/10-deployment.md §6.
+  # ---------------------------------------------------------------------------------------------
+  # coturn:
+  #   image: coturn/coturn:4.6
+  #   network_mode: host          # TURN needs the host network for the relayed UDP port range
+  #   command:
+  #     - -n
+  #     - --realm=${TURN_REALM:-rmt.example.com}
+  #     - --fingerprint
+  #     - --use-auth-secret
+  #     - --static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET before enabling coturn}
+  #     - --min-port=49152
+  #     - --max-port=65535
+  #     # Refuse to relay to loopback/private ranges. A TURN server open to the internet is an open
+  #     # proxy into whatever it can reach; these denials are what keep it from being one.
+  #     - --no-multicast-peers
+  #     - --denied-peer-ip=0.0.0.0-0.255.255.255
+  #     - --denied-peer-ip=10.0.0.0-10.255.255.255
+  #     - --denied-peer-ip=127.0.0.0-127.255.255.255
+  #     - --denied-peer-ip=169.254.0.0-169.254.255.255
+  #     - --denied-peer-ip=172.16.0.0-172.31.255.255
+  #     - --denied-peer-ip=192.168.0.0-192.168.255.255
+  #     - --no-cli
+  #   restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,47 @@
+# Root Cargo workspace for DeskRally's Rust components, including the shared backstage/tooling
+# library in agent/ and the platform-specific components under crates/.
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/crypto",
+    "crates/agent-core",
+    "crates/agent-windows",
+    "crates/transport-webrtc",
+    # M5: the backstage shell/tooling crate, folded in from its former standalone package so
+    # crates/agent-windows can reach its Dispatcher and carry backstage over the session transport.
+    "agent",
+]
+# Vendored third-party source, patched in below; built as a dependency, never as a member.
+exclude = ["third_party/webrtc-ice", "third_party/webrtc-sctp"]
+
+# webrtc-ice 0.11.0 with ONE added hook (relay_dialer.rs): TURN over TCP and TLS. Upstream, up to
+# 0.17.2, gathers relay candidates over UDP only and logs "Unable to handle URL" for every
+# `?transport=tcp` and `turns:` server, so an agent on a UDP-blocked network had no relay at all
+# (docs/50). The framing and TLS live in crates/transport-webrtc/src/turn_stream.rs; this patch
+# only calls the dialer it registers. Diff against the pristine copy: `git log -- third_party/webrtc-ice`.
+[patch.crates-io]
+webrtc-ice = { path = "third_party/webrtc-ice" }
+# webrtc-sctp 0.10.0, patched so ONE failed UDP send does not close the association. Upstream's
+# write_loop sets `done` on any send error, which closes every data channel: a 4 s route loss on the
+# agent (WSAEADDRNOTAVAIL / WSAENETUNREACH) ended a live session as "viewer left" 2 s later, while the
+# viewer was still there (lab VM, 2026-10-23). Diff against the pristine copy: `git log -- third_party/webrtc-sctp`.
+webrtc-sctp = { path = "third_party/webrtc-sctp" }
+
+[workspace.package]
+version = "0.1.28"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time"] }
+tracing = "0.1"
+# The agent-side subscriber (crates/agent-windows/src/logging.rs). Features are deliberately
+# minimal: no `ansi` (helper.log must stay plain text), no `tracing-log` (the webrtc/reqwest
+# stacks log via the `log` crate at high volume and must NOT be bridged into helper.log).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

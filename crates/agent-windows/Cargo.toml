@@ -1,0 +1,184 @@
+# Windows platform crate: real Win32 implementations of the rmt-agent-core platform traits
+# (ScreenCapturer via DXGI Desktop Duplication, InputSink via SendInput) plus the
+# service/per-session-helper skeleton described in docs/02-architecture.md (ADR-005).
+#
+# Everything here is cfg(windows). On non-Windows the crate compiles to an empty shell so the
+# workspace still builds cross-platform for tooling.
+[package]
+name = "rmt-agent-windows"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Windows agent platform layer: DXGI Desktop Duplication capture + SendInput injection + service host (ADR-005)."
+
+[features]
+# test-harness: enables the `multi-stream` CLI subcommand and recording input backend.
+# MUST NOT be included in release artifacts — excluded from the default feature set so
+# `cargo build` (without --features test-harness) produces a clean production binary.
+test-harness = []
+# update-test-feed: point the auto-updater at the lab feed host instead of main.deskrally.com.
+# Release packaging REFUSES a binary built with it (design v3 test feed).
+update-test-feed = []
+# secure-test: enables the `--secure-test-harness` CLI flag and the `secure_test_harness`
+# module. Compiles in verify_grant_inert (real Ed25519 verification, no Dispatcher) and
+# inert promote sinks. Structurally absent from production builds — no #[cfg(feature =
+# "secure-test")] block is compiled without this flag. Requires test-harness for the
+# multi-stream entry point; may be used with the attend entry point independently.
+# DO NOT activate in release artifacts.
+secure-test = []
+
+[dependencies]
+rmt-agent-core = { path = "../agent-core" }
+rmt-protocol = { path = "../protocol" }
+rmt-crypto = { path = "../crypto" }
+# M5: the backstage shell/tooling crate (Dispatcher + RBAC + audit chain). serve_session owns a
+# Dispatcher and carries the backstage Request/Response protocol over ChannelId::Backstage. One-way
+# edge (agent-windows → rmt-agent); rmt-agent depends on no workspace crate, so no cycle.
+rmt-agent = { path = "../../agent" }
+# WebRTC transport for the `stream` subcommand / streaming driver. transport-webrtc is
+# cross-platform and depends on agent-core (as this crate does), so this is a one-way edge
+# (agent-windows → transport-webrtc), NOT a cycle.
+rmt-transport-webrtc = { path = "../transport-webrtc" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# The agent's tracing subscriber → C:\rmt-agent\helper.log (src/logging.rs). Until it existed,
+# every tracing::* in the agent crates was a silent no-op (docs/07 loop 6 §2).
+tracing-subscriber.workspace = true
+# M7: the per-session helper's persistent config (signaling URL, device id, STUN) is JSON on disk.
+serde.workspace = true
+serde_json.workspace = true
+# M8 file transfer: incremental SHA-256 of received uploads (streamed to disk chunk by chunk).
+sha2 = "0.10"
+# Screenshot capture (crate::screenshot): encode a captured BGRA frame as a lossless PNG. Pure Rust
+# (miniz_oxide/fdeflate) — no C deps, so it does not disturb the static-CRT agent link.
+png = "0.17"
+# ZIP extraction for the managed installer bundle. Go's archive/zip streaming writer produces ZIPs
+# whose local file headers carry zero sizes (crc/comp_size/uncomp_size all 0); sizes are in the
+# central directory at the end of the archive. The zip crate reads the central directory, so it
+# handles this correctly. A hand-rolled local-header parser does not and produces empty files.
+zip = { version = "2", default-features = false }
+# M3 enrollment: the identity seed is stored/transmitted as hex.
+hex = "0.4"
+# M3 enrollment: one blocking POST to the control plane's /enroll/redeem. rustls only — the
+# enrollment token is a bearer secret, so certificate validation is mandatory and
+# `danger_accept_invalid_certs` is banned in this crate. The roots are NOT this feature's: every
+# client here (enroll, attend incl. the installer-bundle download) is given `rmt_transport_webrtc::tls_trust`'s config
+# via `use_preconfigured_tls` — the OS store (a self-hosted private CA in `LocalMachine\Root`, docs/07)
+# UNION Mozilla's bundled roots (a fresh machine whose store lacks ISRG Root X1 until Windows fetches
+# it on demand; native-only failed enrollment there, MSI-Night 2026-10-09). The rustls version must
+# match reqwest's, or `build()` refuses the config. Certificate validation stays fully ON.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "blocking"] }
+
+# The `windows` crate is only meaningful on Windows targets. Gating it keeps `cargo check`
+# on other platforms from pulling the Win32 metadata.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    # The support client's code-prompt window uses real EDIT/BUTTON/STATIC common controls, and
+    # InitCommonControlsEx to opt into the v6 comctl32 (theming). docs/27 step 10.
+    "Win32_UI_Controls",
+    "Win32_Foundation",
+    # GUI-subsystem stdio sinks (crate::stdio): GetStdHandle/SetStdHandle bind NUL to the missing
+    # standard handles of a windows-subsystem process so println! does not panic. docs/27 step 8.
+    "Win32_System_Console",
+    # M9 clipboard sync: CF_UNICODETEXT get/set + GetClipboardSequenceNumber, and the moveable
+    # global-memory block SetClipboardData requires.
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_RemoteDesktop",
+    # M3 enrollment: the OS description reported as `machine.os`, read from
+    # HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion.
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Services",
+    # Reboot guest (crate::reboot): InitiateSystemShutdownExW + the SHTDN_REASON_* codes, after
+    # enabling SeShutdownPrivilege on this process token.
+    "Win32_System_Shutdown",
+    # System tool launchers (crate::launch): CreateEnvironmentBlock so a tool launched AS THE
+    # INTERACTIVE USER (WTSQueryUserToken) gets that user's environment, not the SYSTEM helper's.
+    "Win32_System_Environment",
+    # One-line command bar (crate::command_run): CreatePipe for stdout/stderr capture, ReadFile +
+    # CreateFileW (NUL stdin) to drain them, and a Job Object so a timed-out command's whole process
+    # tree is killed (KILL_ON_JOB_CLOSE), not just its top process.
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    # docs/25 F04: GetDriveTypeW lives in Win32_Storage_FileSystem but the DRIVE_* results it
+    # returns are filed under WindowsProgramming. The file browser needs DRIVE_REMOTE to refuse a
+    # MAPPED NETWORK DRIVE before touching it — declaring the DWORD locally would have been one
+    # less feature and one more magic number that nothing checks against the SDK.
+    "Win32_System_WindowsProgramming",
+    "Win32_System_JobObjects",
+    # Auto-update (update_msi): read the staged package identity and the installed UpgradeCode
+    # family through msi.dll, read-only.
+    "Win32_System_ApplicationInstallationAndServicing",
+    # The guest window (crate::guest_window) needs the module handle to register its window class.
+    "Win32_System_LibraryLoader",
+    # System-tray presence icon (crate::tray): Shell_NotifyIconW / NOTIFYICONDATAW so the
+    # helper process shows "DeskRally — Ready for support" in the notification area while
+    # a remote session is available.
+    "Win32_UI_Shell",
+    "Win32_Security",
+    # SAS (Ctrl+Alt+Del): SendSAS lives in sas.dll and is surfaced under Security_Authentication_
+    # Identity in the windows metadata. Used by crate::sas to raise the secure desktop on request.
+    "Win32_Security_Authentication_Identity",
+    # SDDL → security descriptor for the SAS responder's named event, so only LocalSystem can open
+    # it (ConvertStringSecurityDescriptorToSecurityDescriptorW).
+    "Win32_Security_Authorization",
+    # Authenticode verification (crate::update_download): WinVerifyTrust + WTHelperGetProvSignerFromChain
+    # + WTHelperProvDataFromStateData for signature chain and counter-timestamp inspection.
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    # Leaf-cert subject DN extraction (crate::update_download): CertGetNameStringW + CertNameToStrW
+    # to verify the signing identity before accepting a staged payload.
+    "Win32_Security_Cryptography",
+    # WGC (Windows.Graphics.Capture) fallback tier — RDP/RDS where DDA returns black.
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
+    # Audio passthrough (crate::audio): WASAPI LOOPBACK capture of the machine's render endpoint —
+    # IMMDeviceEnumerator/IAudioClient/IAudioCaptureClient — plus the COM apartment they need.
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+]
+
+[dev-dependencies]
+# e2e_stream integration test: connect a controller peer + probe the signaling server.
+rmt-transport-webrtc = { path = "../transport-webrtc" }
+rmt-protocol = { path = "../protocol" }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
+# e2e_backstage: parse the returned backstage Envelope JSON.
+serde_json.workspace = true
+# e2e tests: unique temp transfer dirs + transfer ids.
+uuid.workspace = true
+# e2e_filetransfer: verify the received/reassembled bytes against a known SHA-256.
+sha2 = "0.10"
+
+# Version resource + application manifest for DeskRallySupport.exe only (build.rs, docs/27 step 9).
+# embed-resource links the compiled resource into that ONE binary via a .lib with a forced symbol,
+# which is what makes link.exe merge it into .rsrc (a bare .res on the link line does not merge).
+[build-dependencies]
+serde_json.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"

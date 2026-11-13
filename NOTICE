@@ -4,7 +4,16 @@ Copyright 2026 DeskRally contributors.
 Original project source, documentation, and vector artwork in this repository
 are licensed under the Apache License, Version 2.0, unless a file states otherwise.
 
-Third-party components retain their original licenses and attribution notices.
-Dependency notices will accompany the reviewed application-source imports.
+Third-party components retain their original licenses and attribution notices:
+
+- third_party/webrtc-ice and third_party/webrtc-sctp are modified copies of the
+  webrtc-rs crates, licensed MIT OR Apache-2.0; their license files are kept
+  in those directories.
+- The Windows agent statically links libvpx (BSD-3-Clause, with the WebM
+  project's additional patent grant) through env-libvpx-sys (MPL-2.0, used
+  unmodified).
+- Rust, Go, JavaScript and Android dependencies are fetched by their package
+  managers under their own licenses (MIT, Apache-2.0, BSD, ISC, Zlib,
+  Unicode-3.0, CDLA-Permissive-2.0 and MPL-2.0 as declared by each package).
 
 This notice does not change the terms of the Apache License, Version 2.0.

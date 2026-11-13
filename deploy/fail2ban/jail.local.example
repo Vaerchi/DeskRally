@@ -1,0 +1,26 @@
+# Example fail2ban jail for the support download (docs/27 step 15). DETECTION-oriented: the defaults
+# below are deliberately lenient so a legitimate customer who retries a few times is never banned.
+#
+# Install on the HOST (fail2ban runs on the host, not in the Caddy container):
+#   1. Copy the filter:   sudo cp deploy/fail2ban/deskrally-download.conf /etc/fail2ban/filter.d/
+#   2. Append this jail to /etc/fail2ban/jail.local (create it if absent)
+#   3. Point `logpath` at Caddy's access log on the host — the caddydata volume:
+#        /var/lib/docker/volumes/deploy_caddydata/_data/access.log
+#      (confirm the volume name with `docker volume ls`; a differently-named project prefixes it)
+#   4. sudo fail2ban-client reload   (then: sudo fail2ban-client status deskrally-download)
+#
+# This bans a single source IP, which behind NAT is a whole office. That is ANOTHER reason it is
+# tuned lenient and labelled detection: the honest fix for shared exposure is per-code redeem budget
+# on the control plane (docs/27 open question 4) and real rate limiting in front of /download
+# (open question 2), neither of which this jail replaces.
+
+[deskrally-download]
+enabled  = true
+filter   = deskrally-download
+backend  = auto
+logpath  = /var/lib/docker/volumes/deploy_caddydata/_data/access.log
+# 30 successful downloads from ONE ip in 10 minutes is well past any real customer. Raise findtime /
+# lower maxretry only after watching real traffic — a false ban here strands a customer mid-support.
+maxretry = 30
+findtime = 600
+bantime  = 3600
