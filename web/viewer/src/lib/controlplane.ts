@@ -32,6 +32,7 @@
 
 /** The default base URL: the Vite dev proxy prefix (`/cp` → control plane), overridable via env. */
 import { CSRF_HEADER_NAME, csrfTokenFrom } from "./console_api";
+import { trimTrailingSlashes } from "./trim_slashes";
 
 export const DEFAULT_CONTROL_PLANE_URL =
   (import.meta.env?.VITE_CONTROL_PLANE_URL as string | undefined) ?? "/cp";
@@ -72,7 +73,7 @@ export class ControlPlaneClient {
 
   constructor(opts: ControlPlaneClientOptions = {}) {
     // Strip a trailing slash so `${baseUrl}/grant/mint` never doubles up.
-    this.baseUrl = (opts.baseUrl ?? DEFAULT_CONTROL_PLANE_URL).replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes((opts.baseUrl ?? DEFAULT_CONTROL_PLANE_URL));
     this.fetchImpl =
       opts.fetch ??
       ((input, init) => fetch(input, init));

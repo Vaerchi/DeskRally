@@ -41,6 +41,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -438,6 +439,11 @@ func recEnvMeta(row *RecordingRow, idx int, declared int64, rep EnvRep) (Envelop
 	r, ok2 := recParseUUID(row.ID)
 	if !ok1 || !ok2 {
 		return EnvelopeMeta{}, errors.New("non-canonical ids")
+	}
+	// The values come from the recording row and the upload's declared length; refuse rather than wrap anything a
+	// row should never hold (CodeQL go/incorrect-integer-conversion).
+	if idx < 0 || int64(idx) > math.MaxUint32 || declared < 0 || row.Generation < 0 {
+		return EnvelopeMeta{}, errors.New("segment index, length or generation out of range")
 	}
 	return EnvelopeMeta{TenantID: t, RecordingID: r, Segment: uint32(idx), Rep: rep,
 		Generation: uint64(row.Generation), TotalLen: uint64(declared)}, nil

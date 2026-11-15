@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "./trim_slashes";
 /**
  * The self-service password-setup link (docs/01 §5): the console mints a credential-setup token for a
  * user (POST /users/{id}/password-reset) and the administrator hands over a link to THIS page, where the
@@ -25,7 +26,7 @@ export const SETUP_LINK_PATH = "/set-password";
  */
 export function setupLinkUrl(origin: string, token: string): string {
   if (!token) return "";
-  const base = origin.replace(/\/+$/, "");
+  const base = trimTrailingSlashes(origin);
   return `${base}${SETUP_LINK_PATH}#${encodeURIComponent(token)}`;
 }
 

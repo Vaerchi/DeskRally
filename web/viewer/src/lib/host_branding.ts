@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "./trim_slashes";
 /**
  * The guest JOIN page's HOST BRANDING (docs/66 stage 2): the tenant's operator-approved name, accent,
  * logo, message and contact, as the control plane publishes them for the HOSTNAME the guest opened.
@@ -249,7 +250,7 @@ export function parseHostBranding(body: unknown): HostBrand {
  * request, and an absolute control-plane URL on another host would be asked about that other host's brand.
  */
 export function publicBrandingUrl(origin: string): string {
-  return `${origin.replace(/\/+$/, "")}/cp/public/branding`;
+  return `${trimTrailingSlashes(origin)}/cp/public/branding`;
 }
 
 /**

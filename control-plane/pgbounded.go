@@ -45,6 +45,9 @@ func lookupHardDeadline(ctx context.Context) time.Time {
 // millisecond and returns it before the response floor, so a few connections serve far more than the admitted rate.
 const DefaultLookupPoolConns = 8
 
+// MaxLookupPoolConns caps CP_LOOKUP_DB_CONNS.
+const MaxLookupPoolConns = 256
+
 // LookupPoolConfig derives the dedicated lookup pool's configuration from the shared pool's: the same DSN, role,
 // ConnectTimeout and statement_timeout (it MUST stay a copy: the role/RLS verification, docs/25 F13, runs on the
 // shared pool only and covers this one because the DSN and role are the same), conns connections (the default when
@@ -55,6 +58,11 @@ func LookupPoolConfig(shared *pgxpool.Config, conns int) *pgxpool.Config {
 	c := shared.Copy()
 	if conns <= 0 {
 		conns = DefaultLookupPoolConns
+	}
+	// CP_LOOKUP_DB_CONNS is operator configuration; an absurd value must not wrap int32 (CodeQL
+	// go/incorrect-integer-conversion). No lookup pool needs more than MaxLookupPoolConns connections.
+	if conns > MaxLookupPoolConns {
+		conns = MaxLookupPoolConns
 	}
 	c.MaxConns = int32(conns)
 	c.MinConns = int32(conns)

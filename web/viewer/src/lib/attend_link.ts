@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "./trim_slashes";
 /**
  * The `rmt-<fingerprint>://` launch link for the guest landing page (docs/01 §12, guest client
  * launch handoff).
@@ -121,7 +122,7 @@ export function attendLaunchUri(code: string, cpOrigin: string): string | null {
   const trimmed = code.trim();
   if (!trimmed) return null;
   const scheme = deploymentScheme(cpOrigin);
-  const cp = `${cpOrigin.replace(/\/+$/, "")}/cp`;
+  const cp = `${trimTrailingSlashes(cpOrigin)}/cp`;
   return (
     `${scheme}://${ATTEND_ACTION}?code=${encodeURIComponent(trimmed)}` +
     `&cp=${encodeURIComponent(cp)}`

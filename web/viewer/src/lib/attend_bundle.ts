@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "./trim_slashes";
 /**
  * Pure helpers for the attended-session support bundle download.
  *
@@ -28,12 +29,12 @@ export function validAttendCodeForBundle(code: string): boolean {
  * The caller should POST `{"code":"<ATTEND_CODE>"}` and expect a ZIP response.
  */
 export function attendBundleEndpointUrl(cpOrigin: string): string {
-  return `${cpOrigin.replace(/\/+$/, "")}/cp/attended-sessions/support-bundle`;
+  return `${trimTrailingSlashes(cpOrigin)}/cp/attended-sessions/support-bundle`;
 }
 
 /** URL of the public GET that says whether the session bundle is the ONLY working download. */
 export function attendSupportModeUrl(cpOrigin: string): string {
-  return `${cpOrigin.replace(/\/+$/, "")}/cp/attended-sessions/support-mode`;
+  return `${trimTrailingSlashes(cpOrigin)}/cp/attended-sessions/support-mode`;
 }
 
 /**

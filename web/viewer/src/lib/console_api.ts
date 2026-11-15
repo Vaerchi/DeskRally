@@ -48,6 +48,7 @@ import {
   type RecordingPolicy,
   type RecordingPolicyBody,
 } from "./recordings";
+import { trimTrailingSlashes } from "./trim_slashes";
 
 // ---------------------------------------------------------------------------
 // Row shapes (mirrors of the Go structs' JSON output)
@@ -1807,7 +1808,7 @@ export class ConsoleApiClient implements ConsoleApi {
 
   constructor(opts: ConsoleApiClientOptions = {}) {
     // Strip a trailing slash so `${baseUrl}/machines` never doubles up.
-    this.baseUrl = (opts.baseUrl ?? DEFAULT_CONTROL_PLANE_URL).replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes((opts.baseUrl ?? DEFAULT_CONTROL_PLANE_URL));
     this.fetchImpl = opts.fetch ?? ((input, init) => fetch(input, init));
     this.cookies = opts.cookies ?? (() => (typeof document === "undefined" ? "" : document.cookie));
     this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));

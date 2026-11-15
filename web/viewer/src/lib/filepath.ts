@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "./trim_slashes";
 /**
  * Pure path helpers for the remote file browser (docs/01 §3). The agent speaks Windows paths, so
  * these join/split on backslashes and treat an empty path as "the drive roots" — where each entry's
@@ -20,7 +21,7 @@ export const DEFAULT_TRANSFER_DIR = "C:\\rmt-agent\\transfers";
  * whether the file browser is AT the transfer root, where an upload lands.
  */
 export function isSamePath(a: string, b: string): boolean {
-  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const norm = (p: string) => trimTrailingSlashes(p.replace(/\\/g, "/")).toLowerCase();
   return a !== "" && b !== "" && norm(a) === norm(b);
 }
 

@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "./trim_slashes";
 /**
  * Central session recordings, console side (docs/63 R3). The pure model behind
  * `components/RecordingsPanel.tsx`, `components/RecordingPlayer.tsx` and
@@ -403,11 +404,11 @@ export function recordingErrorMessage(status: number, code: string): string {
 export function segmentStreamUrl(base: string, recordingId: string, item: Pick<RecordingPlaylistItem, "url">): string | null {
   const m = SEGMENT_URL.exec(item.url);
   if (m === null || !/^[0-9a-f-]{36}$/.test(recordingId)) return null;
-  return `${base.replace(/\/+$/, "")}/recordings/${recordingId}/segments/${Number(m[1])}/stream`;
+  return `${trimTrailingSlashes(base)}/recordings/${recordingId}/segments/${Number(m[1])}/stream`;
 }
 
 export function downloadUrl(base: string, recordingId: string): string {
-  return `${base.replace(/\/+$/, "")}/recordings/${encodeURIComponent(recordingId)}/download`;
+  return `${trimTrailingSlashes(base)}/recordings/${encodeURIComponent(recordingId)}/download`;
 }
 
 // ---------------------------------------------------------------------------
