@@ -61,11 +61,13 @@ func LookupPoolConfig(shared *pgxpool.Config, conns int) *pgxpool.Config {
 	}
 	// CP_LOOKUP_DB_CONNS is operator configuration; an absurd value must not wrap int32 (CodeQL
 	// go/incorrect-integer-conversion). No lookup pool needs more than MaxLookupPoolConns connections.
-	if conns > MaxLookupPoolConns {
-		conns = MaxLookupPoolConns
+	// The conversion sits under the guard on conns itself so the analyzer sees the bound.
+	var n int32 = MaxLookupPoolConns
+	if conns <= MaxLookupPoolConns {
+		n = int32(conns)
 	}
-	c.MaxConns = int32(conns)
-	c.MinConns = int32(conns)
+	c.MaxConns = n
+	c.MinConns = n
 	return c
 }
 

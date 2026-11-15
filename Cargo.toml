@@ -29,7 +29,7 @@ webrtc-ice = { path = "third_party/webrtc-ice" }
 webrtc-sctp = { path = "third_party/webrtc-sctp" }
 
 [workspace.package]
-version = "0.1.28"
+version = "0.1.29"
 edition = "2021"
 publish = false
 

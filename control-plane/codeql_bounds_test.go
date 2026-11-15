@@ -4,6 +4,7 @@ package controlplane
 // types are range-checked first, so a bad row or an absurd setting is refused or capped instead of wrapping.
 
 import (
+	"math"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,9 +20,10 @@ func TestRecEnvMetaRefusesOutOfRangeValues(t *testing.T) {
 		declared int64
 		gen      int64
 	}{
-		"negative index":      {-1, 1024, 1},
-		"negative length":     {0, -1, 1},
-		"negative generation": {0, 1024, -1},
+		"negative index":       {-1, 1024, 1},
+		"negative length":      {0, -1, 1},
+		"negative generation":  {0, 1024, -1},
+		"index above MaxInt32": {int(int64(math.MaxInt32) + 1), 1024, 1},
 	} {
 		r := *row
 		r.Generation = c.gen

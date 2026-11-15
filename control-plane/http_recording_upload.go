@@ -442,7 +442,9 @@ func recEnvMeta(row *RecordingRow, idx int, declared int64, rep EnvRep) (Envelop
 	}
 	// The values come from the recording row and the upload's declared length; refuse rather than wrap anything a
 	// row should never hold (CodeQL go/incorrect-integer-conversion).
-	if idx < 0 || int64(idx) > math.MaxUint32 || declared < 0 || row.Generation < 0 {
+	// The bound is on idx itself (not a widened copy) so the analyzer sees it; MaxInt32 fits int on every platform
+	// and no recording approaches 2^31 segments.
+	if idx < 0 || idx > math.MaxInt32 || declared < 0 || row.Generation < 0 {
 		return EnvelopeMeta{}, errors.New("segment index, length or generation out of range")
 	}
 	return EnvelopeMeta{TenantID: t, RecordingID: r, Segment: uint32(idx), Rep: rep,
