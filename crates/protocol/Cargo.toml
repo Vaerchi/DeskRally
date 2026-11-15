@@ -1,0 +1,19 @@
+[package]
+name = "rmt-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Shared wire protocol: channels, framing, identities. The contract every component builds on."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+# M3 agent auth: the challenge nonce travels as hex on the signaling wire.
+hex = "0.4"
+# docs/65: directive verification (Ed25519) and the key fingerprint. rmt-crypto does not depend on rmt-protocol.
+rmt-crypto = { path = "../crypto" }
+serde_json.workspace = true
+sha2 = "0.10"
+

@@ -1,0 +1,12 @@
+# Export the TURN cert for the non-root coturn and restart coturn on renewal (audit #19).
+# Install exactly like bridge-backup (user units + enable-linger); see docs/20 section 9,
+# "Hardening: non-root coturn".
+[Unit]
+Description=Export TURN TLS cert for non-root coturn
+After=docker.service
+
+[Service]
+Type=oneshot
+# Adjust if the deployment does not live at ~/rmt2.
+Environment=BRIDGE_REPO_DIR=%h/rmt2
+ExecStart=%h/rmt2/deploy/turn-cert-sync.sh

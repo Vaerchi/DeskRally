@@ -1,0 +1,24 @@
+/* The "Public join page" section of the Appearance panel (docs/66 2j). Console theme variables only. */
+.pubjoin { display: grid; gap: 12px; margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); min-width: 0; }
+.pubjoin__title { margin: 0; font-size: 15px; }
+.pubjoin__lede, .pubjoin__note, .pubjoin__readonly { margin: 0; color: var(--text-dim); }
+.pubjoin__status { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; padding: 10px 12px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; }
+.pubjoin__status dt { color: var(--text-dim); }
+.pubjoin__status dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.pubjoin__body { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+.pubjoin__form { display: grid; gap: 12px; flex: 1 1 340px; max-width: 520px; min-width: 0; }
+.pubjoin__field { display: grid; gap: 4px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.pubjoin__field > label, .pubjoin__field > legend { display: grid; gap: 4px; }
+.pubjoin__field input:not([type="color"]):not([type="file"]), .pubjoin__field textarea, .pubjoin__field select { width: 100%; max-width: 100%; }
+.pubjoin__field textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; resize: vertical; }
+.pubjoin__field [aria-invalid="true"] { border-color: var(--bad); }
+.pubjoin__row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pubjoin__row > input:not([type="color"]) { flex: 1 1 180px; min-width: 0; }
+.pubjoin__hint { color: var(--text-dim); font-size: 12px; }
+.pubjoin__hint[data-over="true"], .pubjoin__hint[data-state="fail"] { color: var(--bad); }
+.pubjoin__error { color: var(--bad); font-size: 13px; overflow-wrap: anywhere; }
+.pubjoin__outcome { color: var(--good); }
+.pubjoin__actions { display: flex; gap: 8px; }
+.pubjoin__preview { display: grid; gap: 8px; flex: 1 1 380px; min-width: 0; }
+.pubjoin__previewbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.pubjoin__previewtitle { font-weight: 600; }

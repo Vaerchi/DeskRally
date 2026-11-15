@@ -1,0 +1,79 @@
+[package]
+name = "rmt-agent"
+version = "0.0.1"
+edition = "2021"
+description = "Remote support agent — Windows-first, backstage headless tooling"
+publish = false
+
+# NOTE: This is an early scaffold. The Windows-specific modules are written against
+# the `windows` crate API and are intended to be built and tested on a Windows target.
+# They are sketches that establish structure and the hard API sequences; expect to
+# iterate on error handling, handle lifetimes, and edge cases against a real machine.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1", features = ["derive"] }
+# Real SHA-256 for the tamper-evident audit chain (replaces the FNV placeholder).
+sha2 = "0.10"
+# H1: Ed25519 verify/sign of the relay-issued backstage grant. rmt-agent depends on no OTHER
+# workspace crate today; rmt-crypto (the shared identity/AEAD primitives) is a pure, cross-platform
+# leaf, so this stays a one-way edge (rmt-agent → rmt-crypto) with no cycle risk.
+rmt-crypto = { path = "../crates/crypto" }
+# Hex encoding of the 64-byte Ed25519 signature on the SignedGrant wire form (serde has no built-in
+# impl for [u8; 64]).
+hex = "0.4"
+# Cross-platform process/system enumeration for the read-only panels. Real, runnable data
+# without hand-rolling CreateToolhelp32Snapshot; drop to raw Win32 later for cross-session
+# command lines that sysinfo can't reach from a non-elevated context.
+sysinfo = "0.33"
+# HTTP + WebSocket server that serves the browser terminal and bridges the shell channel.
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+# Headless WebSocket client for the end-to-end shell test.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+# Friendly, well-established Windows registry wrapper for the registry read/write ops — avoids
+# hand-rolling RegOpenKeyEx/RegSetValueEx FFI and its UTF-16 buffer handling.
+[target.'cfg(windows)'.dependencies.winreg]
+version = "0.52"
+
+[target.'cfg(windows)'.dependencies.conpty]
+# Tested ConPTY wrapper (the pseudoconsole primitive). Our value-add — split halves, wire
+# codec, WebSocket bridge, RBAC/audit — sits on top. Avoids hand-rolling the fiddly
+# CreateProcessW + PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attachment.
+version = "0.5"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",     # WTSQueryUserToken, WTSGetActiveConsoleSessionId
+    "Win32_System_Environment",       # CreateEnvironmentBlock / DestroyEnvironmentBlock
+    "Win32_System_SystemServices",
+    "Win32_System_Services",          # OpenSCManager / EnumServicesStatusEx (service list panel)
+    "Win32_Storage_FileSystem",       # GetLogicalDrives — drive roots without probing media
+    "Win32_System_WindowsProgramming", # SDK DRIVE_REMOTE constant for mapped-drive rejection
+    "Win32_System_EventLog",          # EvtQuery / EvtNext / EvtRender (event log panel)
+]
+
+[lib]
+name = "rmt_agent"
+path = "src/lib.rs"
+
+# M5: folded into the root workspace (was previously kept standalone via an empty `[workspace]`
+# table). It is now a member of the root Cargo.toml so `crates/agent-windows` can depend on it and
+# carry the backstage protocol over the WebRTC transport.

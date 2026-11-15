@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for DeskRallySupport.exe (docs/27 step 9).
+    * comctl32 v6 dependency: the code prompt uses real EDIT/BUTTON/STATIC controls; v6 gives them
+      the current theme instead of the Windows-95 look.
+    * dpiAware/dpiAwareness PerMonitorV2: the window is created DPI-aware so it is crisp at 150%/200%
+      and after a drag to a second monitor. (support_main also calls SetProcessDpiAwarenessContext
+      before the window; the manifest is the belt to that brace.)
+    * requestedExecutionLevel asInvoker: NEVER requestAdministrator. The client runs as the
+      customer's normal user and refuses an elevated run; asInvoker is what keeps it that way.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2,permonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

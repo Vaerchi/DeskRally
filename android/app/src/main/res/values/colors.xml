@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Mirror the bg and border CSS variables in web/viewer/src/index.css and theme_color in
+         web/viewer/public/manifest.webmanifest. Change them together. -->
+    <color name="console_bg">#0E1116</color>
+    <color name="console_border">#2A323D</color>
+    <color name="icon_plate">#13283E</color>
+</resources>

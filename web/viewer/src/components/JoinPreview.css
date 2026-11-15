@@ -1,0 +1,4 @@
+/* The console's preview of the guest join page (docs/66 2j, 2l). The frame itself is `JoinBrandFrame`; the page inside is the
+   real JoinBrand with the stylesheet the join page uses. */
+.join-preview { display: grid; gap: 8px; min-width: 0; }
+.join-preview__sample { margin: 0; }

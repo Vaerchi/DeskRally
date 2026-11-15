@@ -1,0 +1,44 @@
+# One template, one identity per instance (audit #10). The instance name selects BOTH the config
+# file (config/%i.env, via run-service.sh) and the OS account: deskrally@controlplane runs as
+# deskrally-controlplane, deskrally@signaling as deskrally-signaling, deskrally@relay as
+# deskrally-relay. Each config file is 0640 root:<that service's group>, so the internet-facing
+# signaling process cannot read the control plane's secrets (grant/directive seeds, TOTP key,
+# recording master key, database password), and ProtectProc=invisible hides other users' /proc entries.
+# Caddy is NOT run from this template: use the caddy package's own service and user.
+[Unit]
+Description=DeskRally native %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deskrally-%i
+Group=deskrally-%i
+WorkingDirectory=/opt/deskrally
+ExecStart=/bin/sh /opt/deskrally/run-service.sh %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# docs/63 central recording storage (OFF unless RECORDING_MASTER_KEY is set): ProtectSystem=strict makes every path read-only, so
+# enabling it on a native install needs a drop-in for deskrally@controlplane ONLY (`systemctl edit deskrally@controlplane`) with
+# ReadWritePaths=<RECORDING_DIR>. It is deliberately NOT here: this template also runs signaling and relay, which must never be
+# able to write the evidence directory. The directory itself (owned by deskrally-controlplane, mode 700) is created by the operator;
+# docs/guides/native-server.md "Recording storage and key rotation" has the commands. Nothing to do while storage is off.
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
