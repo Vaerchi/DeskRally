@@ -72,7 +72,8 @@ import { SessionLeaseRenewer } from "./lib/session_lease";
 import { releaseSessionOnTerminalTransport } from "./lib/session_lifecycle";
 import { SessionRecovery, RecoveryRefused, withDeadline, type RecoveryNotice } from "./lib/session_recovery";
 import { withRelayLimitCause } from "./lib/relay_notice";
-import { isDisplayLayoutEnd, LayoutReconnectBudget, LAYOUT_RECONNECT_DELAY_MS } from "./lib/layout_reconnect";
+import { LayoutReconnectBudget, LAYOUT_RECONNECT_DELAY_MS } from "./lib/layout_reconnect";
+import { routeAgentError } from "./lib/agent_error";
 import { isRefusal } from "./lib/session_lease";
 import {
   effectivePaneMode,
@@ -103,7 +104,6 @@ import {
   handTimedOut,
   handoffAdvertised,
   inputControlChanged,
-  isInputControlError,
   type InputHandoffModel,
 } from "./lib/input_handoff";
 import type { SessionParticipantEntry } from "./lib/protocol";
@@ -1521,6 +1521,77 @@ export default function App() {
         return;
       }
 
+      // The two agent-`Error` outcomes that need more than one line (routeAgentError decides which applies).
+      // Agent host.rs lease-lapse errors use the exact "session ended:" prefix; other policy failures can mean a
+      // view-only floor or a recoverable expired renewal and must not be mistaken for a session termination.
+      const endSessionOnAgentError = (message: string, layoutChange: boolean) => {
+        const reconnectLayout = layoutChange && layoutReconnectBudget.current.take(Date.now());
+        if(reconnectLayout) {
+          recovery.current?.cancel();
+          setError(`${message} — reconnecting automatically…`);
+        } else {
+          setError(message);
+        }
+        handleTransportState("failed");
+        transportRef.current?.close(); signalingRef.current?.close();
+        if(reconnectLayout) {
+          const gen = sessionGeneration.current;
+          setTimeout(() => {
+            if (sessionGeneration.current === gen) reconnectManuallyRef.current();
+          }, LAYOUT_RECONNECT_DELAY_MS);
+        }
+      };
+      const settleAfterCommandError = (message: string) => {
+        setError(`agent: ${message}`);
+        // An elevated command that verified and then failed to start answers `Error` for a Win32
+        // fault (a failed environment block, a spawn failure) — with ONE carve-out added in loop
+        // 88: a failure at the TOKEN step (`CommandError::NotElevatable` — the interactive user
+        // has no linked elevated token at all) answers `ElevationDenied` instead, because
+        // nothing ran and the elevation was declined, which is exactly what that channel is for.
+        // The grant is spent either way; see the `pending_command` completion arm in host.rs.
+        // Disarm the deadline here too, since an `Error` is still a verdict.
+        if (elevationTimeoutRef.current !== null) {
+          clearTimeout(elevationTimeoutRef.current);
+          elevationTimeoutRef.current = null;
+        }
+        // A command that could not start (or was refused as one-already-running) comes back as an
+        // Error, not a CommandResult — so re-enable the Run button here too, else it stays disabled.
+        setCommandPending(false);
+        // Likewise a screenshot that could not be taken (no frame yet) — clear the "Capturing…".
+        setScreenshotStatus(undefined);
+        // A recording that could not START (no location configured, disk below the floor, DACL
+        // refused) or could not STOP (nothing running) answers Error, not RecordingStopped — so
+        // clear the pending flag here too, or the Record button stays disabled for the rest of
+        // the session. `recording` itself is deliberately NOT touched: an Error while a
+        // recording is genuinely running (a refused second start) must not make the UI claim it
+        // stopped, and the agent's own `RecordingStopped` is the only thing that says it did.
+        setRecordingPending(false);
+        // If require_recording is mandated but the start was refused (host has no recording
+        // dir, disk full, DACL), reset the pending guard so the next policy lease renewal can
+        // retry. Use setRecording's functional updater to read the CURRENT value without
+        // stale-closure risk — we return `prev` unchanged so the recording indicator is not
+        // disturbed.
+        setRecording(prev => {
+          if (!prev && requireRecordingPendingRef.current) {
+            requireRecordingPendingRef.current = false;
+          }
+          return prev;
+        });
+        // A directory listing that could not be read comes back as an Error — attribute it to the
+        // file browser ONLY when one was in flight, so it shows inline and stops the "Loading…".
+        // Navigation is disabled while loading (FileManagerPanel), so at most one ListDirectory is
+        // in flight, which is what makes this single-pending attribution correct.
+        if (dirPendingPathRef.current !== null) {
+          dirPendingPathRef.current = null;
+          if (dirTimeoutRef.current !== null) {
+            clearTimeout(dirTimeoutRef.current);
+            dirTimeoutRef.current = null;
+          }
+          setDirError(message);
+          setDirLoading(false);
+        }
+      };
+
       // Control client: monitor enumeration/selection over ChannelId.Control. Its `send` frames onto
       // the transport we are about to build (closure captures the ref).
       const control = new ControlClient(
@@ -1593,91 +1664,28 @@ export default function App() {
           },
           onError: (message) => {
             if(!isCurrent()) return;
-            // docs/61: a hand refusal (stable "input control: " prefix) belongs to the pending hand. It
-            // changes no ownership state and is not a session error.
-            if(isInputControlError(message)) {
-              setInputHandoff((m) => handRefused(m, message));
-              return;
-            }
-            // Agent host.rs lease-lapse errors use this exact prefix. Other policy
-            // failures can mean a view-only floor or a recoverable expired renewal;
-            // they must not be mistaken for a session termination.
-            if(message.startsWith("session ended:")) {
-              const reconnectLayout = isDisplayLayoutEnd(message) && layoutReconnectBudget.current.take(Date.now());
-              if(reconnectLayout) {
-                recovery.current?.cancel();
-                setError(`${message} — reconnecting automatically…`);
-              } else {
-                setError(message);
-              }
-              handleTransportState("failed");
-              transportRef.current?.close(); signalingRef.current?.close();
-              if(reconnectLayout) {
-                const gen = sessionGeneration.current;
-                setTimeout(() => {
-                  if (sessionGeneration.current === gen) reconnectManuallyRef.current();
-                }, LAYOUT_RECONNECT_DELAY_MS);
-              }
-              return;
-            }
-            // A session-policy rejection is not a command failure — attribute it to the install that is
-            // in flight and report it as a POLICY state instead of the generic agent-error banner. It
-            // matters which one it is: "the organisation's policy could not be applied" is a security
-            // fact the operator should read differently from "that command did not run".
-            if (policyPendingRef.current) {
-              policyPendingRef.current = false;
-              // applied:false — the agent could not verify it and has floored the session for good.
-              // This is the case that used to vanish: the note was stored and never rendered.
-              setSessionPolicyState({ enforced: false, applied: false, note: message });
-              return;
-            }
-            setError(`agent: ${message}`);
-            // An elevated command that verified and then failed to start answers `Error` for a Win32
-            // fault (a failed environment block, a spawn failure) — with ONE carve-out added in loop
-            // 88: a failure at the TOKEN step (`CommandError::NotElevatable` — the interactive user
-            // has no linked elevated token at all) answers `ElevationDenied` instead, because
-            // nothing ran and the elevation was declined, which is exactly what that channel is for.
-            // The grant is spent either way; see the `pending_command` completion arm in host.rs.
-            // Disarm the deadline here too, since an `Error` is still a verdict.
-            if (elevationTimeoutRef.current !== null) {
-              clearTimeout(elevationTimeoutRef.current);
-              elevationTimeoutRef.current = null;
-            }
-            // A command that could not start (or was refused as one-already-running) comes back as an
-            // Error, not a CommandResult — so re-enable the Run button here too, else it stays disabled.
-            setCommandPending(false);
-            // Likewise a screenshot that could not be taken (no frame yet) — clear the "Capturing…".
-            setScreenshotStatus(undefined);
-            // A recording that could not START (no location configured, disk below the floor, DACL
-            // refused) or could not STOP (nothing running) answers Error, not RecordingStopped — so
-            // clear the pending flag here too, or the Record button stays disabled for the rest of
-            // the session. `recording` itself is deliberately NOT touched: an Error while a
-            // recording is genuinely running (a refused second start) must not make the UI claim it
-            // stopped, and the agent's own `RecordingStopped` is the only thing that says it did.
-            setRecordingPending(false);
-            // If require_recording is mandated but the start was refused (host has no recording
-            // dir, disk full, DACL), reset the pending guard so the next policy lease renewal can
-            // retry. Use setRecording's functional updater to read the CURRENT value without
-            // stale-closure risk — we return `prev` unchanged so the recording indicator is not
-            // disturbed.
-            setRecording(prev => {
-              if (!prev && requireRecordingPendingRef.current) {
-                requireRecordingPendingRef.current = false;
-              }
-              return prev;
-            });
-            // A directory listing that could not be read comes back as an Error — attribute it to the
-            // file browser ONLY when one was in flight, so it shows inline and stops the "Loading…".
-            // Navigation is disabled while loading (FileManagerPanel), so at most one ListDirectory is
-            // in flight, which is what makes this single-pending attribution correct.
-            if (dirPendingPathRef.current !== null) {
-              dirPendingPathRef.current = null;
-              if (dirTimeoutRef.current !== null) {
-                clearTimeout(dirTimeoutRef.current);
-                dirTimeoutRef.current = null;
-              }
-              setDirError(message);
-              setDirLoading(false);
+            const route = routeAgentError(message, policyPendingRef.current);
+            switch (route.kind) {
+              case "input-control":
+                // docs/61: a hand refusal belongs to the pending hand; it changes no ownership state.
+                setInputHandoff((m) => handRefused(m, message));
+                return;
+              case "session-ended":
+                endSessionOnAgentError(message, route.layoutChange);
+                return;
+              case "policy-rejected":
+                // A session-policy rejection is not a command failure — attribute it to the install that is
+                // in flight and report it as a POLICY state instead of the generic agent-error banner. It
+                // matters which one it is: "the organisation's policy could not be applied" is a security
+                // fact the operator should read differently from "that command did not run".
+                policyPendingRef.current = false;
+                // applied:false — the agent could not verify it and has floored the session for good.
+                // This is the case that used to vanish: the note was stored and never rendered.
+                setSessionPolicyState({ enforced: false, applied: false, note: message });
+                return;
+              case "command":
+                settleAfterCommandError(message);
+                return;
             }
           },
           // H1: agent acked a control-plane-signed grant — clear the "no grant" affordance.

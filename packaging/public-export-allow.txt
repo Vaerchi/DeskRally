@@ -250,9 +250,9 @@ control-plane/webhook.go:literal-credential
 control-plane/webhook_ssrf_test.go:private-network
 control-plane/webhook_test.go:credential-assignment-review
 control-plane/webhook_test.go:literal-credential
-crates/agent-core/src/control.rs:long-hex
-crates/agent-core/src/control.rs:personal-workspace
-crates/agent-core/src/control.rs:private-path
+crates/agent-core/src/control/tests.rs:long-hex
+crates/agent-core/src/control/tests.rs:personal-workspace
+crates/agent-core/src/control/tests.rs:private-path
 crates/agent-core/src/deployment.rs:deployment-host
 crates/agent-core/src/file_transfer.rs:long-hex
 crates/agent-core/src/relay_transport.rs:literal-credential
