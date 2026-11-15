@@ -91,8 +91,10 @@ now, not the target design.
   loopback address ranges, so the relay cannot be used to reach the server's internal network.
 - **Web traffic.** The web front end uses HTTPS with HSTS. Framing is denied, through `frame-ancestors 'none'`
   and `X-Frame-Options`.
-- **Content Security Policy.** It currently runs in report-only mode. Violations are collected at
-  `/cp/csp-report` with bounded, redacted logging, so the policy can be tightened before it is enforced.
+- **Content Security Policy.** The shipped Caddyfiles enforce one policy: scripts, styles, connections and
+  workers only from the console's own origin (plus `wss:`/`https:` connections), no plugins, no framing. Styles
+  still allow inline `style` attributes, which the viewer uses to position the remote picture. Violations are
+  reported to `/cp/csp-report`, which logs them bounded and redacted.
 
 ## Updates and releases
 
@@ -118,7 +120,8 @@ now, not the target design.
   control of the signaling server could therefore intercept a session. The design to close this gap is in
   [02-architecture.md](02-architecture.md) (ADR-004) and is not yet shipped. Treat the server as part of your
   trusted base.
-- **The Content Security Policy is not yet enforced** (see above).
+- **The Content Security Policy allows inline styles** (`style-src 'unsafe-inline'`, see above). Script sources
+  are strict.
 - **A reduced permission reaches a live session within about 32 seconds, not instantly.** A remote-control session
   holds a 30-second lease that the technician's viewer renews about every 10 seconds, and every renewal re-reads the
   technician's current role, group scope and expiry from the database. If a role or group scope is reduced so that it
