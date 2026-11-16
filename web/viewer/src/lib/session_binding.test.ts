@@ -2,7 +2,7 @@ import { ChannelId } from "./protocol";
 import { describe, expect, it } from "vitest";
 import {
   allowedBeforeBinding, bytesToHex, createConsoleKey, fingerprintFromSdp, fingerprintsFromDescriptions, fingerprintsFromStats, hexToBytes, parseDeviceBinding, ROLE_AGENT, ROLE_CONSOLE,
-  runConsoleBinding, transcriptBytes, uuidBytes, verifyEd25519, type BindTranscript, type ConsoleBindingDeps,
+  runConsoleBinding, transcriptBytes, uuidBytes, verifyEd25519, type BindingStatus, type BindTranscript, type ConsoleBindingDeps,
 } from "./session_binding";
 
 const subtle = globalThis.crypto.subtle;
@@ -86,7 +86,8 @@ function statsFor(consoleFp: number, agentFp: number) {
 }
 
 /** Wire a console run to a simulated agent whose own view is (agentOwn, agentSeesConsole). */
-async function run(opts: { agentView?: [number, number]; consoleView?: [number, number]; mode?: "warn" | "require"; agentSilent?: boolean; agentRefuses?: boolean; noMaterial?: boolean; noKey?: boolean }) {
+async function run(opts: { agentView?: [number, number]; consoleView?: [number, number]; mode?: "warn" | "require"; agentSilent?: boolean; agentRefuses?: boolean; noMaterial?: boolean; noKey?: boolean; lateProof?: boolean; lateNever?: boolean; onLate?: (s: BindingStatus) => void }) {
+  let proofCalls = 0;
   const agent = await simulatedAgent();
   const key = opts.noKey ? null : await createConsoleKey(subtle);
   const [agentOwn, agentSeesConsole] = opts.agentView ?? [0xa1, 0xb2];
@@ -101,7 +102,11 @@ async function run(opts: { agentView?: [number, number]; consoleView?: [number, 
     sendStart: (_g, n) => { consoleNonce = n; },
     sendConsoleProof: (s) => { consoleSig = s; },
     awaitAgentProof: async () => {
+      proofCalls += 1;
       if (opts.agentSilent) return null;
+      // A slow enforcing agent: the on-time wait sees nothing; the proof arrives during the late window (or never).
+      if ((opts.lateProof || opts.lateNever) && proofCalls === 1) return null;
+      if (opts.lateNever) return null;
       const t: BindTranscript = {
         sessionId: uuidBytes(SESSION), agentCertSha256: new Uint8Array(32).fill(agentOwn),
         consoleCertSha256: new Uint8Array(32).fill(agentSeesConsole), agentNonce, consoleNonce: hexToBytes(consoleNonce),
@@ -120,6 +125,7 @@ async function run(opts: { agentView?: [number, number]; consoleView?: [number, 
     stats: async () => statsFor(consoleOwn, consoleSeesAgent),
     randomBytes: (n) => new Uint8Array(n).fill(0xd4),
     verify: (p, m, s) => verifyEd25519(p, m, s, subtle),
+    onLateStatus: opts.onLate,
   };
   return runConsoleBinding(deps);
 }
@@ -209,5 +215,32 @@ describe("an explicit refusal of BindStart", () => {
       });
       expect(status).toEqual({ state: "failed", reason: "agent_refused" });
     }
+  });
+});
+
+describe("a late agent proof (an enforcing agent whose loop started late, Codex enforce-step3 r2)", () => {
+  const late = (extra: Parameters<typeof run>[0]) =>
+    new Promise<{ first: BindingStatus; late: BindingStatus }>((resolve, reject) => {
+      let first: BindingStatus | null = null;
+      let lateStatus: BindingStatus | null = null;
+      const done = () => { if (first && lateStatus) resolve({ first, late: lateStatus }); };
+      run({ ...extra, onLate: (st) => { lateStatus = st; done(); } }).then((st) => { first = st; done(); }, reject);
+    });
+  it("settles unverified at once at warn, then upgrades to verified with the full checks", async () => {
+    const r = await late({ lateProof: true });
+    expect(r.first.state).toBe("unverified");
+    expect(r.late).toEqual({ state: "verified" });
+  });
+  it("fails a late proof from a man in the middle", async () => {
+    const r = await late({ lateProof: true, agentView: [0xa1, 0xee], consoleView: [0xb2, 0xff] });
+    expect(r.first.state).toBe("unverified");
+    expect(r.late).toEqual({ state: "failed", reason: "bad_signature" });
+  });
+  it("does not wait at require, and reports nothing when no proof ever comes", async () => {
+    const calls: BindingStatus[] = [];
+    expect(await run({ lateProof: true, mode: "require", onLate: (st) => calls.push(st) })).toEqual({ state: "failed", reason: "no_proof" });
+    expect((await run({ lateNever: true, onLate: (st) => calls.push(st) })).state).toBe("unverified");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toEqual([]);
   });
 });

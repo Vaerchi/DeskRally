@@ -202,7 +202,11 @@ test("a console that cannot bind gets no picture, and the enforcing agent ends t
   await expect(page.locator(".viewer__status")).toBeVisible({ timeout: 45_000 });
   await expect(page.getByTestId("session-binding-status")).toHaveCount(0);
   // The enforcing agent ends the session at its 10 s deadline, having sent nothing.
-  expect(await waitFor(() => agentLog.slice(before).includes("no verified console within the deadline"), 30_000)).toBe(true);
+  // The console sent no BindStart at all (its material was stripped), so the agent says the server sent no grant.
+  expect(await waitFor(() => {
+    const log = agentLog.slice(before);
+    return log.includes("the console was not verified; ending the session") && log.includes("no_grant_received");
+  }, 30_000)).toBe(true);
   // The AGENT's own count is the evidence: a <video> clock can tick on a live stream with no frame at all (the
   // gate saw currentTime 0.03 s with frames=0), so the picture check is "no decoded frame" plus the agent count.
   expect(await waitFor(() => /serve_session: finished frames=0 forwarded=0/.test(agentLog.slice(before)), 15_000)).toBe(true);

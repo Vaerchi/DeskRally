@@ -383,7 +383,10 @@ export class BrokeredSessionCore {
       stats: async () => (this.transport as { getStats?: () => Promise<RTCStatsReport | undefined> } | undefined)?.getStats?.(),
       descriptions: () => (this.transport as { descriptions?: () => { local?: string | null; remote?: string | null } } | undefined)?.descriptions?.() ?? {},
       randomBytes: (n) => crypto.getRandomValues(new Uint8Array(n)),
-    }), "binding", 15000);
+      // No person waits on held input here, so wait as long as an enforcing agent could take to answer (its loop can
+      // start seconds late on a busy machine; Codex enforce-step3 r2) rather than settle unverified and run.
+      proofTimeoutMs: 15_000,
+    }), "binding", 30000);
     if (status.state === "failed") {
       void this.deps.api.reportSessionBindingFailed?.(this.id, status.reason)?.catch(() => {});
       throw new CoreError("binding", `This machine could not be verified (${status.reason}); nothing ran`);

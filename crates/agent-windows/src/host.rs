@@ -5297,6 +5297,10 @@ pub async fn serve_session_with_ice(
     let mut lease_tick = tokio::time::interval(LEASE_TICK);
     lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // docs/69: the binding clock starts HERE, where the loop can first read the console's BindStart. Local startup
+    // above (the guest window can take seconds on a busy machine) must not eat an honest console's window
+    // (Codex enforce-step3 r1 P2).
+    binding.start_clock(Instant::now());
     while (video_open || input_open)
         && !stop.load(Ordering::Relaxed)
         && !session_stop.load(Ordering::Relaxed)
@@ -5363,8 +5367,11 @@ pub async fn serve_session_with_ice(
             clip_resync.store(true, Ordering::Relaxed);
         }
         // docs/69: an enforcing session that failed to bind, or ran out its binding deadline, ends.
-        if binding.must_end(Instant::now()) {
-            tracing::warn!(cp_session = ?control_plane_session, "session binding: no verified console within the deadline; ending the session");
+        if let Some(cause) = binding.end_cause(Instant::now()) {
+            // docs/69 3.9: say WHICH step failed. "no_grant_received" is the operator's clue that the server sends no
+            // binding grant (CP_SESSION_BINDING=off) or the console is an older viewer; "no_issuer_pin" means this
+            // machine never pinned the control plane's key (restart the agent or re-enrol it).
+            tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
             break;
         }
         tokio::select! {
@@ -5940,7 +5947,9 @@ pub async fn serve_session_with_ice(
                 // once bound; overflowing the hold ends the session.
                 Ok(frame) if !binding.open() && !is_binding_frame(&frame) => {
                     if !binding.hold(frame) {
-                        tracing::warn!(cp_session = ?control_plane_session, "session binding: too much traffic before the console proved itself; ending the session");
+                        // Same line as every other binding end, so one search finds them all (Codex release-1331 P3).
+                        let cause = binding.end_cause(Instant::now()).unwrap_or(rmt_agent::session_binding::reason::HOLD_OVERFLOW);
+                        tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
                         video_open = false;
                         input_open = false;
                     }
@@ -6688,7 +6697,8 @@ pub async fn serve_session_with_ice(
                             if transport.send_frame(Frame::new(ChannelId::Control, control::encode(&msg))).await.is_err() {
                                 input_open = false;
                             }
-                            if binding.must_end(Instant::now()) {
+                            if let Some(cause) = binding.end_cause(Instant::now()) {
+                                tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
                                 video_open = false;
                                 input_open = false;
                             }
@@ -6729,7 +6739,8 @@ pub async fn serve_session_with_ice(
                                     let _ = transport.send_frame(Frame::new(ChannelId::Control, payload)).await;
                                 }
                                 transport.replay_frames(binding.take_held());
-                            } else if binding.must_end(Instant::now()) {
+                            } else if let Some(cause) = binding.end_cause(Instant::now()) {
+                                tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
                                 video_open = false;
                                 input_open = false;
                             }
@@ -10748,8 +10759,9 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
     // grant there because a config value was blank or had a typo is not a "convenient fallback", it
     // is the whole authorization system switched off by omission — and the shipped installer
     // defaults `-GrantIssuerPubkey` to "", so the insecure path was the one you got by not passing
-    // a flag. Streaming/input/clipboard still run, so the machine stays reachable and fixable; only
-    // the tool panels are gated. Failing closed here is the same house rule as the throttles.
+    // a flag. From 1.3.31 the installed helper also ENFORCES session binding (docs/69), which needs this key
+    // to verify the console's grant, so without it remote sessions are refused too (the helper fetches it once at
+    // start when missing). Failing closed here is the same house rule as the throttles.
     let backstage_auth: BackstageAuth = match cfg.grant_issuer_pubkey.as_deref() {
         Some(hex) if !hex.trim().is_empty() => match PublicIdentity::from_hex(hex.trim()) {
             Ok(pk) => {
@@ -10757,12 +10769,12 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
                 BackstageAuth::SignedBy(pk)
             }
             Err(e) => {
-                log_line(false, &format!("helper: grant_issuer_pubkey is not a valid Ed25519 hex key ({e:?}); backstage is DISABLED (streaming and input are unaffected)"));
+                log_line(false, &format!("helper: grant_issuer_pubkey is not a valid Ed25519 hex key ({e:?}); backstage is DISABLED, and remote sessions are refused until a valid key is pinned (session binding, docs/69)"));
                 BackstageAuth::Deny
             }
         },
         _ => {
-            log_line(false, "helper: no grant_issuer_pubkey configured; backstage is DISABLED (streaming and input are unaffected)");
+            log_line(false, "helper: no grant_issuer_pubkey configured; backstage is DISABLED, and remote sessions are refused until one is pinned (session binding, docs/69; restart the agent to fetch it, or re-enrol)");
             BackstageAuth::Deny
         }
     };
@@ -10875,8 +10887,10 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
         device,
         ice: ice.clone(),
         identity: agent_identity.clone(),
-        // docs/69: answer-only until the enforcing release (the console must ship first).
-        session_binding: rmt_agent::session_binding::Enforcement::AnswerOnly,
+        // docs/69 3.9 step 3: the installed helper ENFORCES. Until the console's proof verifies it sends no media and
+        // processes no other frame, and it ends a session that is not bound within the deadline. Servers send
+        // grants by default (CP_SESSION_BINDING is on unless set to off).
+        session_binding: rmt_agent::session_binding::Enforcement::Enforce,
         transfer_dir: transfer_dir.clone(),
         clipboard_mode,
         backstage_auth: backstage_auth.clone(),

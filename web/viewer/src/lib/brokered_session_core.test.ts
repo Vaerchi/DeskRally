@@ -290,7 +290,7 @@ describe("BrokeredSessionCore readiness and ownership", () => {
     const opening = f.open();
     const rejected = expect(opening).rejects.toMatchObject({ phase: "binding" });
     await drain(); f.events.onChannelOpen?.();
-    await vi.advanceTimersByTimeAsync(5000); // the agent never answers BindStart
+    await vi.advanceTimersByTimeAsync(15000); // the agent never answers BindStart (headless waits 15 s)
     await rejected;
     expect(f.control.sendBindStart).toHaveBeenCalledOnce();
     expect(f.api.startBrokeredSession).toHaveBeenCalledWith("device-1", expect.anything(), { consolePubkey: "cd".repeat(32) });

@@ -1312,8 +1312,17 @@ impl WebRtcTransport {
             let sig = sig.clone();
             tokio::spawn(async move {
                 let mut rx = sig_rx;
+                // docs/69 3.4: a verification is good only for the association it was made on, and nothing
+                // here re-verifies one. So the connection takes exactly ONE remote description (the console's
+                // offer) and refuses any later one, as the console refuses a second answer (transport.ts). A
+                // renegotiation that would replace the DTLS association can therefore never happen under a
+                // completed binding. Trickled candidates still apply: they cannot change the association.
+                let mut remote_applied = false;
                 while let Some(msg) = rx.recv().await {
                     match msg {
+                        ServerToClient::Sdp { .. } if remote_applied => {
+                            tracing::warn!(role = tag, "refused a second remote description (renegotiation is not supported)");
+                        }
                         ServerToClient::Sdp { sdp, kind, .. } => match kind {
                             SdpKind::Offer => {
                                 tracing::debug!(role = tag, media = %sdp_media_summary(&sdp), "remote OFFER media sections");
@@ -1322,6 +1331,7 @@ impl WebRtcTransport {
                                     tracing::warn!(role = tag, error = %e, "set_remote(offer)");
                                     continue;
                                 }
+                                remote_applied = true;
                                 let answer = match pc.create_answer(None).await {
                                     Ok(a) => a,
                                     Err(e) => {
@@ -1346,8 +1356,9 @@ impl WebRtcTransport {
                             }
                             SdpKind::Answer => {
                                 if let Ok(answer) = RTCSessionDescription::answer(sdp) {
-                                    if let Err(e) = pc.set_remote_description(answer).await {
-                                        tracing::warn!(role = tag, error = %e, "set_remote(answer)");
+                                    match pc.set_remote_description(answer).await {
+                                        Ok(()) => remote_applied = true,
+                                        Err(e) => tracing::warn!(role = tag, error = %e, "set_remote(answer)"),
                                     }
                                 }
                             }

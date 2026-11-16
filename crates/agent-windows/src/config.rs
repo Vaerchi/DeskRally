@@ -90,7 +90,7 @@ pub struct HelperConfig {
     /// `Control::InstallGrant` carrying a grant signed by this key verifies.
     ///
     /// When `None`, blank or malformed the agent **fails closed**: backstage is DENIED
-    /// (`BackstageAuth::Deny` in `crate::host`), streaming and input are unaffected. This comment
+    /// (`BackstageAuth::Deny` in `crate::host`), and from 1.3.31 the installed helper also refuses remote sessions, because it enforces session binding (docs/69), which verifies the grant with this key. This comment
     /// used to say the agent fell back to an "insecure dev mode" with a self-issued demo grant and a
     /// loud warning — **that is no longer true of the installed service path**, and leaving the
     /// sentence here would describe a permissive fallback that the code removed precisely because

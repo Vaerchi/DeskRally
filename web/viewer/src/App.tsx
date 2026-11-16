@@ -2090,30 +2090,41 @@ export default function App() {
         // processes it at once and holds everything after it (the policy, the monitor list request...)
         // until our proof verifies, then replays them in order. Input stays held until this settles.
         setBindingStatus(brokered?.binding?.device ? { state: "pending" } : null);
-        // Wait for the channel only when an exchange will run; with no binding material the outcome is immediate.
-        void (brokered?.binding?.device?.grant ? channelOpen : Promise.resolve()).then(() => runConsoleBinding({
-          binding: brokered?.binding?.device,
-          key: brokered?.binding?.key ?? null,
-          sessionId: brokered?.sessionId ?? "",
-          sendStart: (grant, nonce) => control.sendBindStart(grant, nonce),
-          sendConsoleProof: (sig) => control.sendBindConsoleProof(sig),
-          awaitAgentProof: (ms) => waitBind((r) => { bindWaiters.proof = r; }, ms),
-          awaitResult: (ms) => waitBind((r) => { bindWaiters.result = r; }, ms),
-          stats: () => transport.getStats(),
-          descriptions: () => transport.descriptions(),
-          randomBytes: (n) => crypto.getRandomValues(new Uint8Array(n)),
-        })).then((status) => {
-          if (!isCurrent()) return;
+        // How a binding outcome lands, on time or late (a late proof at warn, after the session already settled
+        // "not verified" and released its held traffic: a late `verified` upgrades the mark, a late `failed` ends).
+        const bindingIsCurrent = () => isCurrent() && transportRef.current === transport;
+        const settleBinding = (status: BindingStatus) => {
+          if (!bindingIsCurrent()) return;
           // A server that sends no binding material at all (binding not rolled out) gets no mark.
           setBindingStatus(brokered?.binding?.device ? status : null);
           if (status.state !== "failed") { transport.releaseOutbound(); return; }
           transport.discardOutbound();
           // Not the machine we asked for, or it would not prove it: end the session, say why, record it.
-          setError("This connection could not be verified as the machine you asked for. It may have been intercepted, so the session was ended.");
+          setError(status.reason === "agent_refused"
+            // The machine itself refused the check: usually it does not trust this server's signing key yet (not
+            // re-enrolled, or its agent has not restarted since the key became available) or its clock is off.
+            ? "The machine refused to verify this connection, so the session was ended. Usually this means the machine does not yet trust this server's signing key (restart its DeskRally agent or re-enrol it) or its clock is wrong."
+            : "This connection could not be verified as the machine you asked for. It may have been intercepted, so the session was ended.");
           const sid = brokered?.sessionId;
           if (sid) void consoleApiRef.current.reportSessionBindingFailed(sid, status.reason).catch(() => {});
           transport.close(); signaling.close();
-        });
+        };
+        // Wait for the channel only when an exchange will run; with no binding material the outcome is immediate.
+        void (brokered?.binding?.device?.grant ? channelOpen : Promise.resolve()).then(() => runConsoleBinding({
+          binding: brokered?.binding?.device,
+          key: brokered?.binding?.key ?? null,
+          sessionId: brokered?.sessionId ?? "",
+          // Bound to THIS connection: the ControlClient sends through transportRef, which a recovery replaces. A late
+          // exchange still running when that happens must not put its proof on the new connection (Codex enforce r3).
+          sendStart: (grant, nonce) => { if (bindingIsCurrent()) control.sendBindStart(grant, nonce); },
+          sendConsoleProof: (sig) => { if (bindingIsCurrent()) control.sendBindConsoleProof(sig); },
+          awaitAgentProof: (ms) => waitBind((r) => { bindWaiters.proof = r; }, ms),
+          awaitResult: (ms) => waitBind((r) => { bindWaiters.result = r; }, ms),
+          stats: () => transport.getStats(),
+          descriptions: () => transport.descriptions(),
+          randomBytes: (n) => crypto.getRandomValues(new Uint8Array(n)),
+          onLateStatus: settleBinding,
+        })).then(settleBinding);
         // connect() creates the data channel; sends can now queue until it opens.
         // Install the signed access policy before monitor/quality requests. Sending it
         // before connect() throws because no frames channel exists yet.

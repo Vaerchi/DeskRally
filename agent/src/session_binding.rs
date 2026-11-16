@@ -75,7 +75,8 @@ enum State {
     Unbound,
     AwaitingConsole { grant: VerifiedBindingGrant, transcript: BindTranscript },
     Bound { grant: VerifiedBindingGrant },
-    Failed,
+    /// Carries the reason, so the host can say WHY the session ended.
+    Failed(&'static str),
 }
 
 /// One connection's binding state.
@@ -89,8 +90,12 @@ pub struct AgentBinding {
 
 /// Why a binding failed (the reason string sent in `BindResult`).
 pub mod reason {
-    /// The grant did not verify (signature, expiry, device) or no issuer key is pinned.
+    /// The grant did not verify (signature, expiry, device).
     pub const GRANT: &str = "grant_refused";
+    /// This agent has no pinned control-plane issuer key, so it cannot verify any grant (docs/69 3.7.3).
+    pub const NO_ISSUER_PIN: &str = "no_issuer_pin";
+    /// More frames arrived while unbound than the hold limits allow.
+    pub const HOLD_OVERFLOW: &str = "hold_overflow";
     /// The grant names a different session than signaling reported.
     pub const SESSION_MISMATCH: &str = "session_mismatch";
     /// The grant names a different technician, or a stricter access level, than signaling reported.
@@ -111,6 +116,15 @@ impl AgentBinding {
         Self { enforcement, state: State::Unbound, deadline: now + BINDING_DEADLINE, held: Vec::new(), held_bytes: 0 }
     }
 
+    /// Restart the deadline at `now`, but only while nothing has happened yet. The host calls it when its loop
+    /// can first read a `BindStart`, so slow local startup (opening the guest window) does not consume the
+    /// window an honest console has to bind in. It can never extend a binding already under way.
+    pub fn start_clock(&mut self, now: Instant) {
+        if matches!(self.state, State::Unbound) && self.held.is_empty() {
+            self.deadline = now + BINDING_DEADLINE;
+        }
+    }
+
     /// Handle `BindStart`. On success the reply is the agent's proof and the state awaits the console.
     pub fn on_bind_start(&mut self, grant_json: &str, console_nonce_hex: &str, cx: BindStartContext<'_>) -> BindReply {
         if !matches!(self.state, State::Unbound) {
@@ -119,7 +133,7 @@ impl AgentBinding {
         let Some(console_nonce) = decode_field_hex(console_nonce_hex) else {
             return self.fail(reason::OUT_OF_ORDER);
         };
-        let Some(issuer) = cx.issuer else { return self.fail(reason::GRANT) };
+        let Some(issuer) = cx.issuer else { return self.fail(reason::NO_ISSUER_PIN) };
         let grant = match SignedBindingGrant::from_json(grant_json).and_then(|g| g.verify(issuer, cx.now_ms, cx.device)) {
             Ok(g) => g,
             Err(_) => return self.fail(reason::GRANT),
@@ -150,7 +164,7 @@ impl AgentBinding {
     /// Handle `BindConsoleProof`. `current` re-reads the live fingerprints: a verification is only good
     /// for the association it was made on (docs/69 §3.4), so a changed pair fails it.
     pub fn on_console_proof(&mut self, sig_hex: &str, current: Option<AgentFingerprints>) -> BindReply {
-        let State::AwaitingConsole { grant, transcript } = std::mem::replace(&mut self.state, State::Failed) else {
+        let State::AwaitingConsole { grant, transcript } = std::mem::replace(&mut self.state, State::Failed(reason::OUT_OF_ORDER)) else {
             return self.fail(reason::OUT_OF_ORDER);
         };
         let same_association = current
@@ -171,8 +185,8 @@ impl AgentBinding {
         BindReply::Result { ok: true, reason: None }
     }
 
-    fn fail(&mut self, why: &str) -> BindReply {
-        self.state = State::Failed;
+    fn fail(&mut self, why: &'static str) -> BindReply {
+        self.state = State::Failed(why);
         BindReply::Result { ok: false, reason: Some(why.to_string()) }
     }
 
@@ -186,10 +200,26 @@ impl AgentBinding {
     pub fn must_end(&self, now: Instant) -> bool {
         self.enforcement == Enforcement::Enforce
             && match self.state {
-                State::Failed => true,
+                State::Failed(_) => true,
                 State::Bound { .. } => false,
                 _ => now >= self.deadline,
             }
+    }
+
+    /// Why [`Self::must_end`] is true, for the log and the operator: the failure reason, or which step the
+    /// deadline passed in. `None` while the session may continue.
+    pub fn end_cause(&self, now: Instant) -> Option<&'static str> {
+        if !self.must_end(now) {
+            return None;
+        }
+        Some(match self.state {
+            State::Failed(why) => why,
+            // No BindStart at all: the console sent no grant. The server's CP_SESSION_BINDING is off, or
+            // the console is an older viewer, or someone between them dropped it.
+            State::Unbound => "no_grant_received",
+            State::AwaitingConsole { .. } => "no_console_proof",
+            State::Bound { .. } => unreachable!("must_end is false once bound"),
+        })
     }
 
     /// The verified grant once bound (its technician and access are authoritative, docs/69 §3.1).
@@ -207,7 +237,7 @@ impl AgentBinding {
         self.held.push(frame);
         if self.held.len() > MAX_HELD_FRAMES || self.held_bytes > MAX_HELD_BYTES {
             self.held.clear();
-            self.state = State::Failed;
+            self.state = State::Failed(reason::HOLD_OVERFLOW);
             return false;
         }
         true
@@ -403,7 +433,7 @@ mod tests {
     fn deadline_hold_limits_and_answer_only_mode() {
         let f = fixture();
         let t0 = Instant::now();
-        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        let b = AgentBinding::new(Enforcement::Enforce, t0);
         assert!(!b.must_end(t0 + BINDING_DEADLINE - Duration::from_millis(1)));
         assert!(b.must_end(t0 + BINDING_DEADLINE));
         let mut b = AgentBinding::new(Enforcement::Enforce, t0);
@@ -417,5 +447,79 @@ mod tests {
         assert!(b.open());
         assert!(!b.must_end(t0 + BINDING_DEADLINE * 10));
         assert!(matches!(start(&mut b, &f, &grant_json(&f, SESSION, 100_000), SESSION, Some(f.fps)), BindReply::AgentProof { .. }));
+    }
+
+    #[test]
+    fn no_pinned_issuer_is_its_own_reason() {
+        let f = fixture();
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        let signer = |m: &[u8]| f.device_key.sign(m);
+        let reply = b.on_bind_start(
+            &grant_json(&f, SESSION, 100_000),
+            &"d4".repeat(32),
+            BindStartContext {
+                issuer: None,
+                device: DEVICE.parse().unwrap(),
+                signaled_session: Some(SESSION.parse().unwrap()),
+                signaled_technician: Some(uuid::Uuid::nil()),
+                fingerprints: Some(f.fps),
+                signer: Some(&signer),
+                now_ms: 2_000,
+                agent_nonce: [0xe5; 32],
+            },
+        );
+        assert_eq!(reply, BindReply::Result { ok: false, reason: Some(reason::NO_ISSUER_PIN.into()) });
+        assert_eq!(b.end_cause(Instant::now()), Some(reason::NO_ISSUER_PIN));
+    }
+
+    #[test]
+    fn end_cause_names_the_step_that_never_completed() {
+        let f = fixture();
+        let t0 = Instant::now();
+        let late = t0 + BINDING_DEADLINE;
+        // Nothing yet, and inside the deadline: no cause.
+        let b = AgentBinding::new(Enforcement::Enforce, t0);
+        assert_eq!(b.end_cause(t0), None);
+        // No BindStart ever arrived: the server sent no grant.
+        assert_eq!(b.end_cause(late), Some("no_grant_received"));
+        // The agent proved itself but the console never answered.
+        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        assert!(matches!(start(&mut b, &f, &grant_json(&f, SESSION, 100_000), SESSION, Some(f.fps)), BindReply::AgentProof { .. }));
+        assert_eq!(b.end_cause(late), Some("no_console_proof"));
+        // A refused grant ends at once, with its reason.
+        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        let _ = start(&mut b, &f, "{}", SESSION, Some(f.fps));
+        assert_eq!(b.end_cause(t0), Some(reason::GRANT));
+        // Overflowing the hold says so.
+        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        for _ in 0..=MAX_HELD_FRAMES {
+            let _ = b.hold(Frame::new(ChannelId::Input, vec![0]));
+        }
+        assert_eq!(b.end_cause(t0), Some(reason::HOLD_OVERFLOW));
+        // Answer-only never ends, so it never has a cause.
+        let b = AgentBinding::new(Enforcement::AnswerOnly, t0);
+        assert_eq!(b.end_cause(late), None);
+    }
+
+    #[test]
+    fn the_clock_restarts_only_before_anything_happened() {
+        let f = fixture();
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(7);
+        // Slow local startup: the clock restarts where the loop begins, so the full window remains.
+        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        b.start_clock(later);
+        assert!(!b.must_end(t0 + BINDING_DEADLINE));
+        assert!(b.must_end(later + BINDING_DEADLINE));
+        // Once a BindStart was handled it can never be extended.
+        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        assert!(matches!(start(&mut b, &f, &grant_json(&f, SESSION, 100_000), SESSION, Some(f.fps)), BindReply::AgentProof { .. }));
+        b.start_clock(later);
+        assert!(b.must_end(t0 + BINDING_DEADLINE));
+        // Nor once frames are being held.
+        let mut b = AgentBinding::new(Enforcement::Enforce, t0);
+        assert!(b.hold(Frame::new(ChannelId::Input, vec![0])));
+        b.start_clock(later);
+        assert!(b.must_end(t0 + BINDING_DEADLINE));
     }
 }

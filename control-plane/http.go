@@ -120,9 +120,9 @@ type Server struct {
 	// nil means every tenant is at warn.
 	BindingMode func(tenantID string) SessionBindingMode
 
-	// BindingEnabled turns session binding on (docs/69): brokered sessions carry `device_binding`. OFF by
-	// default (CP_SESSION_BINDING=on enables it) so the server can ship before the answering agent release:
-	// against an agent that never answers, every session would otherwise wait out the binding timeout.
+	// BindingEnabled turns session binding on (docs/69): brokered sessions carry `device_binding`. The
+	// zero value is off (tests and embedders opt in); the production binary sets it from
+	// SessionBindingSwitch, which is on unless CP_SESSION_BINDING=off (docs/69 §3.9).
 	BindingEnabled bool
 
 	// Machines is the machine repository (D1). It is THE source of a machine's group, which the

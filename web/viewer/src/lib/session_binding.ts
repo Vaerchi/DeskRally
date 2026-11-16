@@ -208,7 +208,20 @@ export interface ConsoleBindingDeps {
   descriptions?(): { local?: string | null; remote?: string | null };
   randomBytes(n: number): Uint8Array;
   verify?: typeof verifyEd25519;
+  /** How long to wait for the agent's proof. Default BIND_REPLY_TIMEOUT_MS. A caller with no person waiting on held
+   *  input (the headless runner) can afford to wait longer. */
+  proofTimeoutMs?: number;
+  /** At warn, when the proof does not arrive in time, the session settles "unverified" at once (so input is not held
+   *  long against an older agent) and the exchange keeps listening for a LATE proof. An enforcing agent whose local
+   *  startup was slow answers late; without this it would wait for a console proof that never comes and end the
+   *  session (Codex enforce-step3 r2). A late proof gets the full checks; its outcome is reported here: `verified`,
+   *  or `failed` (which ends the session). Never called after the window passes with nothing. */
+  onLateStatus?(status: BindingStatus): void;
 }
+
+/** How long a warn session keeps listening for a late agent proof after settling "unverified". The enforcing agent
+ *  gives up BINDING_DEADLINE (10 s) after its loop starts, so anything later cannot help. */
+export const LATE_PROOF_WINDOW_MS = 30_000;
 
 /** Control messages that may go out BEFORE the peer is verified: the binding exchange itself and session
  *  setup that carries nothing the technician typed or chose to send (docs/69). Everything else waits. */
@@ -250,10 +263,39 @@ async function runConsoleBindingSteps(d: ConsoleBindingDeps): Promise<BindingSta
   let sessionId: Uint8Array;
   try { sessionId = uuidBytes(d.sessionId); } catch { return unbound("the session id is not a uuid"); }
 
+  // Narrowed once here: the late path below runs in a closure, where property narrowing does not survive.
+  const ready = { ...d, binding: { ...d.binding, device_pubkey: d.binding.device_pubkey }, key: d.key };
   const consoleNonce = d.randomBytes(32);
   d.sendStart(d.binding.grant, bytesToHex(consoleNonce));
-  const reply = await d.awaitAgentProof(BIND_REPLY_TIMEOUT_MS);
-  if (!reply) return unbound("the agent did not answer (it may need an update)");
+  const reply = await d.awaitAgentProof(d.proofTimeoutMs ?? BIND_REPLY_TIMEOUT_MS);
+  if (!reply) {
+    const late = d.onLateStatus;
+    if (mode !== "require" && late) {
+      // Settle now; finish the exchange if the proof turns up. The same nonce, key and connection: nothing is re-sent.
+      void (async () => {
+        let status: BindingStatus | null;
+        try {
+          const lateReply = await d.awaitAgentProof(LATE_PROOF_WINDOW_MS);
+          status = lateReply ? await finishExchange(ready, sessionId, consoleNonce, lateReply) : null;
+        } catch {
+          status = { state: "failed", reason: "unsupported_browser" };
+        }
+        if (status) late(status);
+      })();
+    }
+    return unbound("the agent did not answer (it may need an update)");
+  }
+  return finishExchange(ready, sessionId, consoleNonce, reply);
+}
+
+/** Everything after the agent's reply: its proof is checked against the live fingerprints, ours is sent, and the
+ *  agent's verdict decides. Shared by the on-time and the late path. */
+async function finishExchange(
+  d: ConsoleBindingDeps & { binding: DeviceBinding & { device_pubkey: string }; key: ConsoleKey },
+  sessionId: Uint8Array,
+  consoleNonce: Uint8Array,
+  reply: { agentNonceHex: string; sigHex: string } | { refused: string | null },
+): Promise<BindingStatus> {
   // An explicit refusal is a verification FAILURE in every mode, not the silence of an older agent.
   if ("refused" in reply) return { state: "failed", reason: "agent_refused" };
   const proof = reply;

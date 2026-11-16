@@ -225,3 +225,22 @@ func TestSessionBindingIsOffByDefault(t *testing.T) {
 		t.Fatalf("binding is off but the response carries device_binding: %+v", resp)
 	}
 }
+
+// docs/69 §3.9: the switch is on unless the operator writes exactly "off"; a typo must not disable it.
+func TestSessionBindingSwitchDefaultsOn(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"", true}, {"on", true}, {" ON ", true}, {"yes", true}, {"of", true}, {"0", true},
+		{"off", false}, {"OFF", false}, {"  Off\t", false},
+	} {
+		got, msg := SessionBindingSwitch(tc.raw)
+		if got != tc.want {
+			t.Errorf("SessionBindingSwitch(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+		if msg == "" {
+			t.Errorf("SessionBindingSwitch(%q): empty log line", tc.raw)
+		}
+	}
+}

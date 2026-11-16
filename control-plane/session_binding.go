@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -51,6 +52,22 @@ func refuseMalformedConsoleKey(w http.ResponseWriter, h string) bool {
 		return true
 	}
 	return false
+}
+
+// SessionBindingSwitch reads CP_SESSION_BINDING (docs/69 §3.9): binding is ON unless the value is exactly
+// "off" (any case, surrounding space ignored). An unset or unrecognised value is on: the step-3 enforcing
+// agent ends every session that brings no grant, so the safe reading of a typo is "on". The second result
+// is a one-line description for the startup log.
+func SessionBindingSwitch(raw string) (bool, string) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "off":
+		return false, "session binding OFF (CP_SESSION_BINDING=off): sessions carry no device_binding; enforcing agents will end every session"
+	case "", "on":
+		return true, "session binding on (docs/69)"
+	default:
+		return true, "session binding on: CP_SESSION_BINDING value not recognised (only \"off\" disables it)"
+	}
 }
 
 // sessionBindingMode is the tenant's binding policy: Server.BindingMode when wired, else warn (docs/69
