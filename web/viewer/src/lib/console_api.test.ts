@@ -2252,7 +2252,15 @@ describe("ConsoleApiClient session policy (docs/01 §5 seat metering)", () => {
     const p = await client.getSessionPolicy();
     expect(calls[0].url).toBe("/cp/tenant/session-policy");
     expect(calls[0].init?.method).toBe("GET");
-    expect(p).toEqual({ max_concurrent_sessions: 5, max_session_seconds: 3600 });
+    // An older server sends no session_binding: that is warn (docs/69 step 4).
+    expect(p).toEqual({ max_concurrent_sessions: 5, max_session_seconds: 3600, session_binding: "warn" });
+  });
+
+  it("getSessionPolicy parses session_binding require, and refuses an unknown mode", async () => {
+    const ok = fakeFetch(() => jsonResponse({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "require" }));
+    expect((await new ConsoleApiClient({ baseUrl: "/cp", fetch: ok.fn }).getSessionPolicy()).session_binding).toBe("require");
+    const bad = fakeFetch(() => jsonResponse({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "maybe" }));
+    await expect(new ConsoleApiClient({ baseUrl: "/cp", fetch: bad.fn }).getSessionPolicy()).rejects.toMatchObject({ kind: "server" });
   });
 
   const badSessionPolicyBodies: Array<[string, unknown]> = [
@@ -2286,7 +2294,7 @@ describe("ConsoleApiClient session policy (docs/01 §5 seat metering)", () => {
   it("getSessionPolicy accepts an explicit zero (unlimited) as a real value", async () => {
     const { fn } = fakeFetch(() => jsonResponse({ max_concurrent_sessions: 0, max_session_seconds: 0 }));
     const client = new ConsoleApiClient({ baseUrl: "/cp", fetch: fn });
-    expect(await client.getSessionPolicy()).toEqual({ max_concurrent_sessions: 0, max_session_seconds: 0 });
+    expect(await client.getSessionPolicy()).toEqual({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "warn" });
   });
 
   it("setSessionPolicy PUTs both fields and returns the echoed value", async () => {
@@ -2296,7 +2304,14 @@ describe("ConsoleApiClient session policy (docs/01 §5 seat metering)", () => {
     expect(calls[0].url).toBe("/cp/tenant/session-policy");
     expect(calls[0].init?.method).toBe("PUT");
     expect(JSON.parse(calls[0].init?.body as string)).toEqual({ max_concurrent_sessions: 3, max_session_seconds: 7200 });
-    expect(out).toEqual({ max_concurrent_sessions: 3, max_session_seconds: 7200 });
+    expect(out).toEqual({ max_concurrent_sessions: 3, max_session_seconds: 7200, session_binding: "warn" });
+  });
+
+  it("setSessionPolicy sends session_binding only when given (omitted, the server keeps the stored mode)", async () => {
+    const { fn, calls } = fakeFetch(() => jsonResponse({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "require" }));
+    const client = new ConsoleApiClient({ baseUrl: "/cp", fetch: fn });
+    await client.setSessionPolicy({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "require" });
+    expect(JSON.parse(calls[0].init?.body as string)).toEqual({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "require" });
   });
 });
 

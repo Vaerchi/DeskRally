@@ -1152,3 +1152,32 @@ func TestTransferFinalizeIsAtomicUnderAuditFailure(t *testing.T) {
 		})
 	}
 }
+
+// docs/69 step 4 (Codex bindmode r1): under require, a machine with no enrolled device key cannot be verified, so a
+// transfer to it is refused at ACCEPT, before S2 exists: no S2 is left open holding a seat.
+func TestTransferAcceptRefusedUnderRequireWithoutADeviceKey(t *testing.T) {
+	h := newMemTransferHarness(t)
+	ctx := context.Background()
+	s1 := h.startVouched(h.alice)
+	id := h.mustOffer(h.alice, s1, h.bob)
+	bob := h.srv(h.bob)
+	bob.BindingEnabled = true
+	if err := bob.SessionPolicies.Set(ctx, h.tenant, SessionPolicy{SessionBinding: "require"}); err != nil {
+		t.Fatal(err)
+	}
+	mem := h.machines.(*InMemoryMachineStore)
+	mem.mu.Lock()
+	for _, m := range mem.machines {
+		m.Pubkey = ""
+	}
+	mem.mu.Unlock()
+
+	code, out := h.accept(h.bob, id)
+	wantCode(t, "accept under require with no device key", code, http.StatusConflict, out)
+	if got := h.transfer(id).State; got != TransferPending {
+		t.Fatalf("a refused accept moved the offer to %s", got)
+	}
+	if n := len(h.openSessions()); n != 1 {
+		t.Fatalf("open sessions = %d, want 1 (S1 only: no S2 was admitted)", n)
+	}
+}

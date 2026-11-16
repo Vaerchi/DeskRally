@@ -135,6 +135,13 @@ func (s *Server) transferAdmissionFor(ctx context.Context, tenantID string, t *S
 	if !transferAgentSupported(m.AgentVersion) {
 		return nil, &sessionRefusal{Status: http.StatusUnprocessableEntity, Msg: transferAgentTooOld}
 	}
+	// docs/69 step 4 (Codex bindmode r1): the one PERMANENT binding refusal is decided here, before S2 is admitted,
+	// so it can never leave S2 open holding a seat. The ticket fetch's other refusals (an old console without a key,
+	// a failed grant) are retryable on the same S2, like the admission refusals there.
+	if s.BindingEnabled && s.sessionBindingMode(ctx, tenantID) == SessionBindingRequire && normalisedDeviceKey(m.Pubkey) == "" {
+		return nil, &sessionRefusal{Status: http.StatusConflict,
+			Msg: "this machine has no enrolled device key, so the session cannot be verified; re-enrol the agent"}
+	}
 	adm.Rec.TransferredFrom = t.SessionID
 	return &TransferAdmission{
 		Rec: adm.Rec, Limits: adm.Limits,
@@ -620,7 +627,7 @@ func (s *Server) handleTransferTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	resp, refusal := s.brokerSessionStart(held.Rec, held.Machine, p.UserID, p.TenantID, groupPolicy, keyBody.ConsolePubkey)
+	resp, refusal := s.brokerSessionStart(r.Context(), held.Rec, held.Machine, p.UserID, p.TenantID, groupPolicy, keyBody.ConsolePubkey)
 	if refusal != nil {
 		refusal.write(w)
 		return

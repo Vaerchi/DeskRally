@@ -21,6 +21,11 @@ type SessionPolicy struct {
 	// MaxSessionSeconds caps how long a session may stay OPEN before it is reaped (docs/01 §5). 0 = no
 	// maximum. Seconds, matching the agent's own max_session_secs.
 	MaxSessionSeconds int `json:"max_session_seconds"`
+	// SessionBinding is the tenant's docs/69 policy for sessions that cannot be verified: "warn" or "require"
+	// (migrations/0083). On a READ an empty value means no row (warn). On a WRITE an empty value means "keep what is
+	// stored" (warn for a new row), applied atomically inside the store's upsert, so a PUT that omits it (an older
+	// console's limits form) can never downgrade require to warn, even racing a concurrent change.
+	SessionBinding string `json:"session_binding,omitempty"`
 }
 
 // MaxSessionLimit is the ceiling the console/API will accept for MaxConcurrentSessions. It is a sanity
@@ -50,6 +55,13 @@ func NormalizeSessionPolicy(p SessionPolicy) (SessionPolicy, bool) {
 		ok = false
 	case p.MaxConcurrentSessions > MaxSessionLimit:
 		out.MaxConcurrentSessions = MaxSessionLimit
+		ok = false
+	}
+	// session_binding: empty is warn; anything other than the two modes is refused.
+	switch p.SessionBinding {
+	case "", string(SessionBindingWarn), string(SessionBindingRequire): // "" = keep the stored mode
+	default:
+		out.SessionBinding = string(SessionBindingWarn)
 		ok = false
 	}
 	// max_session_seconds: 0 = no maximum; otherwise a sane, not-too-short duration.
@@ -113,6 +125,9 @@ func (s *InMemoryTenantSessionPolicyStore) Get(_ context.Context, tenantID strin
 func (s *InMemoryTenantSessionPolicyStore) Set(_ context.Context, tenantID string, p SessionPolicy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if p.SessionBinding == "" { // keep the stored mode (warn for a new entry), as the pg upsert does
+		p.SessionBinding = bindingOrWarn(s.policies[tenantID].SessionBinding)
+	}
 	s.policies[tenantID] = p
 	return nil
 }

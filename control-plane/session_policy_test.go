@@ -498,8 +498,9 @@ func TestHandleStartSessionGroupReaperDoesNotCrossGroups(t *testing.T) {
 // Pass4 gate refuses sessions in groups with max_session_duration_seconds > 0.
 //
 // Mutation guards:
-//   M1: group reap ignores session age → group-expired session not reaped.
-//   M2: tenant reap ignores session age → tenant-expired session not reaped.
+//
+//	M1: group reap ignores session age → group-expired session not reaped.
+//	M2: tenant reap ignores session age → tenant-expired session not reaped.
 func TestReaperUsesLesserDuration(t *testing.T) {
 	ctx := context.Background()
 	const oneHour, threeHours = time.Hour, 3 * time.Hour
@@ -612,5 +613,22 @@ func TestHandleSessionPolicy(t *testing.T) {
 	techSrv, _ := newTestServer(tech)
 	if rec := do(techSrv.Handler(), "PUT", `{"max_concurrent_sessions":9}`); rec.Code != http.StatusForbidden {
 		t.Fatalf("technician PUT = %d, want 403", rec.Code)
+	}
+}
+
+// docs/69 step 4: session_binding is warn (also for empty) or require; anything else is refused.
+func TestNormalizeSessionPolicyBindingMode(t *testing.T) {
+	for _, tc := range []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"", "", true} /* "" = keep the stored mode */, {"warn", "warn", true}, {"require", "require", true},
+		{"REQUIRE", "warn", false}, {"off", "warn", false},
+	} {
+		got, ok := NormalizeSessionPolicy(SessionPolicy{SessionBinding: tc.in})
+		if ok != tc.wantOK || got.SessionBinding != tc.want {
+			t.Fatalf("Normalize(binding=%q) = (%q, %v), want (%q, %v)", tc.in, got.SessionBinding, ok, tc.want, tc.wantOK)
+		}
 	}
 }

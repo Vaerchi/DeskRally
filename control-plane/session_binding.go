@@ -10,6 +10,7 @@ package controlplane
 // (2026-11-15) that every tenant starts at warn.
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"net/http"
@@ -70,14 +71,41 @@ func SessionBindingSwitch(raw string) (bool, string) {
 	}
 }
 
-// sessionBindingMode is the tenant's binding policy: Server.BindingMode when wired, else warn (docs/69
-// §8: every tenant starts at warn; require once the fleet runs the enforcing agent). Any value other than
-// the two known modes is treated as require (§3.6: an unreadable setting fails closed).
-func (s *Server) sessionBindingMode(tenantID string) SessionBindingMode {
-	if s.BindingMode == nil {
+// nullIfEmpty passes an empty mode to SQL as NULL ("keep the stored value").
+func nullIfEmpty(m string) *string {
+	if m == "" {
+		return nil
+	}
+	return &m
+}
+
+// bindingOrWarn is the stored form of a mode: empty (no row, or a body that did not say) is warn.
+func bindingOrWarn(m string) string {
+	if m == "" {
+		return string(SessionBindingWarn)
+	}
+	return m
+}
+
+// sessionBindingMode is the tenant's binding policy (docs/69 §8: every tenant starts at warn; the operator
+// sets require once the fleet runs the enforcing agent). Source: Server.BindingMode when wired (tests), else the
+// tenant's session policy (migrations/0083), else warn when no policy store exists at all. A setting that
+// cannot be read, or any value other than the two known modes, is require (§3.6: fail closed).
+func (s *Server) sessionBindingMode(ctx context.Context, tenantID string) SessionBindingMode {
+	var m SessionBindingMode
+	switch {
+	case s.BindingMode != nil:
+		m = s.BindingMode(tenantID)
+	case s.SessionPolicies != nil:
+		pol, err := s.SessionPolicies.Get(ctx, tenantID)
+		if err != nil {
+			return SessionBindingRequire
+		}
+		m = SessionBindingMode(bindingOrWarn(pol.SessionBinding))
+	default:
 		return SessionBindingWarn
 	}
-	switch m := s.BindingMode(tenantID); m {
+	switch m {
 	case SessionBindingWarn, SessionBindingRequire:
 		return m
 	default:
@@ -175,12 +203,12 @@ func (s *Server) handleSessionBindingFailed(w http.ResponseWriter, r *http.Reque
 // verified.
 // sessionID is the control-plane session id the ticket carries; deviceID the agent's device id;
 // storedDeviceKey the key the control plane holds for that device.
-func (s *Server) attachDeviceBinding(resp map[string]any, sessionID, deviceID, storedDeviceKey, userID, tenantID string,
+func (s *Server) attachDeviceBinding(ctx context.Context, resp map[string]any, sessionID, deviceID, storedDeviceKey, userID, tenantID string,
 	access SessionAccessLevel, consolePubkey string, nowMs int64) *sessionRefusal {
 	if !s.BindingEnabled {
 		return nil // not rolled out yet: no device_binding at all, and the console shows no mark
 	}
-	mode := s.sessionBindingMode(tenantID)
+	mode := s.sessionBindingMode(ctx, tenantID)
 	binding := map[string]any{"mode": string(mode)}
 	resp["device_binding"] = binding
 	if consolePubkey == "" {

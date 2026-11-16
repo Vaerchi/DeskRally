@@ -24,6 +24,7 @@ func applyTenantSessionPolicyMigration(t *testing.T, pool *pgxpool.Pool) {
 	for _, f := range []string{
 		"migrations/0029_tenant_session_policy.sql",
 		"migrations/0030_tenant_session_max_age.sql", // ALTER: adds max_session_seconds
+		"migrations/0083_tenant_session_binding.sql", // ALTER: adds session_binding (docs/69 step 4)
 	} {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -182,5 +183,46 @@ func TestPgReapExpiredSessions(t *testing.T) {
 	// Idempotent: nothing left to reap.
 	if n2, _ := store.ReapExpiredSessions(ctx, tid, time.Hour); n2 != 0 {
 		t.Fatalf("second reap = %d, want 0", n2)
+	}
+}
+
+// docs/69 step 4: the binding mode round-trips, an unset tenant reads as warn, and the CHECK refuses anything else.
+func TestPgTenantSessionBindingMode(t *testing.T) {
+	suPool := newTestPool(t)
+	applyAppRoleMigration(t, suPool)
+	applyTenantSessionPolicyMigration(t, suPool)
+	ctx := context.Background()
+	tidA, _ := provisionUser(t, suPool, "sb-a", "a@sb-a.test", "password-1234")
+	tidB, _ := provisionUser(t, suPool, "sb-b", "b@sb-b.test", "password-1234")
+	store := NewPgTenantSessionPolicyStore(newAppRolePool(t, ctx))
+
+	if p, err := store.Get(ctx, tidA); err != nil || p.SessionBinding != "" {
+		t.Fatalf("unset A = (%+v, %v), want no binding value (reads as warn)", p, err)
+	}
+	if err := store.Set(ctx, tidA, SessionPolicy{SessionBinding: "require"}); err != nil {
+		t.Fatalf("Set require: %v", err)
+	}
+	if p, _ := store.Get(ctx, tidA); p.SessionBinding != "require" {
+		t.Fatalf("A = %+v, want require", p)
+	}
+	// An empty mode is stored as warn (bindingOrWarn), never as an empty string the CHECK would refuse.
+	if err := store.Set(ctx, tidB, SessionPolicy{MaxConcurrentSessions: 0}); err != nil {
+		t.Fatalf("Set B with no mode: %v", err)
+	}
+	if p, _ := store.Get(ctx, tidB); p.SessionBinding != "warn" {
+		t.Fatalf("B = %+v, want warn", p)
+	}
+	if p, _ := store.Get(ctx, tidA); p.SessionBinding != "require" {
+		t.Fatalf("A after B's write = %+v, want require (isolation)", p)
+	}
+	// An omitted mode KEEPS the stored one, atomically in the upsert (Codex bindmode r1).
+	if err := store.Set(ctx, tidA, SessionPolicy{MaxConcurrentSessions: 3, MaxSessionSeconds: 600}); err != nil {
+		t.Fatalf("Set A limits only: %v", err)
+	}
+	if p, _ := store.Get(ctx, tidA); p.SessionBinding != "require" || p.MaxConcurrentSessions != 3 {
+		t.Fatalf("A after a limits-only write = %+v, want require kept and limit 3", p)
+	}
+	if err := store.Set(ctx, tidA, SessionPolicy{SessionBinding: "maybe"}); err == nil {
+		t.Fatal("an unknown mode must be refused by the column CHECK")
 	}
 }

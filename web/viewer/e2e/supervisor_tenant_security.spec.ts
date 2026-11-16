@@ -101,3 +101,33 @@ test("when every read succeeds the controls are enabled and show the server valu
   await expect(page.getByTestId("session-limit-save")).toBeEnabled();
   await expect(page.getByTestId("session-limit-current")).toContainText("5");
 });
+
+// docs/69 step 4: turning on "Require verified sessions" PUTs require WITH the saved limits (the PUT replaces the
+// whole policy), and a failed read leaves the toggle disabled.
+test("the session verification toggle saves require and keeps the saved limits", async ({ page }) => {
+  await mount(page, { security: "ok", session: "ok" });
+  // Registered AFTER mount: Playwright tries the newest route first, so this one sees the PUT before mount's catch-all.
+  let putBody: unknown = null;
+  await page.route("**/cp/tenant/session-policy", async (route) => {
+    if (route.request().method() === "PUT") {
+      putBody = route.request().postDataJSON();
+      await route.fulfill({ json: { ...(putBody as object) } });
+    } else {
+      await route.fallback();
+    }
+  });
+  const box = page.getByTestId("require-session-binding-checkbox");
+  await expect(box).toBeEnabled();
+  await expect(box).not.toBeChecked();
+  // A controlled checkbox: it reflects the SERVER's echo, so click and then wait for the saved state.
+  const put = page.waitForRequest((r) => r.url().endsWith("/cp/tenant/session-policy") && r.method() === "PUT", { timeout: 5_000 });
+  await box.click();
+  await put;
+  await expect(box).toBeChecked();
+  expect(putBody).toEqual({ max_concurrent_sessions: 5, max_session_seconds: 3600, session_binding: "require" });
+});
+
+test("a failed session policy read disables the session verification toggle", async ({ page }) => {
+  await mount(page, { security: "ok", session: "fail" });
+  await expect(page.getByTestId("require-session-binding-checkbox")).toBeDisabled();
+});

@@ -42,6 +42,9 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
   const [savingLimit, setSavingLimit] = useState(false);
   const [limitError, setLimitError] = useState<string | null>(null);
   // Tri-state: null = not yet read (or the read failed); only a successful read/save makes it a boolean.
+  // docs/69 step 4: the tenant's session verification policy (null until loaded).
+  const [sessionBinding, setSessionBinding] = useState<"warn" | "require" | null>(null);
+  const [savingBinding, setSavingBinding] = useState(false);
   const [require2fa, setRequire2fa] = useState<boolean | null>(null);
   const [saving2fa, setSaving2fa] = useState(false);
   const [error2fa, setError2fa] = useState<string | null>(null);
@@ -89,6 +92,7 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
           setLimitInput(String(policy.max_concurrent_sessions));
           setSavedMaxAge(policy.max_session_seconds);
           setMaxAgeInput(String(policy.max_session_seconds));
+          setSessionBinding(policy.session_binding ?? "warn");
         }
       } catch (e) {
         if (policyWins.current.isCurrent(policyToken)) setLimitError(e instanceof Error ? e.message : String(e));
@@ -155,6 +159,7 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
         setLimitInput(String(saved.max_concurrent_sessions));
         setSavedMaxAge(saved.max_session_seconds);
         setMaxAgeInput(String(saved.max_session_seconds));
+        setSessionBinding(saved.session_binding ?? "warn");
       } catch (err) {
         setLimitError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -162,6 +167,34 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
       }
     },
     [api, limitInput, maxAgeInput],
+  );
+
+  // Sends the SAVED limits with the mode: the PUT replaces the whole policy, so the toggle must not reset them.
+  const handleToggleBinding = useCallback(
+    async (require: boolean) => {
+      if (savedLimit === null || savedMaxAge === null) return;
+      setSavingBinding(true);
+      setLimitError(null);
+      policyWins.current.invalidate();
+      try {
+        const saved = await api.setSessionPolicy({
+          max_concurrent_sessions: savedLimit,
+          max_session_seconds: savedMaxAge,
+          session_binding: require ? "require" : "warn",
+        });
+        policyWins.current.begin();
+        setSavedLimit(saved.max_concurrent_sessions);
+        setLimitInput(String(saved.max_concurrent_sessions));
+        setSavedMaxAge(saved.max_session_seconds);
+        setMaxAgeInput(String(saved.max_session_seconds));
+        setSessionBinding(saved.session_binding ?? "warn");
+      } catch (err) {
+        setLimitError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSavingBinding(false);
+      }
+    },
+    [api, savedLimit, savedMaxAge],
   );
 
   const handleToggle2fa = useCallback(
@@ -202,7 +235,8 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
   );
 
   const twoFactor = twoFactorControlState(require2fa, busy, saving2fa);
-  const limitControlsDisabled = sessionLimitControlsDisabled(savedLimit, savedMaxAge, savingLimit);
+  // Both forms PUT the whole policy, so neither may start while the other is saving (Codex bindmode r1).
+  const limitControlsDisabled = sessionLimitControlsDisabled(savedLimit, savedMaxAge, savingLimit) || savingBinding;
 
   return (
     <section className="panel panel--security" data-testid="tenant-security">
@@ -254,6 +288,25 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
           </span>
         )}
       </form>
+
+      <div className="panel__form" data-testid="session-binding-section">
+        <span className="panel__toolbar-title">Session verification</span>
+        <label className="panel__toolbar-field panel__toolbar-field--inline">
+          <input
+            type="checkbox"
+            checked={sessionBinding === "require"}
+            disabled={sessionBinding === null || busy || savingBinding || limitControlsDisabled}
+            onChange={(e) => void handleToggleBinding(e.target.checked)}
+            data-testid="require-session-binding-checkbox"
+          />
+          Require verified sessions
+        </label>
+        <span className="panel__toolbar-note">
+          {sessionBinding === "require"
+            ? "A session whose machine cannot prove it is the enrolled machine is refused."
+            : "Sessions that cannot be verified still connect, marked \u201cNot verified\u201d. Turn this on once every machine runs agent 1.3.31 or later."}
+        </span>
+      </div>
 
       <div className="panel__form" data-testid="2fa-policy-section">
         <span className="panel__toolbar-title">Two-factor authentication</span>

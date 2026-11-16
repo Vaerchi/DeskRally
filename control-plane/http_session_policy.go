@@ -22,6 +22,7 @@ func (s *Server) handleGetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "could not read session policy")
 		return
 	}
+	pol.SessionBinding = bindingOrWarn(pol.SessionBinding)
 	writeJSON(w, http.StatusOK, pol)
 }
 
@@ -45,11 +46,14 @@ func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "a concurrency limit requires max_session_seconds so abandoned sessions expire")
 		return
 	}
+	// docs/69 step 4: a body without session_binding (an older console's form) keeps the stored mode. The store
+	// applies that atomically in its upsert (Codex bindmode r1: a read here then a write raced a concurrent change).
 	norm, ok := NormalizeSessionPolicy(req)
 	if !ok {
 		writeError(w, http.StatusBadRequest,
 			"invalid session policy: max_concurrent_sessions must be 0 (unlimited) to 100000, and "+
-				"max_session_seconds must be 0 (no maximum) or between 60 and 2592000")
+				"max_session_seconds must be 0 (no maximum) or between 60 and 2592000, and session_binding must be "+
+				"\"warn\" or \"require\"")
 		return
 	}
 	if err := s.SessionPolicies.Set(r.Context(), p.TenantID, norm); err != nil {
@@ -57,10 +61,17 @@ func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.recordMgmtAudit(r, "tenant.session_policy.set", "tenant", p.TenantID,
-		map[string]any{"max_concurrent_sessions": norm.MaxConcurrentSessions, "max_session_seconds": norm.MaxSessionSeconds}); err != nil {
+		map[string]any{"max_concurrent_sessions": norm.MaxConcurrentSessions, "max_session_seconds": norm.MaxSessionSeconds,
+			"session_binding": norm.SessionBinding /* "" = kept */}); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not record audit event")
 		return
 	}
-	// Echo the normalized value the server stored, so the console adopts exactly that.
-	writeJSON(w, http.StatusOK, norm)
+	// Echo what is stored, so the console adopts exactly that (the mode may have been kept, not sent).
+	stored, err := s.SessionPolicies.Get(r.Context(), p.TenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read session policy")
+		return
+	}
+	stored.SessionBinding = bindingOrWarn(stored.SessionBinding)
+	writeJSON(w, http.StatusOK, stored)
 }

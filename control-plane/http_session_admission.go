@@ -172,7 +172,7 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 //
 // consolePubkey is the console's ephemeral session key (docs/69), "" when the console sent none; the
 // caller has already refused a malformed one (refuseMalformedConsoleKey).
-func (s *Server) brokerSessionStart(rec *SessionRecord, m *Machine, userID, tenantID string, groupPolicy GroupSessionPolicy, consolePubkey string) (map[string]any, *sessionRefusal) {
+func (s *Server) brokerSessionStart(ctx context.Context, rec *SessionRecord, m *Machine, userID, tenantID string, groupPolicy GroupSessionPolicy, consolePubkey string) (map[string]any, *sessionRefusal) {
 	// M2 (ADR-002): broker the rendezvous. When the issuer is wired, hand back the signaling
 	// coordinates plus a short-TTL signed session ticket the signaling server verifies before
 	// brokering connect_request → this device (server/signaling/ticket.go).
@@ -202,7 +202,7 @@ func (s *Server) brokerSessionStart(rec *SessionRecord, m *Machine, userID, tena
 		if rec.Access == "view_only" || groupPolicy.EnforceViewOnly {
 			bindAccess = SessionAccessViewOnly
 		}
-		if refusal := s.attachDeviceBinding(resp, rec.ID, m.DeviceID, m.Pubkey, userID, tenantID, bindAccess, consolePubkey, now); refusal != nil {
+		if refusal := s.attachDeviceBinding(ctx, resp, rec.ID, m.DeviceID, m.Pubkey, userID, tenantID, bindAccess, consolePubkey, now); refusal != nil {
 			return nil, refusal
 		}
 		// The SIGNED SESSION POLICY (docs/01 §3/§5, loops 79/80): what the ORGANISATION says this session

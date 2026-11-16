@@ -219,6 +219,9 @@ export interface TenantBranding {
 export interface SessionPolicy {
   max_concurrent_sessions: number;
   max_session_seconds: number;
+  /** docs/69: "warn" (default) lets an unverifiable session continue, marked; "require" refuses it. Omitted on a
+   *  PUT, the server keeps the stored mode, so the limits form never touches it. */
+  session_binding?: "warn" | "require";
 }
 
 export interface TenantSecurityPolicy {
@@ -302,9 +305,15 @@ function sessionPolicyFrom(body: unknown, action: string): SessionPolicy {
   if (!obj || !isNonNegNum(obj.max_concurrent_sessions) || !isNonNegNum(obj.max_session_seconds)) {
     throw new ConsoleApiError(200, `could not ${action}: malformed response (bad session policy)`, "server");
   }
+  // An older server has no session_binding at all: that is warn. Anything else unexpected is refused, never guessed.
+  const mode = obj.session_binding;
+  if (mode !== undefined && mode !== "warn" && mode !== "require") {
+    throw new ConsoleApiError(200, `could not ${action}: malformed response (bad session_binding)`, "server");
+  }
   return {
     max_concurrent_sessions: obj.max_concurrent_sessions,
     max_session_seconds: obj.max_session_seconds,
+    session_binding: mode ?? "warn",
   };
 }
 
@@ -2733,6 +2742,8 @@ export class ConsoleApiClient implements ConsoleApi {
       body: {
         max_concurrent_sessions: policy.max_concurrent_sessions,
         max_session_seconds: policy.max_session_seconds,
+        // Sent only when the caller sets it: omitted, the server keeps the stored mode (the limits form never sends it).
+        ...(policy.session_binding ? { session_binding: policy.session_binding } : {}),
       },
     });
     return sessionPolicyFrom(body, "set session policy");

@@ -368,7 +368,7 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 	if policyAccess != "" {
 		bindAccess = SessionAccessLevel(policyAccess)
 	}
-	if refusal := s.attachDeviceBinding(resp, active.ID, active.DeviceID, active.AgentPubkey, p.UserID, p.TenantID,
+	if refusal := s.attachDeviceBinding(r.Context(), resp, active.ID, active.DeviceID, active.AgentPubkey, p.UserID, p.TenantID,
 		bindAccess, keyBody.ConsolePubkey, now); refusal != nil {
 		refusal.write(w)
 		return

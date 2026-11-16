@@ -4,9 +4,11 @@ package controlplane
 // is issued, when it is withheld, and that a malformed console key changes no state.
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -39,7 +41,7 @@ func TestAttachDeviceBindingIssuesAVerifiableGrant(t *testing.T) {
 	srv := &Server{Grants: iss, BindingEnabled: true}
 	deviceKey, _ := bindTestDeviceKey()
 	resp := map[string]any{}
-	if r := srv.attachDeviceBinding(resp, goldenSessionID, bindTestDevice, strings.ToUpper(deviceKey), bindTestUser,
+	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, strings.ToUpper(deviceKey), bindTestUser,
 		bindTestTenant, SessionAccessViewOnly, goldenBindConsolePubHex, 1_000); r != nil {
 		t.Fatalf("refused: %+v", r)
 	}
@@ -79,7 +81,7 @@ func TestAttachDeviceBindingWithholdsInWarnAndRefusesInRequire(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			warn := &Server{Grants: bindTestIssuer(t), BindingEnabled: true}
 			resp := map[string]any{}
-			if r := warn.attachDeviceBinding(resp, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser, tc.tenant,
+			if r := warn.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser, tc.tenant,
 				SessionAccessControl, tc.consoleKey, 1); r != nil {
 				t.Fatalf("warn refused: %+v", r)
 			}
@@ -89,7 +91,7 @@ func TestAttachDeviceBindingWithholdsInWarnAndRefusesInRequire(t *testing.T) {
 			}
 
 			require := &Server{Grants: bindTestIssuer(t), BindingEnabled: true, BindingMode: func(string) SessionBindingMode { return SessionBindingRequire }}
-			if r := require.attachDeviceBinding(map[string]any{}, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser,
+			if r := require.attachDeviceBinding(context.Background(), map[string]any{}, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser,
 				tc.tenant, SessionAccessControl, tc.consoleKey, 1); r == nil {
 				t.Fatal("require mode brokered a session it cannot bind")
 			}
@@ -99,10 +101,10 @@ func TestAttachDeviceBindingWithholdsInWarnAndRefusesInRequire(t *testing.T) {
 
 func TestSessionBindingModeFailsClosedOnAnUnknownValue(t *testing.T) {
 	s := &Server{BindingMode: func(string) SessionBindingMode { return "" }}
-	if got := s.sessionBindingMode(bindTestTenant); got != SessionBindingRequire {
+	if got := s.sessionBindingMode(context.Background(), bindTestTenant); got != SessionBindingRequire {
 		t.Fatalf("unknown mode read as %q, want require", got)
 	}
-	if got := (&Server{}).sessionBindingMode(bindTestTenant); got != SessionBindingWarn {
+	if got := (&Server{}).sessionBindingMode(context.Background(), bindTestTenant); got != SessionBindingWarn {
 		t.Fatalf("unwired mode = %q, want warn (Ed 11-15)", got)
 	}
 }
@@ -217,7 +219,7 @@ func TestSessionBindingIsOffByDefault(t *testing.T) {
 	srv := &Server{Grants: bindTestIssuer(t)}
 	deviceKey, _ := bindTestDeviceKey()
 	resp := map[string]any{}
-	if r := srv.attachDeviceBinding(resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser, bindTestTenant,
+	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser, bindTestTenant,
 		SessionAccessControl, goldenBindConsolePubHex, 1); r != nil {
 		t.Fatalf("refused: %+v", r)
 	}
@@ -242,5 +244,77 @@ func TestSessionBindingSwitchDefaultsOn(t *testing.T) {
 		if msg == "" {
 			t.Errorf("SessionBindingSwitch(%q): empty log line", tc.raw)
 		}
+	}
+}
+
+type failingSessionPolicies struct {
+	InMemoryTenantSessionPolicyStore
+}
+
+func (*failingSessionPolicies) Get(context.Context, string) (SessionPolicy, error) {
+	return SessionPolicy{}, errors.New("database unavailable")
+}
+
+// docs/69 step 4 + 3.6: the mode comes from the tenant's session policy; unset is warn, an unreadable policy is
+// require (fail closed), and a stored require is require.
+func TestSessionBindingModeFromTenantPolicy(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryTenantSessionPolicyStore()
+	s := &Server{SessionPolicies: store}
+	if got := s.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingWarn {
+		t.Fatalf("unset tenant = %q, want warn", got)
+	}
+	_ = store.Set(ctx, bindTestTenant, SessionPolicy{SessionBinding: "require"})
+	if got := s.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("require tenant = %q, want require", got)
+	}
+	_ = store.Set(ctx, bindTestTenant, SessionPolicy{SessionBinding: "garbage"})
+	if got := s.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("unknown stored mode = %q, want require", got)
+	}
+	failing := &Server{SessionPolicies: &failingSessionPolicies{}}
+	if got := failing.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("unreadable policy = %q, want require", got)
+	}
+}
+
+// A PUT that omits session_binding (an older console) keeps the stored mode; only an explicit "warn" lowers it.
+func TestSetSessionPolicyKeepsBindingModeWhenOmitted(t *testing.T) {
+	owner := &Principal{UserID: "u1", TenantID: "tenant-123",
+		Grant: NewGrant("u1", "tenant-123", NewMembership(RoleOwner, AllGroups()))}
+	srv, _ := newTestServer(owner)
+	h := srv.Handler()
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("PUT", "/tenant/session-policy", strings.NewReader(body)))
+		return rec
+	}
+	get := func() SessionPolicy {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/tenant/session-policy", nil))
+		var p SessionPolicy
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		return p
+	}
+	if got := get().SessionBinding; got != "warn" {
+		t.Fatalf("default GET session_binding = %q, want warn", got)
+	}
+	if rec := put(`{"max_concurrent_sessions":0,"max_session_seconds":0,"session_binding":"require"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set require: %d %s", rec.Code, rec.Body)
+	}
+	if rec := put(`{"max_concurrent_sessions":0,"max_session_seconds":3600}`); rec.Code != http.StatusOK {
+		t.Fatalf("old-console PUT: %d %s", rec.Code, rec.Body)
+	}
+	if got := get().SessionBinding; got != "require" {
+		t.Fatalf("after a PUT without session_binding = %q, want require kept", got)
+	}
+	if rec := put(`{"max_concurrent_sessions":0,"max_session_seconds":0,"session_binding":"warn"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set warn: %d %s", rec.Code, rec.Body)
+	}
+	if got := get().SessionBinding; got != "warn" {
+		t.Fatalf("after explicit warn = %q", got)
+	}
+	if rec := put(`{"session_binding":"off"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown mode = %d, want 400", rec.Code)
 	}
 }
