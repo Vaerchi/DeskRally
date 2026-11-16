@@ -554,7 +554,11 @@ describe("attended-session helpers (docs/12 §9)", () => {
       signaling: { url: "ws://x/ws", device_id: "d", session_id: "as-1", ticket: {} },
     };
     const open = { connectAttendedSession: () => Promise.resolve(connected as never) };
-    expect(await connectAttendedFlow(open, "as-1")).toEqual({ ok: true, connected });
+    // docs/69: the flow attaches the console key it connected with (client-side only).
+    expect(await connectAttendedFlow(open, "as-1")).toEqual({
+      ok: true,
+      connected: { ...connected, console_key: expect.objectContaining({ publicHex: expect.stringMatching(/^[0-9a-f]{64}$/) }) },
+    });
 
     const networkError = {
       connectAttendedSession: () => Promise.reject(new TypeError("Network error")),

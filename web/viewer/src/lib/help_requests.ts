@@ -13,6 +13,7 @@
  */
 import type { ConsoleApi, HelpRequest, StartedSession } from "./console_api";
 import type { BrokeredSession } from "./session_broker";
+import { createConsoleKey, type ConsoleKey } from "./session_binding";
 import { pageHidden, watchVisibility } from "./use_polling";
 
 /** How often the open list is re-read (no push channel exists; the audit bell polls at 20 s). */
@@ -122,7 +123,7 @@ export interface AcceptedHelpSession {
  * OWNED, like any ordinary one: renewed, recovered and ended on teardown. Throws when signaling is
  * missing, because a session the console cannot dial must not look connected.
  */
-export function acceptedHelpSession(started: StartedSession): AcceptedHelpSession {
+export function acceptedHelpSession(started: StartedSession, key: ConsoleKey | null = null): AcceptedHelpSession {
   if (!started.signaling) throw new Error("The control plane returned no signaling for the accepted help request.");
   return {
     deviceId: started.signaling.device_id,
@@ -132,6 +133,8 @@ export function acceptedHelpSession(started: StartedSession): AcceptedHelpSessio
       signaling: started.signaling,
       ...(started.session_policy ? { sessionPolicy: started.session_policy } : {}),
       owned: true,
+      // docs/69: the key this accept was made with, and what the control plane bound to it.
+      binding: { key, device: started.device_binding },
     },
   };
 }
@@ -337,9 +340,12 @@ export class HelpAcceptController {
     const prior = pending;
     this.set({ accepting: { id: request.id, status: prior ? "Retrying…" : "Accepting…" }, error: null, unresolved: prior });
     try {
-      const started = await this.api.acceptHelpRequest(request.id, opId);
+      const key = await createConsoleKey();
+      // A reset (sign-out, tenant switch) while the key was being made: do not start anything.
       if (gen !== this.generation) return null;
-      const session = acceptedHelpSession(started);
+      const started = await this.api.acceptHelpRequest(request.id, opId, key?.publicHex);
+      if (gen !== this.generation) return null;
+      const session = acceptedHelpSession(started, key);
       this.set(IDLE);
       return session;
     } catch (failure) {

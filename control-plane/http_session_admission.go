@@ -169,7 +169,10 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 // short-TTL signed ticket, and the signed session policy when the group, the machine or the observer
 // mode needs one. It returns the POST /sessions response body. The caller holds the issuance guard
 // (holdIssuance) and ends rec on a refusal.
-func (s *Server) brokerSessionStart(rec *SessionRecord, m *Machine, userID, tenantID string, groupPolicy GroupSessionPolicy) (map[string]any, *sessionRefusal) {
+//
+// consolePubkey is the console's ephemeral session key (docs/69), "" when the console sent none; the
+// caller has already refused a malformed one (refuseMalformedConsoleKey).
+func (s *Server) brokerSessionStart(rec *SessionRecord, m *Machine, userID, tenantID string, groupPolicy GroupSessionPolicy, consolePubkey string) (map[string]any, *sessionRefusal) {
 	// M2 (ADR-002): broker the rendezvous. When the issuer is wired, hand back the signaling
 	// coordinates plus a short-TTL signed session ticket the signaling server verifies before
 	// brokering connect_request → this device (server/signaling/ticket.go).
@@ -191,6 +194,16 @@ func (s *Server) brokerSessionStart(rec *SessionRecord, m *Machine, userID, tena
 			"device_id":  m.DeviceID,
 			"session_id": rec.ID,
 			"ticket":     ticket,
+		}
+		// docs/69: the trust material that lets the console and the agent bind this session to their
+		// keys. For EVERY brokered session, so before the policy's early return below; the grant's level
+		// is the one the policy below would carry.
+		bindAccess := SessionAccessControl
+		if rec.Access == "view_only" || groupPolicy.EnforceViewOnly {
+			bindAccess = SessionAccessViewOnly
+		}
+		if refusal := s.attachDeviceBinding(resp, rec.ID, m.DeviceID, m.Pubkey, userID, tenantID, bindAccess, consolePubkey, now); refusal != nil {
+			return nil, refusal
 		}
 		// The SIGNED SESSION POLICY (docs/01 §3/§5, loops 79/80): what the ORGANISATION says this session
 		// may do, as opposed to what the technician asks for. The viewer installs it over the Control

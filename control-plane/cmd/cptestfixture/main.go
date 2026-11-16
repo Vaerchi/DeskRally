@@ -162,6 +162,7 @@ func main() {
 	srv := cp.NewServer(sessionAuth, cp.NoopBinder{})
 	srv.AuthAPI = authSvc
 	srv.Grants = issuer
+	srv.BindingEnabled = true // docs/69: the live e2e exercises session binding
 	machines := cp.NewInMemoryMachineStore()
 	srv.Machines = machines
 	srv.MachineProperties = cp.NewInMemoryMachinePropertyStore()

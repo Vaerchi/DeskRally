@@ -120,6 +120,7 @@ import { NO_OWNERS, acquire, clickAllowed, release as releaseOwner, releaseAll, 
 import { PAD_SEND_INTERVAL_MS, createPadSender } from "../lib/pad_sender";
 import { NO_PRESS, clickArrived, pressAbandoned, pressBegan, pressEnded, type PressActivation } from "../lib/press_activation";
 import { TypeClipboard } from "./TypeClipboard";
+import type { BindingStatus } from "../lib/session_binding";
 import { FileManagerPanel, type BrowseUploadRow } from "./FileManagerPanel";
 import {
   monitorCrop,
@@ -388,6 +389,11 @@ export interface ViewerProps {
   /** Current connection state, for the status bar. */
   connectionState?: ConnectionState;
   recoveryNotice?: RecoveryNotice | null;
+  /** docs/69: hold ALL input (pointer, keyboard, toolbars) while the session is being verified, or
+   *  after verification failed. */
+  inputHeld?: boolean;
+  /** docs/69: this connection's binding state, shown in the status bar. */
+  bindingStatus?: BindingStatus | null;
   onReconnect?: () => void;
   /** Monitors advertised by the agent (Control channel). Empty ⇒ single-display fallback. */
   /** Whether the agent is actually sending an audio track — gates the speaker control. */
@@ -721,6 +727,8 @@ export function Viewer({
   stream,
   connectionState = "idle",
   recoveryNotice,
+  inputHeld = false,
+  bindingStatus = null,
   onReconnect,
   audioAvailable = false,
   monitors = [],
@@ -970,9 +978,10 @@ export function Viewer({
   // review caught keyboard leaking through in pan mode while the banner claimed input was off.
   // `inputActive` gates keyboard + the special-key/OSK toolbars (keys carry no coordinates, so they
   // are correct at any *zoom* — a merely-zoomed, not-panning view still sends them).
-  const inputActive = captureInput && !panning && !recoveryNotice;
+  // docs/69: nothing reaches a machine that has not yet been verified as the machine (`inputHeld`).
+  const inputActive = captureInput && !panning && !recoveryNotice && !inputHeld;
   // A pointer event actuates the remote only when capturing AND not in pan-navigation mode.
-  const pointerToRemote = captureInput && !panning;
+  const pointerToRemote = captureInput && !panning && !inputHeld;
   // Trackpad mode drives the remote only where direct touch would: capturing and not panning. Outside
   // that (pan mode, capture off) the ordinary touch gestures apply, which is what navigates the view.
   const padActive = trackpadOn && pointerToRemote;
@@ -3170,7 +3179,23 @@ export function Viewer({
         </div>
 
         <ToolbarDock target={!isFullscreen ? toolbarEndHost : null} inline={!!hostWindow || !toolbarHost}>
-          {recording && <span className="viewer__recording-indicator" data-testid="viewer-recording-indicator" role="status" title={recordingRequired ? "Recording required by policy" : "Recording"}>⏺<span className="viewer__lbl"> Recording{recordingRequired ? " (required)" : ""}</span></span>}
+          {bindingStatus && (
+            // docs/69: whether this connection is bound to the machine's key. At the END of the bar so it
+            // never moves the controls before it.
+            // A glyph plus a label that collapses on narrow bars (like the recording indicator), so the
+            // mark never adds sideways overflow at phone width.
+            <span className="viewer__binding" data-testid="session-binding-status" data-state={bindingStatus.state} role="status"
+              title={bindingStatus.state === "unverified" ? `Not verified: ${bindingStatus.why}` : undefined}>
+              {bindingStatus.state === "pending" ? "…" : bindingStatus.state === "verified" ? "✓" : "!"}
+              <span className="viewer__lbl">
+                {bindingStatus.state === "pending" ? " Verifying machine"
+                  : bindingStatus.state === "verified" ? " Verified"
+                  : bindingStatus.state === "unverified" ? " Not verified"
+                  : " Verification failed"}
+              </span>
+            </span>
+          )}
+          {recording &&<span className="viewer__recording-indicator" data-testid="viewer-recording-indicator" role="status" title={recordingRequired ? "Recording required by policy" : "Recording"}>⏺<span className="viewer__lbl"> Recording{recordingRequired ? " (required)" : ""}</span></span>}
           <button className="viewer__disconnect" onClick={onDisconnect}>{disconnectLabel}</button>
         </ToolbarDock>
       </div>

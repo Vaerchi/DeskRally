@@ -341,6 +341,8 @@ describe("HelpAcceptController (a lost accept response)", () => {
     let finish!: (s: StartedSession) => void;
     h.results.push(() => new Promise<StartedSession>((res) => { finish = res; }));
     const pending = h.controller.attempt(req("a"));
+    // The console key (docs/69) is made before the request goes out; wait until it is in flight.
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
     h.controller.reset(); // signed out / switched tenant while the request was in flight
     finish(started());
     expect(await pending).toBeNull();

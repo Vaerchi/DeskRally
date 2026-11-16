@@ -693,3 +693,35 @@ describe("relay notice (signaling withheld a relay credential)", () => {
     });
   });
 });
+
+describe("WebRTCTransport outbound hold (docs/69)", () => {
+  it("holds what the predicate rejects, sends what it allows, and releases in order", async () => {
+    const { transport, dc } = await connected();
+    dc.open();
+    const allow = (f: { channel: ChannelId }) => f.channel === ChannelId.Control;
+    transport.holdOutbound(allow);
+    const a = new TextEncoder().encode("a");
+    const b = new TextEncoder().encode("b");
+    transport.send(ChannelId.Input, a);
+    transport.send(ChannelId.Control, b);
+    transport.send(ChannelId.Clipboard, a);
+    expect(dc.sent).toHaveLength(1);
+    expect(decodeFrame(new Uint8Array(dc.sent[0])).frame.channel).toBe(ChannelId.Control);
+    transport.releaseOutbound();
+    expect(dc.sent.map((s) => decodeFrame(new Uint8Array(s)).frame.channel)).toEqual([ChannelId.Control, ChannelId.Input, ChannelId.Clipboard]);
+    transport.send(ChannelId.Input, a);
+    expect(dc.sent).toHaveLength(4);
+    transport.close();
+  });
+
+  it("discard drops the held frames and sends nothing afterwards", async () => {
+    const { transport, dc } = await connected();
+    dc.open();
+    transport.holdOutbound(() => false);
+    transport.send(ChannelId.Input, new Uint8Array([1]));
+    transport.discardOutbound();
+    transport.send(ChannelId.Control, new Uint8Array([2]));
+    expect(dc.sent).toHaveLength(0);
+    transport.close();
+  });
+});

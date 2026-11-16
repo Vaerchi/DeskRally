@@ -6,6 +6,8 @@
 //! unit-tested on any host, while the Win32 modules are exercised on Windows.
 
 pub mod backstage;
+pub mod binding_grant;
+pub mod session_binding;
 pub mod elevation;
 pub mod session_policy;
 pub mod transport;

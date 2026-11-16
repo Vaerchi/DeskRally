@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agent_auth;
+pub mod session_binding;
 pub mod channel;
 pub mod directive;
 pub mod frame;

@@ -288,6 +288,7 @@ import { CONSOLE_AREAS, type ConsoleArea } from "./lib/console_areas";
 import { ConsoleAreaBar } from "./components/ConsoleAreaBar";
 import { AppMenu } from "./components/AppMenu";
 import { TransferBanner } from "./components/TransferBanner";
+import { allowedBeforeBinding, createConsoleKey, runConsoleBinding, type BindingStatus } from "./lib/session_binding";
 
 /** Present the agent's `MonitorDesc` list to the Viewer's picker (adds a human label). */
 function toMonitorInfo(list: MonitorDesc[]): MonitorInfo[] {
@@ -465,6 +466,8 @@ export default function App() {
   // View-only / presentation mode: whether the agent is dropping our injected input. Sourced from the
   // agent's `ViewOnlyApplied` ack (the state actually in force), never optimistically from the request.
   const [viewOnly, setViewOnly] = useState(false);
+  // docs/69: whether this connection is bound to the machine's key. null = no live connection.
+  const [bindingStatus, setBindingStatus] = useState<BindingStatus | null>(null);
   const [observing, setObserving] = useState(false);
   const observingRef = useRef(false);
   // Remote support: a transient status line while a reboot the operator requested is in flight.
@@ -1388,6 +1391,7 @@ export default function App() {
     monitorCanvasRef.current = undefined;
       setAudioAvailable(false);
       setError(null);
+      setBindingStatus(null);
       setState("signaling");
 
       // M2 brokered path: start a control-plane session FIRST; when it succeeds we dial the
@@ -1404,10 +1408,12 @@ export default function App() {
         const request = observe
           ? acquireBrokeredSession(consoleApiRef.current, device, undefined, {access:"view_only"})
           : preAcquired ? Promise.resolve(preAcquired) : recovering
-          ? consoleApiRef.current.startBrokeredSession(device).then(started => {
+          ? createConsoleKey().then(key => consoleApiRef.current.startBrokeredSession(device, undefined, key ? {consolePubkey:key.publicHex} : undefined).then(started => {
               if(!started.signaling) throw new RecoveryRefused("No authorized signaling endpoint is available");
-              return {sessionId:started.session.id, signaling:started.signaling, sessionPolicy:started.session_policy};
-            })
+              // docs/69: a recovered session is a NEW connection with its own key and grant.
+              return {sessionId:started.session.id, signaling:started.signaling, sessionPolicy:started.session_policy,
+                binding:{key, device:started.device_binding}};
+            }))
           : acquireBrokeredSession(consoleApiRef.current,device);
         brokered=preAcquired ?? await withDeadline(request,15000,late=> {
           releaseBrokeredSession(consoleApiRef.current,late?.sessionId);
@@ -1591,6 +1597,17 @@ export default function App() {
           setDirLoading(false);
         }
       };
+
+      // docs/69: the binding exchange waits on two agent replies; the ControlClient resolves them.
+      const bindWaiters: {
+        proof: ((p: { agentNonceHex: string; sigHex: string } | { refused: string | null }) => void) | null;
+        result: ((r: { ok: boolean; reason: string | null }) => void) | null;
+      } = { proof: null, result: null };
+      const waitBind = <T,>(register: (resolve: (v: T) => void) => void, ms: number): Promise<T | null> =>
+        new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(null), ms);
+          register((v) => { clearTimeout(timer); resolve(v); });
+        });
 
       // Control client: monitor enumeration/selection over ChannelId.Control. Its `send` frames onto
       // the transport we are about to build (closure captures the ref).
@@ -1856,6 +1873,13 @@ export default function App() {
           // (isCurrent) before routing, which input_handoff.spec.ts pins.
           onInputHandoffAvailable: (available) => setInputHandoff((m) => handoffAdvertised(m, available)),
           onInputControlChanged: (owner, mode) => setInputHandoff((m) => inputControlChanged(m, owner, mode)),
+          // docs/69: resolve the binding exchange's waits (a reply nobody is waiting for is ignored).
+          onBindAgentProof: (agentNonceHex, sigHex) => { const r = bindWaiters.proof; bindWaiters.proof = null; r?.({ agentNonceHex, sigHex }); },
+          // A refusal can arrive while we still wait for the proof (the agent refused the grant itself).
+          onBindResult: (ok, reason) => {
+            if (bindWaiters.result) { const r = bindWaiters.result; bindWaiters.result = null; r({ ok, reason }); return; }
+            if (!ok && bindWaiters.proof) { const r = bindWaiters.proof; bindWaiters.proof = null; r({ refused: reason }); }
+          },
         },
       );
       controlRef.current = control;
@@ -1971,6 +1995,10 @@ export default function App() {
       chatRef.current = chat;
       setChatClient(chat);
 
+      // docs/69: the binding exchange starts only once the data channel is open (connect() returns earlier), so
+      // its reply timeouts measure the agent, not ICE.
+      let channelOpened: () => void = () => {};
+      const channelOpen = new Promise<void>((resolve) => { channelOpened = resolve; });
       const transport = new WebRTCTransport(
         // ICE policy keys off the EFFECTIVE rendezvous (the brokered URL when present).
         { signaling, iceServers: iceServersFor(brokered?.signaling.url ?? signalingUrl), requireViewOnlyBrokered: observe },
@@ -2010,6 +2038,7 @@ export default function App() {
               err.message === "connect rejected: internal error allocating session"
             )) recovery.current?.refuse(err.message);
           },
+          onChannelOpen: () => channelOpened(),
           onMessage: (channel, payload) => {
             if (!isCurrent()) return;
             // Route each inbound frame by channel. Control drives the monitor client (and grant
@@ -2028,6 +2057,10 @@ export default function App() {
         },
       );
       transportRef.current = transport;
+      // docs/69: until the machine is verified (or the session proceeds unverified under warn), nothing the
+      // technician sends leaves this console: only the binding exchange and plain session setup pass. Only when an
+      // exchange will actually run (the server sent binding material); without it the outcome is decided at once.
+      if (brokered?.binding?.device?.grant) transport.holdOutbound(allowedBeforeBinding);
 
       // Dev/e2e seam: expose the live transport's stats + state so the Playwright console test can
       // assert real inbound media (getStats) without the app shipping a debug handle to production.
@@ -2053,6 +2086,34 @@ export default function App() {
       try {
         await transport.connect(device, brokered?.signaling.ticket);
         if (!isCurrent()) { transport.close(); signaling.close(); return; }
+        // docs/69: bind this connection to the machine's key. BindStart goes FIRST: an enforcing agent
+        // processes it at once and holds everything after it (the policy, the monitor list request...)
+        // until our proof verifies, then replays them in order. Input stays held until this settles.
+        setBindingStatus(brokered?.binding?.device ? { state: "pending" } : null);
+        // Wait for the channel only when an exchange will run; with no binding material the outcome is immediate.
+        void (brokered?.binding?.device?.grant ? channelOpen : Promise.resolve()).then(() => runConsoleBinding({
+          binding: brokered?.binding?.device,
+          key: brokered?.binding?.key ?? null,
+          sessionId: brokered?.sessionId ?? "",
+          sendStart: (grant, nonce) => control.sendBindStart(grant, nonce),
+          sendConsoleProof: (sig) => control.sendBindConsoleProof(sig),
+          awaitAgentProof: (ms) => waitBind((r) => { bindWaiters.proof = r; }, ms),
+          awaitResult: (ms) => waitBind((r) => { bindWaiters.result = r; }, ms),
+          stats: () => transport.getStats(),
+          descriptions: () => transport.descriptions(),
+          randomBytes: (n) => crypto.getRandomValues(new Uint8Array(n)),
+        })).then((status) => {
+          if (!isCurrent()) return;
+          // A server that sends no binding material at all (binding not rolled out) gets no mark.
+          setBindingStatus(brokered?.binding?.device ? status : null);
+          if (status.state !== "failed") { transport.releaseOutbound(); return; }
+          transport.discardOutbound();
+          // Not the machine we asked for, or it would not prove it: end the session, say why, record it.
+          setError("This connection could not be verified as the machine you asked for. It may have been intercepted, so the session was ended.");
+          const sid = brokered?.sessionId;
+          if (sid) void consoleApiRef.current.reportSessionBindingFailed(sid, status.reason).catch(() => {});
+          transport.close(); signaling.close();
+        });
         // connect() creates the data channel; sends can now queue until it opens.
         // Install the signed access policy before monitor/quality requests. Sending it
         // before connect() throws because no frames channel exists yet.
@@ -2410,8 +2471,9 @@ export default function App() {
   const connectAttendedHere = useCallback(async (id: string) => {
     const epoch = authSession.epoch;
     try {
-      const connected = await consoleApiRef.current.connectAttendedSession(id);
-      if (authSession.isCurrent(epoch)) handleAttendedConnect(connected);
+      const key = await createConsoleKey();
+      const connected = await consoleApiRef.current.connectAttendedSession(id, key?.publicHex);
+      if (authSession.isCurrent(epoch)) handleAttendedConnect({ ...connected, console_key: key });
     } catch (e) {
       if (authSession.isCurrent(epoch)) setError(e instanceof Error ? e.message : "Could not connect to this support session.");
     }
@@ -3302,6 +3364,8 @@ export default function App() {
                   machineAlias={machineAlias}
                   connectionState={state}
                   recoveryNotice={recoveryNotice}
+                  inputHeld={bindingStatus?.state === "pending" || bindingStatus?.state === "failed"}
+                  bindingStatus={bindingStatus}
                   onReconnect={reconnectManually}
                   audioAvailable={audioAvailable}
                   monitors={toMonitorInfo(monitors)}

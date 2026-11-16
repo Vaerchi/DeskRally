@@ -894,6 +894,8 @@ func main() {
 		srv.RequireAgentAuditSignatures = true
 		srv.Audit = controlplane.NewPgAuditStore(pool)
 		srv.Grants = grants
+		// docs/69: session binding, off until the answering agent release is out (CP_SESSION_BINDING=on).
+		srv.BindingEnabled = strings.EqualFold(strings.TrimSpace(os.Getenv("CP_SESSION_BINDING")), "on")
 		// Strict machine repository: a mint/session for an unknown machine is genuinely rejected,
 		// and the machine's group (which scopes backstage authorization) comes from stored data.
 		machines := controlplane.NewPgMachineStore(pool)

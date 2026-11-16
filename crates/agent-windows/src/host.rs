@@ -1124,6 +1124,12 @@ fn multi_stream_command(args: &[String]) -> i32 {
         device,
         ice: Vec::new(),
         identity,
+        // docs/69: the live e2e suite drives enforcement with `--session-binding enforce`.
+        session_binding: if parse_str_arg(args, "--session-binding") == Some("enforce") {
+            rmt_agent::session_binding::Enforcement::Enforce
+        } else {
+            rmt_agent::session_binding::Enforcement::AnswerOnly
+        },
         transfer_dir,
         clipboard_mode: ClipboardMode::Disabled,
         backstage_auth,
@@ -3001,6 +3007,10 @@ pub struct SessionOptions {
     /// registry on a server running without `-insecure-no-agent-auth`. `None` ⇒ the unauthenticated
     /// dev/LAN path (placeholder pubkey, challenges unanswered). Default: `None`.
     pub identity: Option<AgentIdentity>,
+    /// docs/69 session binding: `AnswerOnly` (default) answers a console's binding request so the
+    /// console can verify this agent; `Enforce` additionally sends no picture and processes no other
+    /// frame until the console's proof verifies, and ends the session if that does not happen.
+    pub session_binding: rmt_agent::session_binding::Enforcement,
     /// Longest a single session may run. Default: [`DEFAULT_STREAM_MAX_RUN`] (4 hours).
     ///
     /// This is a resource bound, not a policy one: it exists so a session that is never closed
@@ -3658,6 +3668,7 @@ impl Default for SessionOptions {
             session_lease: SessionLeaseMode::FromSessionBinding,
             session_lease_grace: DEFAULT_LEASE_GRACE,
             identity: None,
+            session_binding: rmt_agent::session_binding::Enforcement::AnswerOnly,
             max_session: DEFAULT_STREAM_MAX_RUN,
             // Today's behaviour exactly — a caller that has not thought about quality policy gets
             // the ceiling the agent already had compiled in.
@@ -3729,6 +3740,25 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// Pass a received frame through unchanged, noting technician activity for the idle release
 /// (update_guard.rs). Errors and non-technician channels are not activity.
+/// docs/69: the only frames an unbound ENFORCING agent processes (everything else is held).
+fn is_binding_frame(frame: &Frame) -> bool {
+    frame.channel == ChannelId::Control
+        && matches!(
+            control::decode(&frame.payload),
+            Ok(ControlMessage::BindStart { .. } | ControlMessage::BindConsoleProof { .. })
+        )
+}
+
+/// docs/69: the wire message for a binding reply.
+fn bind_reply_message(reply: rmt_agent::session_binding::BindReply) -> ControlMessage {
+    match reply {
+        rmt_agent::session_binding::BindReply::AgentProof { agent_nonce, sig } => {
+            ControlMessage::BindAgentProof { agent_nonce, sig }
+        }
+        rmt_agent::session_binding::BindReply::Result { ok, reason } => ControlMessage::BindResult { ok, reason },
+    }
+}
+
 fn note_activity(
     received: rmt_agent_core::transport::TransportResult<Frame>,
     activity: Option<&crate::update_guard::SessionActivity>,
@@ -4130,6 +4160,7 @@ pub async fn serve_session_with_ice(
         session_lease: session_lease_mode,
         session_lease_grace,
         identity,
+        session_binding: session_binding_enforcement,
         quality_policy: opts_quality_policy,
         max_session,
         guest_ui,
@@ -4205,6 +4236,9 @@ pub async fn serve_session_with_ice(
         || crate::upload_root::test_harness_anchored();
 
     let audit_signer = identity.as_ref().map(|id| (id.pubkey.clone(), id.signer.clone()));
+    // docs/69: the device key signs this session's binding proof (its own domain tag keeps it apart
+    // from the registration proof the same key signs).
+    let binding_signer = identity.as_ref().map(|id| id.signer.clone());
     let role = agent_role(device, identity, require_session_policy);
 
     // Multi-session path: transport already connected by `run_multi_session_stream`. Single-session
@@ -4236,6 +4270,13 @@ pub async fn serve_session_with_ice(
     // The agent has no other source: the viewer must not self-attribute (that is the forgery
     // `POST /audit/ingest` answers 403 to) and an unverified ticket is attacker-chosen.
     let session_technician = transport.session_technician();
+    // docs/69 session binding: the live association's fingerprints (read through a handle, since the
+    // loop holds `&mut transport`) and this connection's binding state.
+    let binding_source = transport.binding_source();
+    let mut binding = rmt_agent::session_binding::AgentBinding::new(session_binding_enforcement, Instant::now());
+    // Audio is pumped by its own thread; it follows the binding through this flag (true at once in
+    // answer-only mode, set when an enforcing session binds).
+    let media_open = Arc::new(AtomicBool::new(binding.open()));
     // HOW this session may act (observer design v2), from the same verified ticket, read once. Decided
     // here, before any frame, guest-window update or input path exists: an observer is view-only from
     // the first frame, and a session whose access signaling stated wrongly never starts at all.
@@ -4496,11 +4537,17 @@ pub async fn serve_session_with_ice(
     // At most ONE hand in flight per session: a controller flooding HandInputControl cannot pile up
     // blocking tasks, each of which briefly holds the dispatch gate every session's input passes.
     let hand_slot = HandSlot::default();
+    // docs/69: not to an unverified peer of an enforcing session (the view-only floor applies regardless); then it is
+    // delivered once the session binds (`indicator_notice_pending`).
+    const INDICATOR_MISSING_NOTICE: &str = "The guest's on-screen indicator could not be shown, so this session is view-only.";
+    let mut indicator_notice_pending = false;
     if indicator_missing {
-        let payload = control::encode(&ControlMessage::Error {
-            message: "The guest's on-screen indicator could not be shown, so this session is view-only.".to_string(),
-        });
-        let _ = transport.send_frame(Frame::new(ChannelId::Control, payload)).await;
+        if binding.open() {
+            let payload = control::encode(&ControlMessage::Error { message: INDICATOR_MISSING_NOTICE.to_string() });
+            let _ = transport.send_frame(Frame::new(ChannelId::Control, payload)).await;
+        } else {
+            indicator_notice_pending = true;
+        }
     }
     // Replay what the transcript already holds so a guest who reconnects mid-conversation is not
     // shown an empty window beside a technician who can see the whole history.
@@ -4619,6 +4666,7 @@ pub async fn serve_session_with_ice(
     if synthetic_tone {
         if let Some(audio) = transport.audio_sender() {
             let stop_audio = session_stop.clone();
+            let media_open = media_open.clone();
             std::thread::spawn(move || {
                 tracing::info!("audio: streaming a synthetic 440 Hz test tone (--synthetic-tone)");
                 let start = Instant::now();
@@ -4634,7 +4682,7 @@ pub async fn serve_session_with_ice(
                         pcm.extend_from_slice(&[s, s]); // interleaved stereo
                         sent_frames += 1;
                     }
-                    if !pcm.is_empty() && audio.send(&pcm).is_err() {
+                    if !pcm.is_empty() && media_open.load(Ordering::Relaxed) && audio.send(&pcm).is_err() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -4643,6 +4691,7 @@ pub async fn serve_session_with_ice(
         }
     } else if !mock_input { if let Some(audio) = transport.audio_sender() {
         let stop_audio = session_stop.clone();
+        let media_open = media_open.clone();
         std::thread::spawn(move || {
             let mut cap = match crate::audio::LoopbackCapture::new() {
                 Ok(c) => c,
@@ -4669,8 +4718,9 @@ pub async fn serve_session_with_ice(
                     Ok(_) if pcm.is_empty() => {}
                     Ok(_) => {
                         // Framing is the transport's job (one `FrameAccumulator`, tested there), so
-                        // any length goes. A send error means the session is gone.
-                        if audio.send(&pcm).is_err() {
+                        // any length goes. A send error means the session is gone. docs/69: nothing
+                        // is sent before an enforcing session is bound.
+                        if media_open.load(Ordering::Relaxed) && audio.send(&pcm).is_err() {
                             break;
                         }
                     }
@@ -5256,6 +5306,7 @@ pub async fn serve_session_with_ice(
         // watched display gets its real pixels now, not at the next screen change.
         if freeze.reconcile(last_frame.as_ref(), shared_canvas.as_ref(), recorder.is_some(), Instant::now())
             && video_open
+            && binding.open()
             && !session_stop.load(Ordering::Relaxed)
         {
             if let Some(f) = freeze.outgoing(last_frame.as_ref()) {
@@ -5287,7 +5338,8 @@ pub async fn serve_session_with_ice(
         // keeps rediscovering. Here it cannot be forgotten: any change to `view_only`, from any
         // source, is published on the next iteration, and view-only only ever changes as the result
         // of an event this loop just processed, so "the next iteration" is immediately.
-        let clip_allow = !view_only && clipboard_mode.allows_to_technician();
+        // docs/69: nor before an enforcing session is bound (the peer may not be the console yet).
+        let clip_allow = !view_only && binding.open() && clipboard_mode.allows_to_technician();
         // The swap is UNCONDITIONAL and its result is bound before it is tested. Writing this as
         // `if clip_allow && !clip_egress.swap(..)` reads identically and is badly wrong: `&&`
         // short-circuits, so the store never runs on the `clip_allow == false` path and egress would
@@ -5309,6 +5361,11 @@ pub async fn serve_session_with_ice(
             // lift is consumed too, and does not sync until the guest copies again — a missed
             // paste, against a leaked password. That trade is not close.
             clip_resync.store(true, Ordering::Relaxed);
+        }
+        // docs/69: an enforcing session that failed to bind, or ran out its binding deadline, ends.
+        if binding.must_end(Instant::now()) {
+            tracing::warn!(cp_session = ?control_plane_session, "session binding: no verified console within the deadline; ending the session");
+            break;
         }
         tokio::select! {
             biased;
@@ -5358,6 +5415,9 @@ pub async fn serve_session_with_ice(
                     // a catch-all so a future variant fails to compile until someone decides what it
                     // means for a live session.
                     LeaseStatus::NotEnforced => {}
+                    // docs/69: not to an unverified peer of an enforcing session (the next tick after
+                    // binding announces it; the lease grace outlasts the binding deadline).
+                    LeaseStatus::AwaitingFirst { .. } if !binding.open() => {}
                     LeaseStatus::AwaitingFirst { remaining_ms } => {
                         // (RE-)ANNOUNCE. The controller cannot know it must renew — the console has
                         // no way to tell whether a given agent can verify a signed policy at all —
@@ -5417,9 +5477,11 @@ pub async fn serve_session_with_ice(
                                      not renewed".to_string(),
                             },
                         });
-                        let _ = transport
-                            .send_frame(Frame::new(ChannelId::Control, payload))
-                            .await;
+                        if binding.open() {
+                            let _ = transport
+                                .send_frame(Frame::new(ChannelId::Control, payload))
+                                .await;
+                        }
                         end_notice_sent = true;
                         end_reason.get_or_insert(rmt_protocol::signaling::SessionEndReason::LeaseLapsed);
                         input_open = false;
@@ -5442,9 +5504,11 @@ pub async fn serve_session_with_ice(
                         let payload = control::encode(&ControlMessage::Error {
                             message: "session ended: maximum session duration reached".to_string(),
                         });
-                        let _ = transport
-                            .send_frame(Frame::new(ChannelId::Control, payload))
-                            .await;
+                        if binding.open() {
+                            let _ = transport
+                                .send_frame(Frame::new(ChannelId::Control, payload))
+                                .await;
+                        }
                         end_notice_sent = true;
                         input_open = false;
                         video_open = false;
@@ -5475,9 +5539,11 @@ pub async fn serve_session_with_ice(
                     let payload = control::encode(&ControlMessage::Error {
                         message: "session ended: idle timeout reached".to_string(),
                     });
-                    let _ = transport
-                        .send_frame(Frame::new(ChannelId::Control, payload))
-                        .await;
+                    if binding.open() {
+                        let _ = transport
+                            .send_frame(Frame::new(ChannelId::Control, payload))
+                            .await;
+                    }
                     end_notice_sent = true;
                     input_open = false;
                     video_open = false;
@@ -5498,7 +5564,9 @@ pub async fn serve_session_with_ice(
                 end_reason.get_or_insert(rmt_protocol::signaling::SessionEndReason::ViewerLeft);
                 video_open = false;
             }
-            ready = &mut monitor_ready_rx, if monitor_announcement_pending => {
+            // docs/69: the initial announcements (monitors, transfer dir, hand-off, directory join) wait until an
+            // enforcing session is bound; the peer may not be the console yet.
+            ready = &mut monitor_ready_rx, if monitor_announcement_pending && binding.open() => {
                 // Disable on success OR sender drop; polling a completed oneshot again panics.
                 monitor_announcement_pending = false;
                 if let Ok(monitors) = ready {
@@ -5620,11 +5688,15 @@ pub async fn serve_session_with_ice(
                         last_frame = None;
                         continue;
                     }
-                    if let Err(e) = video.send(freeze.on_frame(&f, shared_canvas.as_ref(), recorder.is_some())) {
-                        result = Err(e);
-                        break;
+                    // docs/69: no picture leaves an enforcing agent before the console has proved
+                    // itself. The frame is still kept below, so the first frame after binding is fresh.
+                    if binding.open() {
+                        if let Err(e) = video.send(freeze.on_frame(&f, shared_canvas.as_ref(), recorder.is_some())) {
+                            result = Err(e);
+                            break;
+                        }
+                        sent += 1;
                     }
-                    sent += 1;
                     last_sent_at = Instant::now(); // a REAL frame resets the min-cadence timer
                     // Keep the newest raw frame (moved in — `video.send` only borrowed it) so an
                     // on-demand `RequestScreenshot` can encode a full-res PNG of the current view,
@@ -5655,7 +5727,7 @@ pub async fn serve_session_with_ice(
                 // computed once would go on delivering 15 fps after they asked for 5.
                 let floor = min_frame_interval(fps_now.load(Ordering::Relaxed));
                 // A hidden viewer has no picture to keep alive: only real frames, at BACKGROUND_FPS.
-                if !background && last_sent_at.elapsed() >= floor {
+                if !background && binding.open() && last_sent_at.elapsed() >= floor {
                     if let Some(f) = freeze.outgoing(last_frame.as_ref()) {
                         // Best-effort: a closed pipeline is caught by the frame arm's error path.
                         if let Err(e) = video.send(f) {
@@ -5698,6 +5770,8 @@ pub async fn serve_session_with_ice(
                 // dropping keeps the channel drained, so lifting view-only shares only what the
                 // guest copies from then on.
                 Some(_) if view_only => {}
+                // docs/69: an enforcing session that is not yet bound shares nothing (drained, like view-only).
+                Some(_) if !binding.open() => {}
                 // MACHINE POLICY: this machine's config forbids the guest's clipboard leaving it.
                 // Checked separately from `view_only` and after it, so the two reasons a copy can be
                 // refused stay distinguishable in the code as they are in the model: view-only is
@@ -5772,8 +5846,12 @@ pub async fn serve_session_with_ice(
                     if let Some(s) = guest_surface.as_ref() {
                         s.posted(entry.from, &entry.body, entry.at_unix_ms);
                     }
+                    // docs/69: before an enforcing session is bound the line stays in the transcript only;
+                    // the console's history request (held, replayed once bound) delivers it.
                     let payload = chat::encode(&ChatMessage::Posted { entry });
-                    if let Err(e) = transport.send_frame(Frame::new(ChannelId::Chat, payload)).await {
+                    if !binding.open() {
+                        // nothing leaves yet
+                    } else if let Err(e) = transport.send_frame(Frame::new(ChannelId::Chat, payload)).await {
                         tracing::debug!(error = %e, "guest chat frame send failed");
                         input_open = false;
                     }
@@ -5798,12 +5876,15 @@ pub async fn serve_session_with_ice(
                     if control_plane_session.is_none() {
                         tracing::info!("guest ended session has no control-plane record to end");
                     }
+                    // docs/69: an unverified peer of an enforcing session learns nothing (the session still ends).
                     let payload = control::encode(&ControlMessage::SessionEndedByGuest);
-                    if let Err(e) = transport
-                        .send_frame(Frame::new(ChannelId::Control, payload))
-                        .await
-                    {
-                        tracing::debug!(error = %e, "guest-ended notification send failed");
+                    if binding.open() {
+                        if let Err(e) = transport
+                            .send_frame(Frame::new(ChannelId::Control, payload))
+                            .await
+                        {
+                            tracing::debug!(error = %e, "guest-ended notification send failed");
+                        }
                     }
                     input_open = false;
                     video_open = false;
@@ -5842,8 +5923,11 @@ pub async fn serve_session_with_ice(
                             message: "The guest's on-screen indicator could not be shown after a display change, so the session is view-only until it is.".to_string(),
                         });
                     }
-                    for m in msgs {
-                        let _ = transport.send_frame(Frame::new(ChannelId::Control, control::encode(&m))).await;
+                    // docs/69: nothing goes to an unverified peer of an enforcing session.
+                    if binding.open() {
+                        for m in msgs {
+                            let _ = transport.send_frame(Frame::new(ChannelId::Control, control::encode(&m))).await;
+                        }
                     }
                 }
                 // Every sender is gone — the window closed. Stop polling this arm, but do NOT touch
@@ -5851,6 +5935,16 @@ pub async fn serve_session_with_ice(
                 None => guest_open = false,
             },
             received = transport.recv_frame(), if input_open => match note_activity(received, activity.as_deref()) {
+                // docs/69: an ENFORCING agent processes nothing but the binding exchange until the
+                // console has proved itself. Everything else is held (bounded) and replayed in order
+                // once bound; overflowing the hold ends the session.
+                Ok(frame) if !binding.open() && !is_binding_frame(&frame) => {
+                    if !binding.hold(frame) {
+                        tracing::warn!(cp_session = ?control_plane_session, "session binding: too much traffic before the console proved itself; ending the session");
+                        video_open = false;
+                        input_open = false;
+                    }
+                }
                 Ok(frame) if frame.channel == ChannelId::Input => {
                     match input_codec::decode(&frame.payload) {
                         // VIEW-ONLY: drop the controller's input HERE, at the agent, rather than
@@ -6561,6 +6655,85 @@ pub async fn serve_session_with_ice(
                                 video_open = false;
                             }
                         }
+                        // docs/69 session binding, steps 1 and 3 (the agent's side).
+                        Ok(ControlMessage::BindStart { grant, console_nonce }) => {
+                            let fps = binding_source.fingerprints().await.map(|f| {
+                                rmt_agent::session_binding::AgentFingerprints { agent: f.local, console: f.remote }
+                            });
+                            let issuer = match &backstage_auth {
+                                BackstageAuth::SignedBy(issuer) => Some(issuer),
+                                _ => None,
+                            };
+                            let sign = |m: &[u8]| -> [u8; 64] {
+                                binding_signer.as_ref().map_or([0u8; 64], |s| s.sign(m))
+                            };
+                            let reply = binding.on_bind_start(
+                                &grant,
+                                &console_nonce,
+                                rmt_agent::session_binding::BindStartContext {
+                                    issuer,
+                                    device: device.0,
+                                    signaled_session: control_plane_session,
+                                    signaled_technician: session_technician,
+                                    fingerprints: fps,
+                                    signer: binding_signer.as_ref().map(|_| &sign as &dyn Fn(&[u8]) -> [u8; 64]),
+                                    now_ms: now_unix_ms(),
+                                    agent_nonce: rmt_crypto::random_32(),
+                                },
+                            );
+                            if let rmt_agent::session_binding::BindReply::Result { reason, .. } = &reply {
+                                tracing::warn!(cp_session = ?control_plane_session, ?reason, "session binding: refused the console's start");
+                            }
+                            let msg = bind_reply_message(reply);
+                            if transport.send_frame(Frame::new(ChannelId::Control, control::encode(&msg))).await.is_err() {
+                                input_open = false;
+                            }
+                            if binding.must_end(Instant::now()) {
+                                video_open = false;
+                                input_open = false;
+                            }
+                        }
+                        Ok(ControlMessage::BindConsoleProof { sig }) => {
+                            let fps = binding_source.fingerprints().await.map(|f| {
+                                rmt_agent::session_binding::AgentFingerprints { agent: f.local, console: f.remote }
+                            });
+                            let reply = binding.on_console_proof(&sig, fps);
+                            let bound = matches!(reply, rmt_agent::session_binding::BindReply::Result { ok: true, .. });
+                            if bound {
+                                // The grant is authoritative (docs/69 §3.1): a view-only grant floors the session
+                                // NOW, before any held input is replayed (e.g. a control ticket in a view-only group).
+                                // Through the same one-way ratchet a verified policy uses, so no toggle lifts it.
+                                if binding.bound_grant().is_some_and(|g| g.access == rmt_agent::session_policy::AccessLevel::ViewOnly) {
+                                    access_state.install_verified(rmt_agent::session_policy::AccessLevel::ViewOnly);
+                                    view_only = access_state.view_only() || indicator_lost;
+                                    // Exactly as a verified policy does: close the injection gate, update hand-off
+                                    // eligibility and the guest's window.
+                                    set_input_admitted(&sink, !view_only).await;
+                                    sync_handoff_eligibility(&input_handoff, handoff_registration.is_some(), observer, view_only);
+                                    if let Some(s) = guest_surface.as_ref() {
+                                        s.set_view_only(view_only);
+                                    }
+                                }
+                                tracing::info!(cp_session = ?control_plane_session, "session binding: console verified; the session is bound");
+                            } else {
+                                tracing::warn!(cp_session = ?control_plane_session, "session binding: the console's proof was refused");
+                            }
+                            let msg = bind_reply_message(reply);
+                            if transport.send_frame(Frame::new(ChannelId::Control, control::encode(&msg))).await.is_err() {
+                                input_open = false;
+                            }
+                            if bound {
+                                media_open.store(true, Ordering::Relaxed);
+                                if std::mem::take(&mut indicator_notice_pending) {
+                                    let payload = control::encode(&ControlMessage::Error { message: INDICATOR_MISSING_NOTICE.to_string() });
+                                    let _ = transport.send_frame(Frame::new(ChannelId::Control, payload)).await;
+                                }
+                                transport.replay_frames(binding.take_held());
+                            } else if binding.must_end(Instant::now()) {
+                                video_open = false;
+                                input_open = false;
+                            }
+                        }
                         Ok(ControlMessage::InstallSessionPolicy { signed_policy }) => {
                             // Loop 79: install a control-plane-signed SESSION ACCESS policy — what
                             // the organisation says this session may do, as distinct from what the
@@ -6751,7 +6924,7 @@ pub async fn serve_session_with_ice(
                                                         }
                                                         Ok(handle) => match {
                                                             let raw = freeze.suspend_for_recording();
-                                                            let refresh = if raw { last_frame.as_ref().map_or(Ok(()), |f| video.send(f)) } else { Ok(()) };
+                                                            let refresh = if raw && binding.open() { last_frame.as_ref().map_or(Ok(()), |f| video.send(f)) } else { Ok(()) };
                                                             refresh.and_then(|_| video.set_recording(Some(handle.sink())))
                                                         }
                                                         {
@@ -7515,7 +7688,7 @@ pub async fn serve_session_with_ice(
                                                 // nothing — so that is an error, not a start.
                                                 match {
                                                     let raw = freeze.suspend_for_recording();
-                                                    let refresh = if raw { last_frame.as_ref().map_or(Ok(()), |f| video.send(f)) } else { Ok(()) };
+                                                    let refresh = if raw && binding.open() { last_frame.as_ref().map_or(Ok(()), |f| video.send(f)) } else { Ok(()) };
                                                     refresh.and_then(|_| video.set_recording(Some(handle.sink())))
                                                 } {
                                                     Ok(()) => {
@@ -7844,7 +8017,9 @@ pub async fn serve_session_with_ice(
                         | Ok(ControlMessage::TransferDir { .. })
                         | Ok(ControlMessage::SelectMonitorAccepted { .. })
                         | Ok(ControlMessage::MonitorPinned { .. })
-                        | Ok(ControlMessage::MonitorCanvas(_)) => {}
+                        | Ok(ControlMessage::MonitorCanvas(_))
+                        | Ok(ControlMessage::BindAgentProof { .. })
+                        | Ok(ControlMessage::BindResult { .. }) => {}
                         Err(e) => tracing::debug!(error = %e, "control decode failed; dropping frame"),
                     }
                 }
@@ -8086,7 +8261,8 @@ pub async fn serve_session_with_ice(
     // before anything is torn down, so the transport is still there to carry it. Best-effort and
     // bounded: on most silent ends the peer is still connected, and when it is not this costs 500 ms.
     if !end_notice_sent {
-        if let Some(message) = end_notice_message(end_detail, end_reason, max_session) {
+        // docs/69: never to an unverified peer of an enforcing session (teardown itself is unchanged).
+        if let Some(message) = end_notice_message(end_detail, end_reason, max_session).filter(|_| binding.open()) {
             let payload = control::encode(&ControlMessage::Error { message });
             let _ = tokio::time::timeout(
                 Duration::from_millis(500),
@@ -9890,6 +10066,8 @@ struct MultiSessionOpts {
     device: DeviceId,
     ice: Vec<IceServer>,
     identity: Option<AgentIdentity>,
+    /// docs/69: whether sessions gate media and input on a completed binding.
+    session_binding: rmt_agent::session_binding::Enforcement,
     transfer_dir: PathBuf,
     clipboard_mode: ClipboardMode,
     backstage_auth: BackstageAuth,
@@ -10253,6 +10431,7 @@ async fn run_multi_session_stream(
                 session_lease: SessionLeaseMode::FromSessionBinding,
                 session_lease_grace: DEFAULT_LEASE_GRACE,
                 identity: opts_c.identity.clone(),
+                session_binding: opts_c.session_binding,
                 quality_policy: opts_c.quality_policy,
                 max_session: opts_c.max_session,
                 recording_dir: opts_c.recording_dir.clone(),
@@ -10443,6 +10622,13 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
             ),
             Err(e) => log_line(false, &format!("helper: enrollment failed: {e}")),
         }
+    }
+    // docs/69 §3.7 step 2: an installed agent enrolled before the control plane handed out its grant issuer key
+    // fetches it once per start (blocking HTTP, before the runtime, like enrollment). A failure leaves it unpinned.
+    match crate::enroll::fetch_grant_issuer_pin_if_missing(cfg, crate::config::CONFIG_FILE) {
+        Ok(true) => log_line(false, "helper: grant issuer public key fetched from the control plane and pinned"),
+        Ok(false) => {}
+        Err(e) => log_line(false, &format!("helper: grant issuer key not pinned: {e}")),
     }
 
     // Stable per-machine identity. An agent whose identity belongs to a control plane NEVER
@@ -10689,6 +10875,8 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
         device,
         ice: ice.clone(),
         identity: agent_identity.clone(),
+        // docs/69: answer-only until the enforcing release (the console must ship first).
+        session_binding: rmt_agent::session_binding::Enforcement::AnswerOnly,
         transfer_dir: transfer_dir.clone(),
         clipboard_mode,
         backstage_auth: backstage_auth.clone(),
@@ -12526,8 +12714,8 @@ mod typing_cancel_wiring_tests {
         let gate = body.find(concat!("set_input_", "admitted(&sink, false).await")).expect("End closes the input gate");
         let ended = body.find(concat!("s.end", "ed();")).expect("End shows ENDED");
         assert!(gate < ended, "input must stop BEFORE the indicator comes down");
-        assert_eq!(src.matches(concat!("view_only = access_state.view_only() || indicator_", "lost;")).count(), 4,
-            "every recompute (3 policy sites + the indicator arm) keeps the indicator floor");
+        assert_eq!(src.matches(concat!("view_only = access_state.view_only() || indicator_", "lost;")).count(), 5,
+            "every recompute (3 policy sites + the indicator arm + the docs/69 view-only grant) keeps the indicator floor");
     }
 }
 

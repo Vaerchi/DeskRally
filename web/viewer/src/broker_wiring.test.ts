@@ -93,7 +93,8 @@ describe("M2 brokered connect wiring", () => {
 
     const brokered = await acquireBrokeredSession(api, DEVICE);
     expect(posts[0].url).toBe("/cp/sessions");
-    expect(JSON.parse(posts[0].body as string)).toEqual({ machine_id: DEVICE });
+    // docs/69: the start also carries this connection's ephemeral console key.
+    expect(JSON.parse(posts[0].body as string)).toEqual({ machine_id: DEVICE, console_pubkey: expect.stringMatching(/^[0-9a-f]{64}$/) });
     expect(brokered).not.toBeNull();
     expect(brokered!.sessionId).toBe("s-1");
     expect(brokered!.signaling.url).toBe(SIGNALING.url);

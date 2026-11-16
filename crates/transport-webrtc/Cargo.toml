@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 uuid.workspace = true
 # M3 agent auth: the challenge nonce and the proof signature are hex on the signaling wire.
 hex = "0.4"
+# docs/69 session binding: SHA-256 of the peer's DTLS certificate (already in the lock via other crates).
+sha2 = "0.10"
 webrtc = "0.17"
 # TURN over TCP/TLS (turn_stream.rs): the dialer trait is async, and TURNS needs a tokio TLS stream.
 # `ring` provider like everything else here; no aws-lc.

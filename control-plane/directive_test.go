@@ -514,6 +514,11 @@ func TestIssuedArtifactVerifiesUnderTheDedicatedKeyOnly(t *testing.T) {
 		if code != http.StatusCreated || str(out, "directive_pubkey") != h.issuer.PublicKeyHex() {
 			t.Fatalf("enroll response = %d %v, want directive_pubkey %s", code, out, h.issuer.PublicKeyHex())
 		}
+		// docs/69 §3.7: and the GRANT issuer key, which the agent pins to verify session policies and
+		// binding grants. Distinct from the directive key (asserted above).
+		if str(out, "grant_issuer_pubkey") != h.grants.PublicKeyHex() {
+			t.Fatalf("enroll response grant_issuer_pubkey = %q, want %s", str(out, "grant_issuer_pubkey"), h.grants.PublicKeyHex())
+		}
 	})
 }
 

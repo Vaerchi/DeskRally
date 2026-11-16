@@ -15,13 +15,14 @@ import { runAdhocCommand } from "./adhoc_run";
 import { composeRunLine, type BulkTask } from "./bulk_run";
 import { ChannelBackstageTransport } from "../backstage/channel";
 import { FileTransferClient } from "./file_transfer";
+import { createConsoleKey, runConsoleBinding, type ConsoleKey, type SessionBindingMaterial } from "./session_binding";
 
 export type RunOutcome =
   | { kind: "done"; exitCode: number; stdout: string; stderr: string; agentTruncated: boolean; consoleTruncated: boolean }
   | { kind: "not_run"; reason: string }
   | { kind: "unknown"; reason: string };
 
-export type CorePhase = "acquire" | "signaling" | "channel" | "policy" | "authorization" | "result" | "closed";
+export type CorePhase = "acquire" | "signaling" | "channel" | "binding" | "policy" | "authorization" | "result" | "closed";
 
 export class CoreError extends Error {
   constructor(readonly phase: CorePhase, message: string) {
@@ -30,9 +31,9 @@ export class CoreError extends Error {
   }
 }
 
-type CoreApi = Pick<ConsoleApi, "startBrokeredSession" | "endSession" | "setSessionNote" | "requestToolboxRun" | "requestCommandRun" | "renewSessionPolicy" | "ingestAudit">;
+type CoreApi = Pick<ConsoleApi, "startBrokeredSession" | "endSession" | "setSessionNote" | "requestToolboxRun" | "requestCommandRun" | "renewSessionPolicy" | "ingestAudit"> & Partial<Pick<ConsoleApi, "reportSessionBindingFailed">>;
 type ControlHandlers = NonNullable<ConstructorParameters<typeof ControlClient>[1]>;
-type CoreControl = Pick<ControlClient, "installSessionPolicy" | "runCommand" | "handleMessage">;
+type CoreControl = Pick<ControlClient, "installSessionPolicy" | "runCommand" | "handleMessage" | "sendBindStart" | "sendBindConsoleProof">;
 type CoreSignaling = Pick<SignalingClient, "open" | "send" | "close">;
 
 export interface BrokeredSessionCoreDeps {
@@ -48,6 +49,9 @@ export interface BrokeredSessionCoreDeps {
   clearTimer?: (handle: number) => void;
   /** Audit delivery failures must be surfaced by the caller, including after a result settles. */
   onAuditError?: (error: Error) => void;
+  /** docs/69: makes this session's ephemeral console key. Undefined = WebCrypto; null = do not bind
+   *  (tests that drive the core on fake timers). */
+  createKey?: (() => Promise<ConsoleKey | null>) | null;
 }
 
 /** Keep valid UTF-8 heads without splitting a code point or retaining the discarded tail. */
@@ -98,6 +102,12 @@ export class BrokeredSessionCore {
   // flight. Settled by onSessionPolicyInstalled; a wait is bounded by the caller.
   private policyWaiters: Array<() => void> = [];
   private policyRequired = false;
+  /** docs/69: this session's console key and the server's binding material. */
+  private binding: SessionBindingMaterial | undefined;
+  private bindWaiters: {
+    proof: ((p: { agentNonceHex: string; sigHex: string } | { refused: string | null }) => void) | null;
+    result: ((r: { ok: boolean; reason: string | null }) => void) | null;
+  } = { proof: null, result: null };
   private policyApplied = false;
   private policySigned = "";
   private refusal: string | null = null;
@@ -210,16 +220,21 @@ export class BrokeredSessionCore {
   private async establish(device: string, note?: string): Promise<void> {
     // Own the raw start response, including records whose missing envelope makes acquisition null.
     const brokered = await this.wait(acquireBrokeredSession({
-      startBrokeredSession: async (target) => {
+      startBrokeredSession: async (target, _signal, opts) => {
         this.check();
-        const started = await this.deps.api.startBrokeredSession(target, this.abort.signal);
+        const started = opts?.consolePubkey
+          ? await this.deps.api.startBrokeredSession(target, this.abort.signal, { consolePubkey: opts.consolePubkey })
+          : await this.deps.api.startBrokeredSession(target, this.abort.signal);
         this.ownedRecords.add(started.session.id);
         if (this.closed || !this.deps.authSession.isCurrent(this.epoch)) this.release(started.session.id);
         return started;
       },
-    }, device), "acquire", 15000);
+    // docs/69: a headless session binds like an interactive one (an enforcing agent runs nothing for an
+    // unverified console).
+    }, device, undefined, { createKey: this.deps.createKey === undefined ? createConsoleKey : this.deps.createKey }), "acquire", 15000);
     if (!brokered) throw new CoreError("acquire", "A brokered session is required; nothing ran");
     this.id = brokered.sessionId;
+    this.binding = brokered.binding;
     this.policyRequired = !!brokered.sessionPolicy;
     this.policySigned = brokered.sessionPolicy?.signed ?? "";
     // The unchanged factory reads only ingestAudit; preserve its first-event chain adoption.
@@ -295,6 +310,13 @@ export class BrokeredSessionCore {
       onDirectoryListing: (listing) => this.enqueueAudit(listing.audit),
       onDirectoryListingRefused: (refusal) => this.enqueueAudit(refusal.audit),
       onUnknown: (error) => { if (this.live()) this.fail(new CoreError(this.phase, `Undecodable control message: ${error.message}`)); },
+      // docs/69: resolve the binding exchange's waits.
+      onBindAgentProof: (agentNonceHex, sigHex) => { const r = this.bindWaiters.proof; this.bindWaiters.proof = null; r?.({ agentNonceHex, sigHex }); },
+      // A refusal can arrive while the proof is still awaited (the agent refused the grant itself).
+      onBindResult: (ok, reason) => {
+        if (this.bindWaiters.result) { const r = this.bindWaiters.result; this.bindWaiters.result = null; r({ ok, reason }); return; }
+        if (!ok && this.bindWaiters.proof) { const r = this.bindWaiters.proof; this.bindWaiters.proof = null; r({ refused: reason }); }
+      },
     };
     this.control = this.deps.makeControl?.(handlers) ?? new ControlClient((payload) => {
       this.check();
@@ -344,6 +366,28 @@ export class BrokeredSessionCore {
       this.check();
       await this.channelReady;
     })(), "channel", 20000);
+    // docs/69: verify the machine before anything runs. A failure means: run nothing.
+    const waitFor = <T,>(register: (resolve: (v: T) => void) => void, ms: number): Promise<T | null> =>
+      new Promise((resolve) => {
+        const handle = this.schedule(() => resolve(null), ms);
+        register((v) => { this.unschedule(handle); resolve(v); });
+      });
+    const status = await this.wait(runConsoleBinding({
+      binding: this.binding?.device,
+      key: this.binding?.key ?? null,
+      sessionId: this.id,
+      sendStart: (grant, nonce) => this.control!.sendBindStart(grant, nonce),
+      sendConsoleProof: (sig) => this.control!.sendBindConsoleProof(sig),
+      awaitAgentProof: (ms) => waitFor((r) => { this.bindWaiters.proof = r; }, ms),
+      awaitResult: (ms) => waitFor((r) => { this.bindWaiters.result = r; }, ms),
+      stats: async () => (this.transport as { getStats?: () => Promise<RTCStatsReport | undefined> } | undefined)?.getStats?.(),
+      descriptions: () => (this.transport as { descriptions?: () => { local?: string | null; remote?: string | null } } | undefined)?.descriptions?.() ?? {},
+      randomBytes: (n) => crypto.getRandomValues(new Uint8Array(n)),
+    }), "binding", 15000);
+    if (status.state === "failed") {
+      void this.deps.api.reportSessionBindingFailed?.(this.id, status.reason)?.catch(() => {});
+      throw new CoreError("binding", `This machine could not be verified (${status.reason}); nothing ran`);
+    }
     if (this.policyRequired && !this.policyApplied) await this.wait(this.policyReady, "policy", 10000);
   }
 

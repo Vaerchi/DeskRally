@@ -9,6 +9,7 @@
  * halves of the UI show the same "YYYY-MM-DD HH:MM:SS" UTC convention.
  */
 
+import { createConsoleKey, type SessionBindingMaterial } from "./session_binding";
 import type { ChartRow } from "./report_chart";
 import {
   ConsoleApiError,
@@ -743,7 +744,9 @@ export async function connectAttendedFlow(
   id: string,
 ): Promise<ConnectAttendedOutcome> {
   try {
-    return { ok: true, connected: await api.connectAttendedSession(id) };
+    const key = await createConsoleKey();
+    const connected = await api.connectAttendedSession(id, key?.publicHex);
+    return { ok: true, connected: { ...connected, console_key: key } };
   } catch (e) {
     if (e instanceof ConsoleApiError) {
       return { ok: false, awaitingConsent: e.kind === "conflict", message: e.message };
@@ -777,6 +780,8 @@ export type AttendedHandoff = {
     sessionId: string;
     signaling: SessionSignaling;
     sessionPolicy?: SessionAccessPolicy;
+    /** docs/69: the connect's console key and the guest key + grant the control plane returned. */
+    binding?: SessionBindingMaterial;
   };
 };
 
@@ -795,6 +800,7 @@ export function attendedHandoff(connected: ConnectedAttendedSession): AttendedHa
       // enrols it into the invite's group — so a per-group view-only mandate applies here exactly as
       // it does to an ordinary session.
       sessionPolicy: connected.session_policy,
+      binding: { key: connected.console_key ?? null, device: connected.device_binding },
     },
   };
 }

@@ -555,6 +555,16 @@ func (s *Server) handleTransferTicket(w http.ResponseWriter, r *http.Request) {
 	if !s.transfersConfigured(w) {
 		return
 	}
+	// docs/69: the console may send its ephemeral session key; older consoles send no body.
+	var keyBody consoleKeyBody
+	if r.ContentLength != 0 {
+		if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &keyBody, "malformed transfer ticket body"); err != nil {
+			return
+		}
+	}
+	if refuseMalformedConsoleKey(w, keyBody.ConsolePubkey) {
+		return
+	}
 	t, err := s.SessionTransfers.Get(r.Context(), p.TenantID, r.PathValue("id"))
 	if errors.Is(err, ErrTransferNotFound) {
 		writeError(w, http.StatusNotFound, "unknown transfer")
@@ -610,7 +620,7 @@ func (s *Server) handleTransferTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	resp, refusal := s.brokerSessionStart(held.Rec, held.Machine, p.UserID, p.TenantID, groupPolicy)
+	resp, refusal := s.brokerSessionStart(held.Rec, held.Machine, p.UserID, p.TenantID, groupPolicy, keyBody.ConsolePubkey)
 	if refusal != nil {
 		refusal.write(w)
 		return

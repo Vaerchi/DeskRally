@@ -116,6 +116,15 @@ type Server struct {
 	// issuer; tests wire one from a fixed seed.
 	Grants *GrantIssuer
 
+	// BindingMode returns a tenant's session-binding policy (docs/69, session_binding.go). Optional:
+	// nil means every tenant is at warn.
+	BindingMode func(tenantID string) SessionBindingMode
+
+	// BindingEnabled turns session binding on (docs/69): brokered sessions carry `device_binding`. OFF by
+	// default (CP_SESSION_BINDING=on enables it) so the server can ship before the answering agent release:
+	// against an agent that never answers, every session would otherwise wait out the binding timeout.
+	BindingEnabled bool
+
 	// Machines is the machine repository (D1). It is THE source of a machine's group, which the
 	// grant/session/machine handlers scope authorization against — replacing the pre-D1 behaviour
 	// of trusting a group id in the request body. Production wires the strict PgMachineStore; DEV
@@ -533,6 +542,8 @@ func (s *Server) Handler() http.Handler {
 	}
 	protected.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	protected.HandleFunc("PATCH /sessions/{id}/note", s.handleSetSessionNote)
+	// docs/69: the console reports a session it could not verify (session_binding.go).
+	protected.HandleFunc("POST /sessions/{id}/binding-failed", s.handleSessionBindingFailed)
 	// Centrally audit an ad-hoc command before the viewer sends it to the agent (http_command_run.go):
 	// the toolbox-run grant's sibling for a command the operator types rather than a saved item.
 	protected.HandleFunc("POST /sessions/{id}/command-run", s.handleRunCommand)
@@ -748,6 +759,11 @@ func (s *Server) Handler() http.Handler {
 	// Only mounted when both the token store and the machine store are wired.
 	if s.EnrollmentTokens != nil && s.Machines != nil {
 		root.HandleFunc("POST /enroll/redeem", s.handleRedeemEnrollment)
+	}
+	// PUBLIC grant issuer key (docs/69 §3.7 step 2): an installed agent that has no pinned key fetches it
+	// once from its own control plane over TLS. It is a PUBLIC key, so exposing it costs nothing.
+	if s.Grants != nil {
+		root.HandleFunc("GET /agent/grant-issuer-pubkey", s.handleGrantPubkey)
 	}
 	// PUBLIC removal confirmation (docs/65 sec. 2b): the device-key signature on the final acknowledgement of
 	// an uninstall is the whole credential. Mounted exactly when the internal directive routes are.

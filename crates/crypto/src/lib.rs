@@ -28,6 +28,14 @@ mod session;
 pub use identity::{Identity, PublicIdentity, VerifyError};
 pub use session::{Handshake, HandshakeError, SessionKeys, SealError, Role};
 
+/// 32 bytes from the OS CSPRNG (docs/69 binding nonces).
+pub fn random_32() -> [u8; 32] {
+    use rand_core::RngCore;
+    let mut out = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut out);
+    out
+}
+
 #[derive(Debug, Error)]
 pub enum CryptoError {
     #[error("verification failed: {0}")]

@@ -352,6 +352,12 @@ func (s *Server) handleRedeemEnrollment(w http.ResponseWriter, r *http.Request) 
 		// directive key refuses every directive.
 		resp["directive_pubkey"] = s.DirectiveIssuer.PublicKeyHex()
 	}
+	if s.Grants != nil {
+		// docs/69 §3.7: the key that signs session policies, backstage grants and binding grants. The
+		// agent pins it (config `grant_issuer_pubkey`) unless an installer already pinned one; the
+		// enrollment token authenticates this exchange over the control plane's TLS.
+		resp["grant_issuer_pubkey"] = s.Grants.PublicKeyHex()
+	}
 	writeJSON(w, http.StatusCreated, resp)
 }
 

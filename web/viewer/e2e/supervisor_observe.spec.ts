@@ -67,12 +67,12 @@ test("Observe adds access while Connect preserves its request shape",async({page
  const state=await fixture(page);
  await observe(page);
  await expect.poll(()=>state.starts.length).toBe(1);
- expect(state.starts[0]).toEqual({machine_id:DEVICE,access:"view_only"});
+ expect(state.starts[0]).toEqual({machine_id:DEVICE,access:"view_only",console_pubkey:expect.stringMatching(/^[0-9a-f]{64}$/)});
  await connected(page);
  await page.getByRole("button",{name:"Disconnect",exact:true}).click();
  await page.getByTestId(`connect-${DEVICE}`).click();
  await expect.poll(()=>state.starts.length).toBe(2);
- expect(state.starts[1]).toEqual({machine_id:DEVICE});
+ expect(state.starts[1]).toEqual({machine_id:DEVICE,console_pubkey:expect.stringMatching(/^[0-9a-f]{64}$/)});
 });
 
 // The actuating controls live inside the Tools and Input menus, so each menu is OPENED before
@@ -150,7 +150,7 @@ test("participants count observers among peers",async({page})=> {
 test("a watch invite link opens the machine view-only",async({page})=> {
  const state=await fixture(page,{path:`/console?device=${DEVICE}&observe=1`});
  await expect.poll(()=>state.starts.length).toBe(1);
- expect(state.starts[0]).toEqual({machine_id:DEVICE,access:"view_only"});
+ expect(state.starts[0]).toEqual({machine_id:DEVICE,access:"view_only",console_pubkey:expect.stringMatching(/^[0-9a-f]{64}$/)});
  await connected(page);
  await expect(page.getByTestId("observing-badge")).toBeVisible();
 });
@@ -158,7 +158,7 @@ test("a watch invite link opens the machine view-only",async({page})=> {
 test("a control invite link opens an ordinary session",async({page})=> {
  const state=await fixture(page,{path:`/console?device=${DEVICE}`});
  await expect.poll(()=>state.starts.length).toBe(1);
- expect(state.starts[0]).toEqual({machine_id:DEVICE});
+ expect(state.starts[0]).toEqual({machine_id:DEVICE,console_pubkey:expect.stringMatching(/^[0-9a-f]{64}$/)});
 });
 
 test("the session menu copies a watch invite for this machine",async({page})=> {

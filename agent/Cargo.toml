@@ -24,6 +24,8 @@ sha2 = "0.10"
 # workspace crate today; rmt-crypto (the shared identity/AEAD primitives) is a pure, cross-platform
 # leaf, so this stays a one-way edge (rmt-agent → rmt-crypto) with no cycle risk.
 rmt-crypto = { path = "../crates/crypto" }
+# docs/69: the RMTSESSBINDv1 transcript and Frame (a leaf crate, no cycle).
+rmt-protocol = { path = "../crates/protocol" }
 # Hex encoding of the 64-byte Ed25519 signature on the SignedGrant wire form (serde has no built-in
 # impl for [u8; 64]).
 hex = "0.4"

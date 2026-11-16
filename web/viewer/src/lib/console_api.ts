@@ -30,6 +30,7 @@
  * Base URL / CORS follows `controlplane.ts`: default is the Vite dev proxy prefix `/cp`.
  */
 
+import { parseDeviceBinding, type BindingFailureReason, type ConsoleKey, type DeviceBinding } from "./session_binding";
 import { type AccessWindow, readWindow } from "./access_window";
 import { DEFAULT_CONTROL_PLANE_URL, type FetchLike } from "./controlplane";
 import type { ActiveDirective, ActiveDirectiveList, AgentDirective, DirectiveKind, DirectivePolicy, ForgetMachineResult, MeCapability } from "./fleet_directives";
@@ -914,6 +915,8 @@ export interface StartedSession {
   /** The control-plane-signed session ACCESS policy for this session (docs/01 §3/§5, loops 79/80).
    *  Absent when the control plane has no grant issuer wired (dev). */
   session_policy?: SessionAccessPolicy;
+  /** docs/69: the machine's enrolled key and the binding grant (absent from an older server). */
+  device_binding?: DeviceBinding;
 }
 
 /**
@@ -1233,6 +1236,11 @@ export interface ConnectedAttendedSession {
    *  (docs/01 §5). An attended machine is ephemeral but NOT group-less — redemption enrolls it into
    *  the invite's group — so a per-group mandate applies here exactly as it does to a normal session. */
   session_policy?: SessionAccessPolicy;
+  /** docs/69: the guest's pinned key and the binding grant (absent from an older server). */
+  device_binding?: DeviceBinding;
+  /** CLIENT-SIDE, never sent or received: the ephemeral console key this connect was made with, attached
+   *  by the caller so the hand-off can run the binding exchange with it. */
+  console_key?: ConsoleKey | null;
 }
 
 /**
@@ -1452,7 +1460,7 @@ export interface ConsoleApi {
    * cancels the request mid-flight (passed by callers that time-bound the connect attempt).
    */
   /** `opts.access: "view_only"` starts an OBSERVER session (observer design v2); omitted = control. */
-  startBrokeredSession(machineDeviceId: string, signal?: AbortSignal, opts?: { access?: "view_only" }): Promise<StartedSession>;
+  startBrokeredSession(machineDeviceId: string, signal?: AbortSignal, opts?: { access?: "view_only"; consolePubkey?: string }): Promise<StartedSession>;
   mintSessionElevation(sessionId: string): Promise<SessionElevation>;
   /** Renew a live unattended session's LEASE (docs/25 F03). POST /sessions/{id}/policy. Refused once
    *  the session has ended; that refusal is what makes a central "End session" terminate the
@@ -1477,15 +1485,17 @@ export interface ConsoleApi {
    * a retry reuses, so a lost response returns the SAME session. 409 states surface as ConsoleApiError
    * messages carrying the server's text.
    */
-  acceptHelpRequest(requestId: string, opId?: string): Promise<StartedSession>;
+  acceptHelpRequest(requestId: string, opId?: string, consolePubkey?: string): Promise<StartedSession>;
   /** One offer's status. The acceptor's read also completes the hand-off once the agent confirms. */
   getSessionTransfer(transferId: string): Promise<SessionTransfer>;
   /** Claim an offer: pending -> releasing. The new session exists once the state is `accepted`. */
   acceptSessionTransfer(transferId: string): Promise<SessionTransfer>;
   /** The new session's ticket, minted exactly as `POST /sessions` mints one. Acceptor only. */
-  sessionTransferTicket(transferId: string): Promise<StartedSession>;
+  sessionTransferTicket(transferId: string, consolePubkey?: string): Promise<StartedSession>;
   /** Overwrite a session's free-text operator note (docs/01 §7). PATCH /sessions/{id}/note — CapEndSession. */
   setSessionNote(sessionId: string, note: string): Promise<SessionRecord>;
+  /** docs/69: report a session the console could not verify (POST /sessions/{id}/binding-failed). */
+  reportSessionBindingFailed(sessionId: string, reason: BindingFailureReason): Promise<void>;
   /** `limit` omitted → the server default (200). `filter` narrows by action/target_kind (docs/01 §5). */
   listAudit(limit?: number, filter?: AuditListFilter): Promise<MgmtAuditEvent[]>;
   /** Per-action audit-event counts for the Reports view (docs/01 §5). GET /audit/summary — CapViewAudit. */
@@ -1733,7 +1743,7 @@ export interface ConsoleApi {
    * The consent gate: mint the session ticket + signaling coordinates. Throws a
    * `kind === "conflict"` {@link ConsoleApiError} while the guest has not consented yet.
    */
-  connectAttendedSession(id: string): Promise<ConnectedAttendedSession>;
+  connectAttendedSession(id: string, consolePubkey?: string): Promise<ConnectedAttendedSession>;
   /** Stash an enrollment token for the guest to pick up and become a permanent agent. */
   promoteAttendedSession(id: string): Promise<void>;
   endAttendedSession(id: string): Promise<AttendedSessionRecord>;
@@ -2076,10 +2086,14 @@ export class ConsoleApiClient implements ConsoleApi {
     return (await this.startBrokeredSession(machineDeviceId)).session;
   }
 
-  async startBrokeredSession(machineDeviceId: string, signal?: AbortSignal, opts?: { access?: "view_only" }): Promise<StartedSession> {
+  async startBrokeredSession(machineDeviceId: string, signal?: AbortSignal, opts?: { access?: "view_only"; consolePubkey?: string }): Promise<StartedSession> {
     const body = await this.request("/sessions", "start session", {
       method: "POST",
-      body: { machine_id: machineDeviceId, ...(opts?.access ? { access: opts.access } : {}) },
+      body: {
+        machine_id: machineDeviceId,
+        ...(opts?.access ? { access: opts.access } : {}),
+        ...(opts?.consolePubkey ? { console_pubkey: opts.consolePubkey } : {}),
+      },
       signal,
     });
     return this.parseStartedSession(body, "start session");
@@ -2105,10 +2119,13 @@ export class ConsoleApiClient implements ConsoleApi {
     // declare it. (It was missed exactly that way — every layer above compiled and every test passed
     // while the policy was silently dropped and the whole feature was inert.)
     const sessionPolicy = parseSessionAccessPolicy(body, action);
+    // docs/69: the machine's key and the binding grant. The console takes the device key ONLY from here.
+    const deviceBinding = parseDeviceBinding(body);
     return {
       session,
       ...(signaling ? { signaling } : {}),
       ...(sessionPolicy ? { session_policy: sessionPolicy } : {}),
+      ...(deviceBinding ? { device_binding: deviceBinding } : {}),
     };
   }
 
@@ -2233,11 +2250,12 @@ export class ConsoleApiClient implements ConsoleApi {
     return this.getList<HelpRequest>("/help-requests", "requests", "list help requests");
   }
 
-  async acceptHelpRequest(requestId: string, opId?: string): Promise<StartedSession> {
+  async acceptHelpRequest(requestId: string, opId?: string, consolePubkey?: string): Promise<StartedSession> {
     const action = "accept the help request";
+    const reqBody = { ...(opId ? { op_id: opId } : {}), ...(consolePubkey ? { console_pubkey: consolePubkey } : {}) };
     const body = await this.request(`/help-requests/${encodeURIComponent(requestId)}/accept`, action, {
       method: "POST",
-      ...(opId ? { body: { op_id: opId } } : {}),
+      ...(Object.keys(reqBody).length ? { body: reqBody } : {}),
     });
     return this.parseStartedSession(body, action);
   }
@@ -2252,9 +2270,12 @@ export class ConsoleApiClient implements ConsoleApi {
     return this.pluckTransfer(body, "accept the transfer");
   }
 
-  async sessionTransferTicket(transferId: string): Promise<StartedSession> {
+  async sessionTransferTicket(transferId: string, consolePubkey?: string): Promise<StartedSession> {
     const action = "connect to the transferred session";
-    const body = await this.request(`/session-transfers/${encodeURIComponent(transferId)}/ticket`, action, { method: "POST" });
+    const body = await this.request(`/session-transfers/${encodeURIComponent(transferId)}/ticket`, action, {
+      method: "POST",
+      ...(consolePubkey ? { body: { console_pubkey: consolePubkey } } : {}),
+    });
     return this.parseStartedSession(body, action);
   }
 
@@ -2273,6 +2294,14 @@ export class ConsoleApiClient implements ConsoleApi {
       { method: "PATCH", body: { note } },
     );
     return this.pluck<SessionRecord>(body, "session", "set session note");
+  }
+
+  async reportSessionBindingFailed(sessionId: string, reason: BindingFailureReason): Promise<void> {
+    await this.request(
+      `/sessions/${encodeURIComponent(sessionId)}/binding-failed`,
+      "report the session verification failure",
+      { method: "POST", body: { reason } },
+    );
   }
 
   async listAudit(limit?: number, filter?: AuditListFilter): Promise<MgmtAuditEvent[]> {
@@ -3043,11 +3072,11 @@ export class ConsoleApiClient implements ConsoleApi {
     return this.pluck<AttendedSessionRecord>(body, "session", "get attended session");
   }
 
-  async connectAttendedSession(id: string): Promise<ConnectedAttendedSession> {
+  async connectAttendedSession(id: string, consolePubkey?: string): Promise<ConnectedAttendedSession> {
     const body = await this.request(
       `/attended-sessions/${encodeURIComponent(id)}/connect`,
       "connect attended session",
-      { method: "POST" },
+      { method: "POST", ...(consolePubkey ? { body: { console_pubkey: consolePubkey } } : {}) },
     );
     const session = this.pluck<AttendedSessionRecord>(body, "session", "connect attended session");
     const signaling = this.pluck<SessionSignaling>(body, "signaling", "connect attended session");
@@ -3056,7 +3085,13 @@ export class ConsoleApiClient implements ConsoleApi {
     // A malformed policy is an error rather than a silent drop — dropping it would run the session
     // unrestricted while the console believed a mandate was in force.
     const policy = parseSessionAccessPolicy(body, "connect attended session");
-    return policy ? { session, signaling, session_policy: policy } : { session, signaling };
+    const deviceBinding = parseDeviceBinding(body);
+    return {
+      session,
+      signaling,
+      ...(policy ? { session_policy: policy } : {}),
+      ...(deviceBinding ? { device_binding: deviceBinding } : {}),
+    };
   }
 
   async promoteAttendedSession(id: string): Promise<void> {

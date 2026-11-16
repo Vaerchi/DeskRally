@@ -222,6 +222,59 @@ pub trait ChallengeSigner: Send + Sync {
     fn sign(&self, preimage: &[u8]) -> [u8; 64];
 }
 
+/// Reads the certificate fingerprints of ONE connection's live DTLS association, for the docs/69
+/// session-binding transcript. Cloneable so the session loop can use it while it holds the transport.
+#[derive(Clone)]
+pub struct BindingSource {
+    pc: Arc<RTCPeerConnection>,
+}
+
+/// The two SHA-256 certificate fingerprints of a live DTLS association, as raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtlsFingerprints {
+    /// SHA-256 of THIS side's DER certificate.
+    pub local: [u8; 32],
+    /// SHA-256 of the DER certificate the peer presented on this association.
+    pub remote: [u8; 32],
+}
+
+impl BindingSource {
+    /// The fingerprints of the connection's (single, BUNDLEd) DTLS transport, or `None` when they are
+    /// not yet known or are ambiguous: no remote certificate yet, or the local side does not offer
+    /// exactly one SHA-256 fingerprint. Fails closed; the caller treats `None` as "cannot bind".
+    pub async fn fingerprints(&self) -> Option<DtlsFingerprints> {
+        let dtls = self.pc.dtls_transport();
+        let params = dtls.get_local_parameters().ok()?;
+        let mut sha256 = params.fingerprints.iter().filter(|f| f.algorithm.eq_ignore_ascii_case("sha-256"));
+        let local_fp = sha256.next()?;
+        if sha256.next().is_some() {
+            return None;
+        }
+        let local = parse_colon_hex_fingerprint(&local_fp.value)?;
+        let remote_der = dtls.get_remote_certificate().await;
+        if remote_der.is_empty() {
+            return None;
+        }
+        use sha2::Digest;
+        let remote: [u8; 32] = sha2::Sha256::digest(&remote_der).into();
+        Some(DtlsFingerprints { local, remote })
+    }
+}
+
+/// Parse an SDP-style fingerprint (`"AB:CD:..."`, 32 colon-separated hex bytes) into raw bytes.
+pub fn parse_colon_hex_fingerprint(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let mut n = 0;
+    for part in s.split(':') {
+        if n == 32 || part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        out[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    (n == 32).then_some(out)
+}
+
 /// Answer one `agent_auth_challenge`: build the `RMTAGENTAUTHv1` preimage for
 /// (device, tenant, nonce) and return the hex-encoded 64-byte signature to put on the wire.
 ///
@@ -425,6 +478,9 @@ pub struct WebRtcTransport {
     pc: Arc<RTCPeerConnection>,
     dc: Arc<RTCDataChannel>,
     inbound: mpsc::Receiver<Frame>,
+    /// Frames handed back by the session loop to be delivered BEFORE anything new (docs/69: frames
+    /// an enforcing agent held while unbound, released in arrival order once the session is bound).
+    replay: std::collections::VecDeque<Frame>,
     /// Agent side: the encoder thread's single, totally-ordered command queue. Frames and control
     /// commands (bitrate, chroma, keyframe) share it so a retarget lands cleanly *between* frames
     /// rather than racing one.
@@ -1025,6 +1081,7 @@ impl WebRtcTransport {
             pc,
             dc,
             inbound: inbound_rx,
+            replay: std::collections::VecDeque::new(),
             video_in,
             video_rate,
             audio_in,
@@ -1343,6 +1400,7 @@ impl WebRtcTransport {
             pc,
             dc,
             inbound: inbound_rx,
+            replay: std::collections::VecDeque::new(),
             video_in,
             video_rate,
             audio_in,
@@ -1473,6 +1531,20 @@ impl WebRtcTransport {
     /// [`Self::control_plane_session`].
     pub fn session_technician(&self) -> Option<uuid::Uuid> {
         self.session_technician
+    }
+
+    /// A cloneable handle for reading this connection's DTLS certificate fingerprints (docs/69
+    /// §3.3) from inside the session loop, which holds `&mut self`.
+    pub fn binding_source(&self) -> BindingSource {
+        BindingSource { pc: self.pc.clone() }
+    }
+
+    /// Hand frames back to be delivered by the next `recv_frame` calls, before anything new, in the
+    /// given order (docs/69: frames held while a session was unbound).
+    pub fn replay_frames(&mut self, frames: Vec<Frame>) {
+        for f in frames.into_iter().rev() {
+            self.replay.push_front(f);
+        }
     }
 
     /// TEST HOOK: open an ADDITIONAL data channel from this side of an established connection.
@@ -3373,6 +3445,10 @@ impl Transport for WebRtcTransport {
     /// Already-queued frames win over the closed signal (`biased` + the up-front drain), so a peer
     /// that sent a final frame and immediately hung up does not lose it.
     async fn recv_frame(&mut self) -> TransportResult<Frame> {
+        // docs/69: frames the session loop handed back come first, in the order they arrived.
+        if let Some(frame) = self.replay.pop_front() {
+            return Ok(frame);
+        }
         // Register for the wake-up BEFORE reading the flag (see `PeerGone::wait` for the lost-wake-up
         // window this closes); otherwise a peer that leaves between the two parks this call forever.
         let notify = self.peer_gone_notify.clone();

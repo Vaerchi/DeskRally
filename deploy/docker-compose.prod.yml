@@ -248,6 +248,8 @@ services:
       # SSO simply absent. This service gets its env only from these explicit keys, so a .env line
       # alone does nothing without this mapping.
       CP_TENANT_HOST_SUFFIX: "${CP_TENANT_HOST_SUFFIX:-}"
+      # docs/69 session binding: OFF unless "on" (empty = off). Turn on only once the agents answer binding.
+      CP_SESSION_BINDING: "${CP_SESSION_BINDING:-}"
       # docs/66 hostname theming is OPT-IN and OFF by default (CP_TENANT_HOST_SUFFIX alone never enables it). Set
       # CP_HOST_THEMING=on together with CP_EDGE_SECRET (>= 32 chars) and the Caddy X-DeskRally-Edge marker; the control
       # plane refuses to start with theming on and no secret. Uncomment to pass them through:

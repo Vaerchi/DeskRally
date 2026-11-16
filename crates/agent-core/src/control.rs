@@ -252,6 +252,38 @@ pub enum ControlMessage {
         /// longer than [`MAX_SIGNED_BLOB_BYTES`] (64 KiB).
         signed_policy: String,
     },
+    /// controller → agent (docs/69 §3.2, step 1): start binding this session. `grant` is the
+    /// control plane's `RMTBINDGv1` JSON (opaque here, size-bounded like other signed blobs);
+    /// `console_nonce` is 64 hex chars. Answered with [`ControlMessage::BindAgentProof`], or
+    /// [`ControlMessage::BindResult`] with `ok: false` when the grant does not verify.
+    BindStart {
+        /// The signed binding grant JSON.
+        grant: String,
+        /// The console's fresh nonce, hex.
+        console_nonce: String,
+    },
+    /// agent → controller (step 2): the agent's nonce and its device-key signature over the
+    /// `RMTSESSBINDv1` transcript with role 1.
+    BindAgentProof {
+        /// The agent's fresh nonce, hex.
+        agent_nonce: String,
+        /// Ed25519 signature, hex (128 chars).
+        sig: String,
+    },
+    /// controller → agent (step 3): the console-key signature over the transcript with role 2.
+    BindConsoleProof {
+        /// Ed25519 signature, hex (128 chars).
+        sig: String,
+    },
+    /// agent → controller (step 4): the binding outcome. Only after `ok: true` does an enforcing
+    /// agent send a picture or accept input.
+    BindResult {
+        /// Whether the console's proof verified.
+        ok: bool,
+        /// A short machine-readable reason when `ok` is false.
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// agent → controller (loop 79): a prior [`ControlMessage::InstallSessionPolicy`] verified and
     /// is now in force.
     ///
@@ -999,8 +1031,23 @@ pub fn decode(bytes: &[u8]) -> Result<ControlMessage, ControlCodecError> {
         ControlMessage::InstallGrant { signed_grant } => Some(signed_grant),
         ControlMessage::InstallSessionPolicy { signed_policy } => Some(signed_policy),
         ControlMessage::ElevatedRun { signed_elevation, .. } => Some(signed_elevation),
+        ControlMessage::BindStart { grant, .. } => Some(grant),
         _ => None,
     };
+    // docs/69: binding fields are fixed-length hex; refuse anything else at the codec.
+    let bind_fields: &[(&str, usize)] = match &msg {
+        ControlMessage::BindStart { console_nonce, .. } => &[(console_nonce.as_str(), 64)],
+        ControlMessage::BindAgentProof { agent_nonce, sig } => &[(agent_nonce.as_str(), 64), (sig.as_str(), 128)],
+        ControlMessage::BindConsoleProof { sig } => &[(sig.as_str(), 128)],
+        _ => &[],
+    };
+    for (field, len) in bind_fields {
+        if field.len() != *len || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(<ControlCodecError as serde::de::Error>::custom(format!(
+                "binding field must be {len} hex characters"
+            )));
+        }
+    }
     if let Some(blob) = signed_blob {
         if !is_valid_signed_blob(blob) {
             return Err(<ControlCodecError as serde::de::Error>::custom(format!(
@@ -1104,6 +1151,8 @@ pub fn observer_rule(msg: &ControlMessage) -> ObserverRule {
         ControlMessage::InstallGrant { .. }
         | ControlMessage::InstallSessionPolicy { .. }
         | ControlMessage::SetViewOnly { .. } => Allow,
+        // docs/69: an observer's connection is bound like any other (its own grant, its own key).
+        ControlMessage::BindStart { .. } | ControlMessage::BindConsoleProof { .. } => Allow,
         // Actuating; each handler refuses under view-only with its own reply (EndSession: the session
         // still ends, an uninstall is dropped).
         ControlMessage::SetInputBlocked { .. }
@@ -1152,7 +1201,9 @@ pub fn observer_rule(msg: &ControlMessage) -> ObserverRule {
         | ControlMessage::AdminRightsAvailable { .. }
         | ControlMessage::AdminRightsResult { .. }
         | ControlMessage::InputHandoffAvailable { .. }
-        | ControlMessage::InputControlChanged { .. } => Refuse,
+        | ControlMessage::InputControlChanged { .. }
+        | ControlMessage::BindAgentProof { .. }
+        | ControlMessage::BindResult { .. } => Refuse,
         // docs/53: an observer never raises a UAC prompt on the guest's screen.
         ControlMessage::RequestAdminRights => Refuse,
     }

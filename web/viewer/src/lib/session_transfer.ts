@@ -12,6 +12,7 @@
  */
 import type { ConsoleApi, SessionTransfer, StartedSession } from "./console_api";
 import type { BrokeredSession } from "./session_broker";
+import { createConsoleKey, type ConsoleKey } from "./session_binding";
 import { pageHidden, watchVisibility } from "./use_polling";
 
 /** Receiver poll cadence for new offers (docs/51 §5: matches the 10 s lease cadence; no push channel). */
@@ -48,7 +49,7 @@ export function transferFailureMessage(t: SessionTransfer): string {
 }
 
 /** Turn S2's ticket response into what the connect path takes. Throws when signaling is missing. */
-export function transferredSession(t: SessionTransfer, started: StartedSession): TransferredSession {
+export function transferredSession(t: SessionTransfer, started: StartedSession, key: ConsoleKey | null = null): TransferredSession {
   if (!started.signaling) throw new Error("The control plane returned no signaling for the transferred session.");
   return {
     deviceId: started.signaling.device_id,
@@ -59,6 +60,8 @@ export function transferredSession(t: SessionTransfer, started: StartedSession):
       signaling: started.signaling,
       ...(started.session_policy ? { sessionPolicy: started.session_policy } : {}),
       owned: true,
+      // docs/69: S2 is a new connection with its own key and grant.
+      binding: { key, device: started.device_binding },
     },
   };
 }
@@ -98,7 +101,8 @@ export async function acceptAndWait(
     if (opts.signal?.aborted) throw new Error("Stopped waiting for the hand-off.");
     t = await api.getSessionTransfer(transferId);
   }
-  return transferredSession(t, await api.sessionTransferTicket(transferId));
+  const key = await createConsoleKey();
+  return transferredSession(t, await api.sessionTransferTicket(transferId, key?.publicHex), key);
 }
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {

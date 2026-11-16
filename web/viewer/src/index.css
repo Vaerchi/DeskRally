@@ -3396,6 +3396,9 @@ select {
 .app__toolbar-end:empty { display: none; }
 .app__toolbar-end .viewer__disconnect { white-space: nowrap; }
 .app__toolbar-end .viewer__recording-indicator { color: var(--bad); white-space: nowrap; }
+/* docs/69 session binding mark: same footprint rules as the recording indicator. */
+.viewer__binding { white-space: nowrap; }
+.viewer__binding[data-state="unverified"], .viewer__binding[data-state="failed"] { color: var(--pending); }
 .app__toolbar-host { mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent); }
 @media (pointer: coarse) {
   .toolbar-menu__trigger, .app__session-select, .app__toolbar-end .viewer__disconnect { min-height: 40px; }

@@ -343,7 +343,8 @@ export class WebRTCTransport implements Transport {
   async connect(target: DeviceId, ticket?: SignedSessionTicket): Promise<void> {
     this.setState("signaling");
 
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    // docs/69 §3.3: ONE DTLS transport for everything (max-bundle), so the session's binding covers all of it.
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers, bundlePolicy: "max-bundle" });
     this.pc = pc;
     this.healthFailed = false;
     // A new attempt is brokered afresh and gets its own `ice_servers`: what the last one said about the
@@ -453,6 +454,13 @@ export class WebRTCTransport implements Transport {
       }
       case "sdp": {
         if (this.session !== msg.session) break;
+        // docs/69 §3.4: this console makes ONE offer per peer connection and applies ONE remote description.
+        // A second one is a renegotiation that could bring in a transport the binding never covered, so the
+        // connection fails instead (recovery builds a new peer connection, which binds afresh).
+        if (pc.remoteDescription) {
+          this.failConnectivity("The connection was renegotiated unexpectedly, so it was closed");
+          break;
+        }
         if (msg.kind === "answer") {
           // The agent answered our offer â€” apply it and let ICE finish connecting.
           await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
@@ -591,17 +599,42 @@ export class WebRTCTransport implements Transport {
     dc.send(buf);
   }
 
+  /** docs/69: while set, frames the predicate does not allow are held here instead of sent, so nothing
+   *  the technician does (input, clipboard, files, chat, tools, commands) reaches an unverified peer. */
+  private outboundHold: { allow: (frame: Frame) => boolean; queue: Frame[] } | null = null;
+
+  /** docs/69: start holding every outbound frame `allow` rejects. */
+  holdOutbound(allow: (frame: Frame) => boolean): void {
+    this.outboundHold = { allow, queue: [] };
+  }
+
+  /** docs/69: the peer is verified (or the session proceeds unverified under warn): send the held frames in order. */
+  releaseOutbound(): void {
+    const held = this.outboundHold?.queue ?? [];
+    this.outboundHold = null;
+    for (const f of held) this.enqueue(encodeFrame(f));
+  }
+
+  /** docs/69: the peer could not be verified: drop the held frames unsent. */
+  discardOutbound(): void {
+    if (this.outboundHold) this.outboundHold = { allow: () => false, queue: [] };
+  }
+
   send(channel: ChannelId, payload: Uint8Array): void {
     if (channel === ChannelId.Video) {
       throw new Error(`cannot send on ${channelName(channel)} (video is a media track, not framed)`);
     }
     // Mirror the Rust peer exactly: frame the payload and send it on the one "frames" channel.
-    this.enqueue(encodeFrame(makeFrame(channel, payload)));
+    this.sendFrame(makeFrame(channel, payload));
   }
 
   sendFrame(frame: Frame): void {
     if (frame.channel === ChannelId.Video) {
       throw new Error("cannot send a Video frame (video is a media track, not framed)");
+    }
+    if (this.outboundHold && !this.outboundHold.allow(frame)) {
+      this.outboundHold.queue.push(frame);
+      return;
     }
     this.enqueue(encodeFrame(frame));
   }
@@ -613,6 +646,11 @@ export class WebRTCTransport implements Transport {
    */
   async getStats(): Promise<RTCStatsReport | undefined> {
     return this.pc ? await this.pc.getStats() : undefined;
+  }
+
+  /** docs/69: the APPLIED local and remote SDP (the binding fallback for browsers without certificate stats). */
+  descriptions(): { local?: string | null; remote?: string | null } {
+    return { local: this.pc?.localDescription?.sdp ?? null, remote: this.pc?.remoteDescription?.sdp ?? null };
   }
 
   close(): void {

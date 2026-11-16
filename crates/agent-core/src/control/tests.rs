@@ -1510,3 +1510,46 @@ fn command_result_requires_all_fields() {
         "a missing `truncated` must be rejected"
     );
 }
+
+// docs/69: the binding messages round-trip and refuse anything but fixed-length hex.
+#[test]
+fn binding_messages_round_trip_and_refuse_bad_fields() {
+    let nonce = "ab".repeat(32);
+    let sig = "cd".repeat(64);
+    for msg in [
+        ControlMessage::BindStart { grant: "{\"claims\":{}}".into(), console_nonce: nonce.clone() },
+        ControlMessage::BindAgentProof { agent_nonce: nonce.clone(), sig: sig.clone() },
+        ControlMessage::BindConsoleProof { sig: sig.clone() },
+        ControlMessage::BindResult { ok: true, reason: None },
+        ControlMessage::BindResult { ok: false, reason: Some("bad_signature".into()) },
+    ] {
+        assert_eq!(decode(&encode(&msg)).unwrap(), msg);
+    }
+    for bad in [
+        format!(r#"{{"t":"BindStart","c":{{"grant":"x","console_nonce":"{}"}}}}"#, "ab".repeat(31)),
+        format!(r#"{{"t":"BindStart","c":{{"grant":"x","console_nonce":"{}"}}}}"#, "zz".repeat(32)),
+        format!(r#"{{"t":"BindAgentProof","c":{{"agent_nonce":"{nonce}","sig":"{}"}}}}"#, "cd".repeat(63)),
+        format!(r#"{{"t":"BindConsoleProof","c":{{"sig":"{}"}}}}"#, "cd".repeat(65)),
+        format!(
+            r#"{{"t":"BindStart","c":{{"grant":"{}","console_nonce":"{nonce}"}}}}"#,
+            "g".repeat(MAX_SIGNED_BLOB_BYTES + 1)
+        ),
+    ] {
+        assert!(decode(bad.as_bytes()).is_err(), "accepted: {}", &bad[..bad.len().min(80)]);
+    }
+    // A missing `reason` on BindResult decodes as None (the agent omits it on success).
+    assert_eq!(
+        decode(br#"{"t":"BindResult","c":{"ok":true}}"#).unwrap(),
+        ControlMessage::BindResult { ok: true, reason: None }
+    );
+}
+
+#[test]
+fn binding_messages_observer_rules() {
+    let nonce = "ab".repeat(32);
+    let sig = "cd".repeat(64);
+    assert_eq!(observer_rule(&ControlMessage::BindStart { grant: String::new(), console_nonce: nonce.clone() }), ObserverRule::Allow);
+    assert_eq!(observer_rule(&ControlMessage::BindConsoleProof { sig: sig.clone() }), ObserverRule::Allow);
+    assert_eq!(observer_rule(&ControlMessage::BindAgentProof { agent_nonce: nonce, sig }), ObserverRule::Refuse);
+    assert_eq!(observer_rule(&ControlMessage::BindResult { ok: true, reason: None }), ObserverRule::Refuse);
+}

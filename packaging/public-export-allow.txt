@@ -555,3 +555,13 @@ web/viewer/e2e/mobile_bar.mobile.spec.ts:credential-assignment-review
 web/viewer/e2e/mobile_bar.mobile.spec.ts:literal-credential
 web/viewer/src/lib/phone_typing.ts:connection-credential
 web/viewer/src/lib/phone_typing.ts:literal-credential
+# docs/69 session binding (2026-11-15, reviewed by Claude): Go/Rust golden vectors (patterned ids, RFC 8032 test
+# key, deterministic signature), transcript test bytes, and the live e2e spec's fixed grant seed and fixture login.
+agent/src/binding_grant.rs:long-base64
+agent/src/binding_grant.rs:long-hex
+control-plane/binding_grant_mint_test.go:long-base64
+control-plane/binding_grant_mint_test.go:long-hex
+crates/protocol/src/session_binding.rs:long-hex
+web/viewer/e2e/session_binding_live.spec.ts:credential-assignment-review
+web/viewer/e2e/session_binding_live.spec.ts:literal-credential
+web/viewer/e2e/session_binding_live.spec.ts:long-hex

@@ -15,6 +15,7 @@
 
 import { ConsoleApiError } from "./console_api";
 import type { ConsoleApi, SessionAccessPolicy, SessionSignaling } from "./console_api";
+import { createConsoleKey, type ConsoleKey, type SessionBindingMaterial } from "./session_binding";
 
 /** A control-plane-brokered session: the record id (for the end call) + signaling coordinates. */
 export interface BrokeredSession {
@@ -27,6 +28,9 @@ export interface BrokeredSession {
    *  owned exactly like one from `POST /sessions`, so it is renewed, ended on teardown and recovered.
    *  Absent = the ATTENDED hand-off, whose record the console deliberately does not own. */
   owned?: boolean;
+  /** docs/69: this connection's ephemeral console key and what the control plane returned for it.
+   *  Absent from paths that predate binding; the console then treats the session as unverified. */
+  binding?: SessionBindingMaterial;
 }
 
 /**
@@ -43,12 +47,15 @@ export async function acquireBrokeredSession(
   api: Pick<ConsoleApi, "startBrokeredSession">,
   deviceId: string,
   devMode = import.meta.env.DEV,
-  opts?: { access?: "view_only" },
+  opts?: { access?: "view_only"; createKey?: (() => Promise<ConsoleKey | null>) | null },
 ): Promise<BrokeredSession | null> {
   try {
-    const started = opts?.access
-      ? await api.startBrokeredSession(deviceId, undefined, opts)
-      : await api.startBrokeredSession(deviceId);
+    // `createKey: null` = this caller does not bind (no key, and no extra await before the start).
+    const key = opts?.createKey === null ? null : await (opts?.createKey ?? createConsoleKey)();
+    const started = await api.startBrokeredSession(deviceId, undefined, {
+      ...(opts?.access ? { access: opts.access } : {}),
+      ...(key ? { consolePubkey: key.publicHex } : {}),
+    });
     if (!started.signaling) {
       // Dev/test: CP has no issuer configured — fall through to direct-connect.
       // Production: a missing signaling envelope is unexpected and must be surfaced immediately;
@@ -60,6 +67,7 @@ export async function acquireBrokeredSession(
       sessionId: started.session.id,
       signaling: started.signaling,
       sessionPolicy: started.session_policy,
+      binding: { key, device: started.device_binding },
     };
   } catch (e) {
     // 403 Forbidden: authenticated but NOT authorized for this specific device (cross-tenant,

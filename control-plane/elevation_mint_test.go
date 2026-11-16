@@ -238,6 +238,7 @@ func TestDomainTagsArePairwiseDistinct(t *testing.T) {
 		"mgmt audit":     mgmtAuditDomainTag,
 		"update":         updateDomainTag,
 		"update v2":      updateDomainTagV2,
+		"binding grant":  bindingGrantDomainTag,
 	}
 	for aName, a := range tags {
 		if len(a) != 12 {

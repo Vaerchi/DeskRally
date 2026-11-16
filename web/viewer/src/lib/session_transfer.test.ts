@@ -42,6 +42,8 @@ describe("acceptAndWait", () => {
     expect(got.signalingUrl).toBe("wss://sig");
     expect(got.brokered).toEqual({
       sessionId: "s2", signaling: started.signaling, sessionPolicy: started.session_policy, owned: true,
+      // docs/69: S2 carries its own console key (and whatever binding material the server returned).
+      binding: { key: expect.objectContaining({ publicHex: expect.stringMatching(/^[0-9a-f]{64}$/) }), device: started.device_binding },
     });
   });
 

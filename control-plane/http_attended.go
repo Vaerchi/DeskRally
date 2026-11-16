@@ -157,6 +157,17 @@ func (s *Server) handleGetAttended(w http.ResponseWriter, r *http.Request) {
 // has consented (MarkActive enforces consented/active, else ErrAttendedNotConsented → 409).
 func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 	p := principalFrom(r.Context())
+	// docs/69: the console may send its ephemeral session key; older consoles send no body. Refused
+	// before MarkActive so a malformed key changes no state.
+	var keyBody consoleKeyBody
+	if r.ContentLength != 0 {
+		if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &keyBody, "malformed attended connect body"); err != nil {
+			return
+		}
+	}
+	if refuseMalformedConsoleKey(w, keyBody.ConsolePubkey) {
+		return
+	}
 	sess, err := s.Attended.Get(r.Context(), p.TenantID, r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, ErrAttendedNotFound) {
@@ -350,6 +361,17 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 			}
 			policyAccess, groupEnforces = string(access), groupPolicy.EnforceViewOnly
 		}
+	}
+	// docs/69: bind this session to the guest's key pinned at redemption. The grant's level is the
+	// policy's when one was minted, else control (what an unfloored attended session gets).
+	bindAccess := SessionAccessControl
+	if policyAccess != "" {
+		bindAccess = SessionAccessLevel(policyAccess)
+	}
+	if refusal := s.attachDeviceBinding(resp, active.ID, active.DeviceID, active.AgentPubkey, p.UserID, p.TenantID,
+		bindAccess, keyBody.ConsolePubkey, now); refusal != nil {
+		refusal.write(w)
+		return
 	}
 	// AUDIT LAST, and audit the OUTCOME. Two things were wrong with recording this before the mint.
 	//

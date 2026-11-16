@@ -45,6 +45,9 @@ pub struct EnrolledIdentity {
     /// docs/65 D-C3: the control plane's directive public key from the redeem response (`directive_pubkey`, top level, present only
     /// when the control plane has directives enabled). Pinned into the config set-if-blank by [`apply_enrollment`]; `None` when absent.
     pub directive_pubkey: Option<String>,
+    /// docs/69 §3.7: the control plane's GRANT issuer key (`grant_issuer_pubkey`, top level), which signs session
+    /// policies, backstage grants and binding grants. Pinned set-if-blank; `None` when absent (an older control plane).
+    pub grant_issuer_pubkey: Option<String>,
 }
 
 /// True when this agent is control-plane managed, has an enrollment token, and has not yet been
@@ -88,6 +91,91 @@ pub fn redeem_url(base: &str) -> String {
     format!("{}{REDEEM_PATH}", base.trim().trim_end_matches('/'))
 }
 
+/// docs/69 §3.7 step 2: the public route an installed agent with no pinned grant issuer key fetches it from.
+pub const GRANT_ISSUER_PATH: &str = "/agent/grant-issuer-pubkey";
+
+/// The fetch URL for the grant issuer key under `base` (same joining rule as [`redeem_url`]).
+pub fn grant_issuer_url(base: &str) -> String {
+    format!("{}{GRANT_ISSUER_PATH}", base.trim().trim_end_matches('/'))
+}
+
+/// Read and validate the key from the `GET /agent/grant-issuer-pubkey` body.
+pub fn parse_grant_issuer_response(body: &str) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("grant issuer response is not JSON: {e}"))?;
+    let raw = v
+        .get("grant_issuer_pubkey")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "grant issuer response has no grant_issuer_pubkey".to_string())?;
+    crate::directive_pin::normalize(raw).map_err(|e| format!("grant issuer key is malformed: {e}"))
+}
+
+/// docs/69 §3.7 step 2: an ENROLLED agent with no pinned grant issuer key fetches it ONCE per start from its own
+/// control plane over TLS and pins it (set-if-blank; a pin is never replaced). This trusts the control plane's TLS
+/// identity, which the agent already trusts for enrollment and updates. `Ok(true)` when a key was pinned.
+pub fn fetch_grant_issuer_pin_if_missing(cfg: &mut HelperConfig, config_path: &str) -> Result<bool, String> {
+    if cfg.grant_issuer_pubkey.as_deref().is_some_and(|k| !k.trim().is_empty()) || cfg.device_id.is_none() {
+        return Ok(false);
+    }
+    let Some(base) = cfg.control_plane_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string) else {
+        return Ok(false);
+    };
+    validate_control_plane_url(&base)?;
+    // NO redirects (Codex 1.3.30 release review): only the validated control-plane URL may supply the key; a 3xx is a
+    // failure, never a hop to another scheme or origin.
+    let client = reqwest::blocking::Client::builder()
+        .use_preconfigured_tls(rmt_transport_webrtc::tls_trust::client_config()?)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REDEEM_TIMEOUT)
+        .build()
+        .map_err(|e| format!("grant issuer pin: could not build HTTP client: {e}"))?;
+    let resp = client
+        .get(grant_issuer_url(&base))
+        .send()
+        .map_err(|e| format!("grant issuer pin: GET {base}{GRANT_ISSUER_PATH} failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("grant issuer pin: control plane returned {status}"));
+    }
+    let key = parse_grant_issuer_response(&text)?;
+    // Edit the RAW document (fields this version does not model survive) and replace it ATOMICALLY: an interrupted
+    // write must never leave a truncated config, which would take an enrolled agent out of service.
+    if !pin_grant_issuer_in_file(config_path, &key)? {
+        return Ok(false); // a pin appeared on disk meanwhile; it is kept
+    }
+    cfg.grant_issuer_pubkey = Some(key);
+    Ok(true)
+}
+
+/// Set-if-blank `grant_issuer_pubkey` in the config FILE: read the raw JSON, insert the key only when absent or blank,
+/// write a temp file beside it (inheriting the hardened directory's DACL), flush it to disk, and rename it over the
+/// config. `Ok(false)` when a non-blank pin is already there (nothing written).
+pub fn pin_grant_issuer_in_file(config_path: &str, key: &str) -> Result<bool, String> {
+    let text = std::fs::read_to_string(config_path).map_err(|e| format!("grant issuer pin: read {config_path}: {e}"))?;
+    let mut value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("grant issuer pin: {config_path} is not JSON: {e}"))?;
+    let obj = value.as_object_mut().ok_or_else(|| format!("grant issuer pin: {config_path} is not a JSON object"))?;
+    if obj.get("grant_issuer_pubkey").and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(false);
+    }
+    obj.insert("grant_issuer_pubkey".into(), key.into());
+    let data = serde_json::to_string_pretty(&value).map_err(|e| format!("grant issuer pin: encode: {e}"))?;
+    let tmp = format!("{config_path}.pin-{}.tmp", std::process::id());
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, config_path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("grant issuer pin: could not replace {config_path}: {e}")
+    })?;
+    Ok(true)
+}
+
 /// Parse a `201` redemption body and assert it describes *our* key.
 ///
 /// `our_pubkey` is this agent's own hex public key. A control plane that answers with a different
@@ -123,7 +211,12 @@ pub fn parse_redeem_response(body: &str, our_pubkey: &str) -> Result<EnrolledIde
         .and_then(|x| x.as_str())
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty());
-    Ok(EnrolledIdentity { device_id, tenant_id, directive_pubkey })
+    let grant_issuer_pubkey = v
+        .get("grant_issuer_pubkey")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    Ok(EnrolledIdentity { device_id, tenant_id, directive_pubkey, grant_issuer_pubkey })
 }
 
 /// Load the Ed25519 identity seed at `path`, or generate + persist a fresh one.
@@ -518,6 +611,20 @@ pub fn apply_enrollment(cfg: &mut HelperConfig, enrolled: &EnrolledIdentity) {
     cfg.device_id = Some(enrolled.device_id.clone());
     cfg.tenant_id = Some(enrolled.tenant_id.clone());
     cfg.enrollment_token = None;
+    // docs/69 §3.7: pin the grant issuer key FIRST (set-if-blank; an installer-provided pin is never replaced), so the
+    // directive pin below can check it is a different key. The enrollment token authenticated this exchange over the
+    // control plane's TLS; a malformed key leaves the agent unpinned, which is the safe failure.
+    if let Some(key) = enrolled.grant_issuer_pubkey.as_deref() {
+        let blank = cfg.grant_issuer_pubkey.as_deref().map_or(true, |k| k.trim().is_empty());
+        match (blank, crate::directive_pin::normalize(key)) {
+            (true, Ok(norm)) => {
+                cfg.grant_issuer_pubkey = Some(norm);
+                tracing::info!("enroll: grant issuer public key pinned");
+            }
+            (true, Err(e)) => tracing::warn!(error = %e, "enroll: the control plane's grant issuer key is malformed; not pinned"),
+            (false, _) => tracing::info!("enroll: a grant issuer key is already pinned; kept"),
+        }
+    }
     if let Some(key) = enrolled.directive_pubkey.as_deref() {
         // Set-if-blank, dedicated-key rule: a malformed or shared key leaves the agent without a pin (it then refuses every
         // directive), which is the safe failure; enrollment itself must not fail over it.
@@ -702,6 +809,7 @@ mod tests {
                 device_id: "dev-1".into(),
                 tenant_id: "ten-1".into(),
                 directive_pubkey: None,
+                grant_issuer_pubkey: None,
             },
         );
         assert_eq!(cfg.device_id.as_deref(), Some("dev-1"));
@@ -721,7 +829,7 @@ mod tests {
         };
         apply_enrollment(
             &mut cfg,
-            &EnrolledIdentity { device_id: "dev-1".into(), tenant_id: "ten-1".into(), directive_pubkey: None },
+            &EnrolledIdentity { device_id: "dev-1".into(), tenant_id: "ten-1".into(), directive_pubkey: None, grant_issuer_pubkey: None },
         );
         cfg.save_to(&path).unwrap();
         let mut back = HelperConfig::load_from(&path).expect("reload");
@@ -831,7 +939,7 @@ mod tests {
         let mut cfg = HelperConfig { grant_issuer_pubkey: Some(DIRECTIVE_KEY.into()), ..Default::default() };
         apply_enrollment(
             &mut cfg,
-            &EnrolledIdentity { device_id: "d".into(), tenant_id: "t".into(), directive_pubkey: Some(DIRECTIVE_KEY.into()) },
+            &EnrolledIdentity { device_id: "d".into(), tenant_id: "t".into(), directive_pubkey: Some(DIRECTIVE_KEY.into()), grant_issuer_pubkey: None },
         );
         assert_eq!(cfg.device_id.as_deref(), Some("d"));
         assert!(cfg.directive_pubkey.is_none(), "a shared key must leave the agent unpinned (refusing every directive)");
@@ -1122,5 +1230,88 @@ mod identity_acl_tests {
             after.contains("BUILTIN\\Administrators") || after.contains("S-1-5-32-544"),
             "Administrators was not granted:\n{after}"
         );
+    }
+}
+
+#[cfg(test)]
+mod grant_issuer_pin_tests {
+    use super::*;
+
+    const GRANT_KEY: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+    const OTHER: &str = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+
+    fn enrolled(key: Option<&str>) -> EnrolledIdentity {
+        EnrolledIdentity {
+            device_id: "d".into(),
+            tenant_id: "t".into(),
+            directive_pubkey: None,
+            grant_issuer_pubkey: key.map(str::to_string),
+        }
+    }
+
+    // docs/69 §3.7: enrollment pins the grant issuer key when none is pinned, and never replaces one.
+    #[test]
+    fn the_grant_issuer_key_is_pinned_set_if_blank() {
+        let mut cfg = HelperConfig::default();
+        apply_enrollment(&mut cfg, &enrolled(Some(&GRANT_KEY.to_uppercase())));
+        assert_eq!(cfg.grant_issuer_pubkey.as_deref(), Some(GRANT_KEY), "pinned, normalised to lowercase");
+
+        let mut cfg = HelperConfig { grant_issuer_pubkey: Some(OTHER.into()), ..Default::default() };
+        apply_enrollment(&mut cfg, &enrolled(Some(GRANT_KEY)));
+        assert_eq!(cfg.grant_issuer_pubkey.as_deref(), Some(OTHER), "an installer-provided pin is kept");
+
+        let mut cfg = HelperConfig::default();
+        apply_enrollment(&mut cfg, &enrolled(Some("not-a-key")));
+        assert!(cfg.grant_issuer_pubkey.is_none(), "a malformed key leaves the agent unpinned");
+        assert_eq!(cfg.device_id.as_deref(), Some("d"), "and enrollment still succeeds");
+    }
+
+    #[test]
+    fn the_grant_issuer_fetch_url_and_response_are_strict() {
+        assert_eq!(grant_issuer_url("https://cp.example/"), "https://cp.example/agent/grant-issuer-pubkey");
+        assert_eq!(parse_grant_issuer_response(&format!(r#"{{"grant_issuer_pubkey":"{}"}}"#, GRANT_KEY.to_uppercase())).unwrap(), GRANT_KEY);
+        assert!(parse_grant_issuer_response(r#"{"grant_issuer_pubkey":"short"}"#).is_err());
+        assert!(parse_grant_issuer_response(r#"{}"#).is_err());
+        assert!(parse_grant_issuer_response("not json").is_err());
+    }
+
+    #[test]
+    fn the_fetch_does_nothing_for_a_pinned_or_unenrolled_agent() {
+        // No network is touched on these paths (no control_plane_url would even be needed).
+        let mut pinned = HelperConfig {
+            grant_issuer_pubkey: Some(OTHER.into()),
+            device_id: Some("d".into()),
+            control_plane_url: Some("https://cp.invalid".into()),
+            ..Default::default()
+        };
+        assert_eq!(fetch_grant_issuer_pin_if_missing(&mut pinned, "unused.json"), Ok(false));
+        let mut unenrolled = HelperConfig { control_plane_url: Some("https://cp.invalid".into()), ..Default::default() };
+        assert_eq!(fetch_grant_issuer_pin_if_missing(&mut unenrolled, "unused.json"), Ok(false));
+        let mut unmanaged = HelperConfig { device_id: Some("d".into()), ..Default::default() };
+        assert_eq!(fetch_grant_issuer_pin_if_missing(&mut unmanaged, "unused.json"), Ok(false));
+    }
+
+    #[test]
+    fn the_file_pin_is_set_if_blank_keeps_unknown_fields_and_never_truncates() {
+        let dir = std::env::temp_dir().join(format!("rmt-gi-pin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, r#"{"device_id":"d","future_field":{"x":1}}"#).unwrap();
+        assert_eq!(pin_grant_issuer_in_file(p, GRANT_KEY), Ok(true));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["grant_issuer_pubkey"], GRANT_KEY);
+        assert_eq!(v["future_field"]["x"], 1, "a field this version does not model survives");
+        // An existing pin is kept and nothing is written.
+        assert_eq!(pin_grant_issuer_in_file(p, OTHER), Ok(false));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["grant_issuer_pubkey"], GRANT_KEY);
+        // A file that is not JSON is refused and left exactly as it was (no truncation, no temp left behind).
+        std::fs::write(&path, "not json").unwrap();
+        assert!(pin_grant_issuer_in_file(p, GRANT_KEY).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "only config.json remains: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

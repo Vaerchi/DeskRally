@@ -353,6 +353,8 @@ func (s *Server) handleListHelpRequests(w http.ResponseWriter, r *http.Request) 
 
 type acceptHelpBody struct {
 	OpID string `json:"op_id"`
+	// ConsolePubkey is the console's ephemeral session key (docs/69); empty from older consoles.
+	ConsolePubkey string `json:"console_pubkey,omitempty"`
 }
 
 func (b *acceptHelpBody) UnmarshalJSON(raw []byte) error {
@@ -384,6 +386,9 @@ func (s *Server) handleAcceptHelpRequest(w http.ResponseWriter, r *http.Request)
 		if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &body, "malformed accept body"); err != nil {
 			return
 		}
+	}
+	if refuseMalformedConsoleKey(w, body.ConsolePubkey) {
+		return
 	}
 	opID := strings.TrimSpace(body.OpID)
 	if opID == "" {
@@ -537,7 +542,7 @@ func (s *Server) handleAcceptHelpRequest(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	resp, brokerRefusal := s.brokerSessionStart(rec, m, p.UserID, p.TenantID, adm.GroupPolicy)
+	resp, brokerRefusal := s.brokerSessionStart(rec, m, p.UserID, p.TenantID, adm.GroupPolicy, body.ConsolePubkey)
 	if brokerRefusal != nil {
 		brokerRefusal.write(w)
 		return

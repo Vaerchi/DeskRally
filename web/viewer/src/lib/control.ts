@@ -305,6 +305,12 @@ export type ControlMessage =
   // uses for backstage grants (they are told apart by a domain tag inside the signed bytes, not a second
   // key). Answered with `SessionPolicyInstalled`, or `Error` if it does not verify.
   | { t: "InstallSessionPolicy"; c: { signed_policy: string } }
+  // docs/69 session binding (hex for every binary field). console → agent: start, then the console's
+  // proof; agent → console: its proof, then the outcome.
+  | { t: "BindStart"; c: { grant: string; console_nonce: string } }
+  | { t: "BindAgentProof"; c: { agent_nonce: string; sig: string } }
+  | { t: "BindConsoleProof"; c: { sig: string } }
+  | { t: "BindResult"; c: { ok: boolean; reason: string | null } }
   // Loops 79/80: agent → controller ack. `access` is the level the POLICY carried; `view_only` is the
   // session's EFFECTIVE input state afterwards, which can differ — the agent applies a policy as a
   // one-way RATCHET, so a stricter policy already in force (or the technician's own toggle) still wins.
@@ -557,6 +563,18 @@ export function encodeControl(msg: ControlMessage): Uint8Array {
       break;
     case "InstallSessionPolicy":
       obj = { t: msg.t, c: { signed_policy: msg.c.signed_policy } };
+      break;
+    case "BindStart":
+      obj = { t: msg.t, c: { grant: msg.c.grant, console_nonce: msg.c.console_nonce } };
+      break;
+    case "BindAgentProof":
+      obj = { t: msg.t, c: { agent_nonce: msg.c.agent_nonce, sig: msg.c.sig } };
+      break;
+    case "BindConsoleProof":
+      obj = { t: msg.t, c: { sig: msg.c.sig } };
+      break;
+    case "BindResult":
+      obj = { t: msg.t, c: { ok: msg.c.ok, reason: msg.c.reason } };
       break;
     case "SessionPolicyInstalled":
       obj = { t: msg.t, c: { access: msg.c.access, view_only: msg.c.view_only, allow_recording: msg.c.allow_recording, require_recording: msg.c.require_recording, max_session_duration_seconds: msg.c.max_session_duration_seconds } };
@@ -885,6 +903,26 @@ export function decodeControl(bytes: Uint8Array): ControlMessage {
       const c = obj.c as { signed_policy?: unknown } | undefined;
       if (!c || typeof c.signed_policy !== "string") throw new Error("malformed InstallSessionPolicy");
       return { t: "InstallSessionPolicy", c: { signed_policy: c.signed_policy } };
+    }
+    case "BindStart": {
+      const c = obj.c as { grant?: unknown; console_nonce?: unknown } | undefined;
+      if (!c || typeof c.grant !== "string" || !isHexOfLength(c.console_nonce, 64)) throw new Error("malformed BindStart");
+      return { t: "BindStart", c: { grant: c.grant, console_nonce: c.console_nonce } };
+    }
+    case "BindAgentProof": {
+      const c = obj.c as { agent_nonce?: unknown; sig?: unknown } | undefined;
+      if (!c || !isHexOfLength(c.agent_nonce, 64) || !isHexOfLength(c.sig, 128)) throw new Error("malformed BindAgentProof");
+      return { t: "BindAgentProof", c: { agent_nonce: c.agent_nonce, sig: c.sig } };
+    }
+    case "BindConsoleProof": {
+      const c = obj.c as { sig?: unknown } | undefined;
+      if (!c || !isHexOfLength(c.sig, 128)) throw new Error("malformed BindConsoleProof");
+      return { t: "BindConsoleProof", c: { sig: c.sig } };
+    }
+    case "BindResult": {
+      const c = obj.c as { ok?: unknown; reason?: unknown } | undefined;
+      if (!c || typeof c.ok !== "boolean") throw new Error("malformed BindResult");
+      return { t: "BindResult", c: { ok: c.ok, reason: typeof c.reason === "string" ? c.reason : null } };
     }
     case "SessionPolicyInstalled": {
       const c = obj.c as { access?: unknown; view_only?: unknown; allow_recording?: unknown; require_recording?: unknown; max_session_duration_seconds?: unknown } | undefined;
@@ -1302,6 +1340,20 @@ export const installGrant = (signedGrant: string): ControlMessage => ({
   c: { signed_grant: signedGrant },
 });
 
+/** True for a string of exactly `len` hex characters (docs/69 binding fields). */
+export function isHexOfLength(v: unknown, len: number): v is string {
+  return typeof v === "string" && v.length === len && /^[0-9a-fA-F]+$/.test(v);
+}
+
+/** docs/69 step 1: start binding this session. */
+export const bindStart = (grant: string, consoleNonceHex: string): ControlMessage => ({
+  t: "BindStart",
+  c: { grant, console_nonce: consoleNonceHex },
+});
+
+/** docs/69 step 3: the console's proof. */
+export const bindConsoleProof = (sigHex: string): ControlMessage => ({ t: "BindConsoleProof", c: { sig: sigHex } });
+
 /** Install a control-plane-signed session access policy (loops 79/80). `signedPolicy` is the
  *  `SignedSessionPolicy` JSON exactly as `POST /sessions` returned it — forwarded verbatim, never
  *  re-serialized, because the signature covers the claims and the agent re-derives them from these bytes. */
@@ -1603,6 +1655,8 @@ export class ControlClient {
    *  `requireRecording` (loop 89/0044) is whether recording is mandatory; default false when absent.
    *  `maxSessionDurationSeconds` (loop 90/0045) is the hard time limit; 0 = unlimited; default 0 when absent. */
   private readonly onSessionPolicyInstalled?: (access: string, viewOnly: boolean, allowRecording: boolean, requireRecording: boolean, maxSessionDurationSeconds: number) => void;
+  private readonly onBindAgentProof?: (agentNonceHex: string, sigHex: string) => void;
+  private readonly onBindResult?: (ok: boolean, reason: string | null) => void;
   /** Optional callback fired when the agent says this session runs on a control-plane LEASE that the
    *  console must keep renewing (docs/25 F03). `renewWithinMs` is how long the agent will still wait
    *  for the FIRST lease; it counts down across re-announcements and is never extended.
@@ -1641,6 +1695,10 @@ export class ControlClient {
       onSessionEnding?: (uninstall: boolean) => void;
       onSessionEndedByGuest?: () => void;
       onSessionPolicyInstalled?: (access: string, viewOnly: boolean, allowRecording: boolean, requireRecording: boolean, maxSessionDurationSeconds: number) => void;
+      /** docs/69: the agent's binding proof (step 2). */
+      onBindAgentProof?: (agentNonceHex: string, sigHex: string) => void;
+      /** docs/69: the agent's verdict on the console's proof (step 4). */
+      onBindResult?: (ok: boolean, reason: string | null) => void;
       onSessionLeaseRequired?: (renewWithinMs: number) => void;
       onTransferDir?: (path: string) => void;
       onAdminRightsAvailable?: (available: boolean, reason: string | null) => void;
@@ -1659,6 +1717,8 @@ export class ControlClient {
     this.onGrantInstalled = handlers.onGrantInstalled;
     this.onBackstageFeatures = handlers.onBackstageFeatures;
     this.onSessionPolicyInstalled = handlers.onSessionPolicyInstalled;
+    this.onBindAgentProof = handlers.onBindAgentProof;
+    this.onBindResult = handlers.onBindResult;
     this.onSessionLeaseRequired = handlers.onSessionLeaseRequired;
     this.onQualityApplied = handlers.onQualityApplied;
     this.onQualityStats = handlers.onQualityStats;
@@ -1708,6 +1768,16 @@ export class ControlClient {
    *  `onSessionPolicyInstalled`, or replies `Error` if it does not verify. */
   installSessionPolicy(signedPolicy: string): void {
     this.send(encodeControl(installSessionPolicy(signedPolicy)));
+  }
+
+  /** docs/69 step 1. */
+  sendBindStart(grant: string, consoleNonceHex: string): void {
+    this.send(encodeControl(bindStart(grant, consoleNonceHex)));
+  }
+
+  /** docs/69 step 3. */
+  sendBindConsoleProof(sigHex: string): void {
+    this.send(encodeControl(bindConsoleProof(sigHex)));
   }
 
   /** Ask the agent to enumerate its monitors. The reply arrives via {@link handleMessage}. */
@@ -1966,6 +2036,12 @@ export class ControlClient {
         break;
       case "SessionPolicyInstalled":
         this.onSessionPolicyInstalled?.(msg.c.access, msg.c.view_only, msg.c.allow_recording, msg.c.require_recording, msg.c.max_session_duration_seconds);
+        break;
+      case "BindAgentProof":
+        this.onBindAgentProof?.(msg.c.agent_nonce, msg.c.sig);
+        break;
+      case "BindResult":
+        this.onBindResult?.(msg.c.ok, msg.c.reason);
         break;
       case "SessionLeaseRequired":
         this.onSessionLeaseRequired?.(msg.c.renew_within_ms);

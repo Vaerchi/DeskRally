@@ -80,6 +80,7 @@ function fixture(policy = true) {
   const control = {
     installSessionPolicy: vi.fn<(signed: string) => void>(),
     runCommand: vi.fn<ControlClient["runCommand"]>(), handleMessage: vi.fn(),
+    sendBindStart: vi.fn(), sendBindConsoleProof: vi.fn(),
   };
   const transport = {
     kind: "webrtc" as const, state: "idle" as const,
@@ -94,6 +95,9 @@ function fixture(policy = true) {
     now: () => Date.now(),
     setTimer: (fn, ms) => setTimeout(fn, ms) as unknown as number,
     clearTimer: (handle) => clearTimeout(handle), onAuditError: vi.fn(),
+    // docs/69: these tests drive the core on fake timers; WebCrypto key generation would not settle.
+    // The binding exchange itself is covered in session_binding.test.ts.
+    createKey: null,
   };
   const cores: BrokeredSessionCore[] = [];
   const open = (opts?: Parameters<typeof BrokeredSessionCore.open>[2]) => {
@@ -272,6 +276,26 @@ describe("BrokeredSessionCore readiness and ownership", () => {
     await rejected;
     expect(f.api.endSession).toHaveBeenCalledExactlyOnceWith("session-1");
     expect(f.signaling.close).toHaveBeenCalledOnce();
+  });
+
+  it("docs/69: under require, a machine that does not prove itself runs nothing", async () => {
+    const f = setup();
+    f.api.startBrokeredSession.mockResolvedValue({
+      ...f.started,
+      // The transcript binds the control-plane session id as a UUID.
+      session: { id: "11111111-1111-4111-8111-111111111111" } as StartedSession["session"],
+      device_binding: { mode: "require", device_pubkey: "ab".repeat(32), grant: "{}" },
+    });
+    f.deps.createKey = async () => ({ publicHex: "cd".repeat(32), sign: async () => new Uint8Array(64) });
+    const opening = f.open();
+    const rejected = expect(opening).rejects.toMatchObject({ phase: "binding" });
+    await drain(); f.events.onChannelOpen?.();
+    await vi.advanceTimersByTimeAsync(5000); // the agent never answers BindStart
+    await rejected;
+    expect(f.control.sendBindStart).toHaveBeenCalledOnce();
+    expect(f.api.startBrokeredSession).toHaveBeenCalledWith("device-1", expect.anything(), { consolePubkey: "cd".repeat(32) });
+    expect(f.control.runCommand).not.toHaveBeenCalled();
+    expect(f.api.endSession).toHaveBeenCalledOnce();
   });
 
   it("rejects a policy installation error before readiness", async () => {

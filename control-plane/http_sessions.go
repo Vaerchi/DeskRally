@@ -193,6 +193,8 @@ type startSessionRequest struct {
 	// omitempty: Go callers (tests, tools) that leave Access unset send no field, which means control.
 	// A PRESENT empty string is still refused by startSessionAccess.UnmarshalJSON.
 	Access startSessionAccess `json:"access,omitempty"`
+	// ConsolePubkey is the console's ephemeral session key (docs/69); empty from older consoles.
+	ConsolePubkey string `json:"console_pubkey,omitempty"`
 }
 
 // compensationContext is for compensating writes that undo a partial success after a later failure.
@@ -220,6 +222,9 @@ func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 	// Require(CapStartSession) pre-check would refuse a read-only caller before the read entirely, but
 	// that is a change to the authorization model rather than to the body bound, and is not made here.
 	if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &req, "malformed start-session request body"); err != nil {
+		return
+	}
+	if refuseMalformedConsoleKey(w, req.ConsolePubkey) {
 		return
 	}
 	if req.MachineID == "" {
@@ -282,7 +287,7 @@ func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not record audit event")
 		return
 	}
-	resp, brokerRefusal := s.brokerSessionStart(rec, m, p.UserID, p.TenantID, groupPolicy)
+	resp, brokerRefusal := s.brokerSessionStart(rec, m, p.UserID, p.TenantID, groupPolicy, req.ConsolePubkey)
 	if brokerRefusal != nil {
 		// The deferred compensation above ends the record just created, so a refusal never strands a seat.
 		brokerRefusal.write(w)
