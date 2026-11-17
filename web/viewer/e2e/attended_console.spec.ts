@@ -258,6 +258,9 @@ test("console UI: start attended → code shown → Connect gated on consent →
   expect(inbound, "no inbound-rtp video over the console-driven attended session").not.toBeNull();
   expect(inbound!.bytesReceived ?? 0).toBeGreaterThan(0);
   expect(inbound!.packetsReceived ?? 0).toBeGreaterThan(0);
+  // docs/69: the guest ENFORCES binding (attended path), so video can only flow after the console's proof verified.
+  expect(guestLog, "the enforcing guest must have bound the console-driven session").toContain("console verified; the session is bound");
+  await expect(page.getByTestId("session-binding-status")).toHaveAttribute("data-state", "verified");
 
   await page.close();
 });

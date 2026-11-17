@@ -75,6 +75,9 @@ pub enum Failure {
     /// The session ended (the technician closed it, or the connection dropped). Single-shot: a new
     /// code is needed to start again.
     SessionEnded,
+    /// docs/69: the technician's side never proved it was the console this session was created for (an old page,
+    /// or someone in between, or an exchange out of order after binding), so the session was stopped. The copy makes no claim about what was or was not shared: a session can be stopped after it had bound (Codex attend r2).
+    ConnectionNotConfirmed,
     /// The machine's policy blocked the client (Smart App Control, AppLocker, WDAC, an ASR rule).
     /// The canonical wording for the technician script and the page; there may be no bypass.
     BlockedByPolicy,
@@ -170,6 +173,11 @@ pub fn message(failure: &Failure) -> SupportMessage {
             Some("If you're connected over Remote Desktop, sign in at the physical machine and \
                   try again."),
         ),
+        Failure::ConnectionNotConfirmed => msg(
+            "Session stopped",
+            "The technician's connection could not be confirmed, so the session was stopped.",
+            Some("Ask the technician to reload their DeskRally page and give you a new code."),
+        ),
         Failure::AlreadyRunning => msg(
             "Already open",
             "The support client is already running on this computer.",
@@ -262,6 +270,7 @@ mod tests {
             Failure::CaptureUnavailable,
             Failure::AlreadyRunning,
             Failure::SessionEnded,
+            Failure::ConnectionNotConfirmed,
             Failure::BlockedByPolicy,
             Failure::AntivirusRemovedFile,
             Failure::WorkspaceSetupFailed,
@@ -364,6 +373,7 @@ mod tests {
             Failure::CaptureUnavailable,
             Failure::AlreadyRunning,
             Failure::SessionEnded,
+            Failure::ConnectionNotConfirmed,
             Failure::BlockedByPolicy,
             Failure::AntivirusRemovedFile,
             Failure::WorkspaceSetupFailed,

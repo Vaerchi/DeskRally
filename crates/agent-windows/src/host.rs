@@ -1268,6 +1268,9 @@ fn attend_params_from_args(args: &[String]) -> Result<AttendParams, i32> {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(DEFAULT_STREAM_FPS),
         synthetic: args.iter().any(|a| a == "--synthetic"),
+        // DEBUG BUILDS ONLY (Codex attend-enforce r1): --synthetic fakes the picture but leaves real input, audio and
+        // other controls live, so no shipped build may run an unbound attended session.
+        binding_answer_only: cfg!(debug_assertions) && parse_str_arg(args, "--session-binding") == Some("answer-only"),
         log_input: args.iter().any(|a| a == "--log-input"),
         signaling_override: parse_str_arg(args, "--signaling").map(str::to_string),
         // The installed agent's own command line: default disk, operator stop-file watcher, and the
@@ -1345,6 +1348,7 @@ fn attend_params_from_uri(parsed: crate::uri::AttendUri) -> AttendParams {
         // guest's media at a server the control plane never named).
         fps: DEFAULT_STREAM_FPS,
         synthetic: false,
+        binding_answer_only: false,
         log_input: false,
         signaling_override: None,
         // A link launch runs on an installed machine's console UX, but it must NOT be able to
@@ -1378,6 +1382,10 @@ pub(crate) struct AttendParams {
     auto_consent: bool,
     fps: u32,
     synthetic: bool,
+    /// LAB-ONLY (`attend --synthetic --session-binding answer-only`): answer binding but do not enforce it, for
+    /// e2e suites whose controller is a transport harness that never runs the exchange. Honoured only in DEBUG builds
+    /// and only with `--synthetic`; a release build (the shipped agent and support client) never reads it.
+    binding_answer_only: bool,
     log_input: bool,
     signaling_override: Option<String>,
     /// Where delivered/received files and the chat transcript live. `None` ⇒ the installed agent's
@@ -1488,6 +1496,10 @@ fn attend_session_options(
         // config.json, no argv flag — so the per-group mandate bound only a viewer that chose to
         // forward the very policy restricting it.
         require_session_policy: redeemed.require_session_policy,
+        // docs/69 step 3 for the ATTENDED path: the guest client ENFORCES binding like the installed helper (1.3.31).
+        // The control plane pinned this guest's key at redemption and attaches device_binding to attended connect, and
+        // the guest pinned the grant issuer from the same redeem (grant_issuer_pubkey), so it can verify the console's grant.
+        session_binding: rmt_agent::session_binding::Enforcement::Enforce,
         // NO SESSION LEASE ON THE ATTENDED PATH (docs/25 F03), stated rather than inherited from
         // `Default` because it is a decision and not an omission — the same reasoning as
         // `recording_dir` below it.
@@ -1566,6 +1578,7 @@ pub(crate) fn support_attend_params(base: String, transfer_root: PathBuf, pass: 
         auto_consent: false, // a public binary must ALWAYS face the consent prompt
         fps: DEFAULT_STREAM_FPS,
         synthetic: false,
+        binding_answer_only: false,
         log_input: false,
         signaling_override: None,
         transfer_root: Some(transfer_root),
@@ -1659,6 +1672,7 @@ fn run_attend_after_redeem_inner(
         auto_consent,
         fps,
         synthetic,
+        binding_answer_only,
         log_input,
         signaling_override,
         transfer_root,
@@ -1878,8 +1892,8 @@ fn run_attend_after_redeem_inner(
     // the transport failed for a real reason. The attended path serves ONE technician connection, as
     // before; this only changes how long it waits for that connection to begin.
     let cancelled = Arc::new(AtomicBool::new(false));
-    let result: Result<(), String>;
-    let end_reason: String;
+    let mut result: Result<(), String>;
+    let mut end_reason: String;
     enum Cap {
         Synthetic(rmt_agent_core::SyntheticCapturer),
         Real(DxgiCapturer),
@@ -1945,6 +1959,8 @@ fn run_attend_after_redeem_inner(
         }
         (waited, cap)
     };
+    // docs/69: the session records here why binding ended it, if it did.
+    let binding_end: Arc<std::sync::OnceLock<&'static str>> = Arc::new(std::sync::OnceLock::new());
     match waited {
         (Ok(transport), cap) => {
             tracing::info!("attend: a technician connected; serving the session");
@@ -1952,6 +1968,11 @@ fn run_attend_after_redeem_inner(
                 Cap::Synthetic(capturer) => {
                     let mut opts = attend_session_options(&redeemed, sink, transfer_dir, backstage_auth,
                         Some(agent_identity), make_guest_ui(), log_input, synthetic);
+                    opts.binding_end = Some(binding_end.clone());
+                    // The lab opt-out exists ONLY on this generated-frames branch (see AttendParams::binding_answer_only).
+                    if binding_answer_only {
+                        opts.session_binding = rmt_agent::session_binding::Enforcement::AnswerOnly;
+                    }
                     opts.admin_rights = admin_rights;
                     opts.pre_built_transport = Some(transport);
                     #[cfg(feature = "secure-test")]
@@ -1961,6 +1982,7 @@ fn run_attend_after_redeem_inner(
                 Cap::Real(capturer) => {
                     let mut opts = attend_session_options(&redeemed, sink, transfer_dir, backstage_auth,
                         Some(agent_identity), make_guest_ui(), log_input, synthetic);
+                    opts.binding_end = Some(binding_end.clone());
                     opts.admin_rights = admin_rights;
                     opts.pre_built_transport = Some(transport);
                     #[cfg(feature = "secure-test")]
@@ -1973,6 +1995,18 @@ fn run_attend_after_redeem_inner(
                 Ok(()) => "the technician's session ended".to_string(),
                 Err(e) => format!("the session failed: {e}"),
             };
+            // docs/69 (Codex attend-enforce r1): a session that binding ended is NOT a normal technician disconnect.
+            // Say why in support.log, exit non-zero, and tell the guest what to ask for.
+            if let Some(cause) = binding_end.get() {
+                end_reason = format!(
+                    "the technician's console was not confirmed as the one this session was created for ({cause}), so the \
+                     session was stopped. Ask them to reload their DeskRally console and start again"
+                );
+                result = Err(format!("session binding ended the session: {cause}"));
+                if ux == AttendUx::GuestFacing {
+                    support_failure_dialog(&rmt_agent_core::support_ui::Failure::ConnectionNotConfirmed);
+                }
+            }
         }
         (Err(end), _) => {
             end_reason = match &end {
@@ -3011,6 +3045,9 @@ pub struct SessionOptions {
     /// console can verify this agent; `Enforce` additionally sends no picture and processes no other
     /// frame until the console's proof verifies, and ends the session if that does not happen.
     pub session_binding: rmt_agent::session_binding::Enforcement,
+    /// Where this session records WHY binding ended it (the `cause`), for a caller that reports the outcome (the
+    /// attended path shows the guest a reason instead of "the technician's session ended"). `None`: nobody asks.
+    pub binding_end: Option<Arc<std::sync::OnceLock<&'static str>>>,
     /// Longest a single session may run. Default: [`DEFAULT_STREAM_MAX_RUN`] (4 hours).
     ///
     /// This is a resource bound, not a policy one: it exists so a session that is never closed
@@ -3669,6 +3706,7 @@ impl Default for SessionOptions {
             session_lease_grace: DEFAULT_LEASE_GRACE,
             identity: None,
             session_binding: rmt_agent::session_binding::Enforcement::AnswerOnly,
+            binding_end: None,
             max_session: DEFAULT_STREAM_MAX_RUN,
             // Today's behaviour exactly — a caller that has not thought about quality policy gets
             // the ceiling the agent already had compiled in.
@@ -4161,6 +4199,7 @@ pub async fn serve_session_with_ice(
         session_lease_grace,
         identity,
         session_binding: session_binding_enforcement,
+        binding_end,
         quality_policy: opts_quality_policy,
         max_session,
         guest_ui,
@@ -5372,6 +5411,7 @@ pub async fn serve_session_with_ice(
             // binding grant (CP_SESSION_BINDING=off) or the console is an older viewer; "no_issuer_pin" means this
             // machine never pinned the control plane's key (restart the agent or re-enrol it).
             tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
+                if let Some(slot) = &binding_end { let _ = slot.set(cause); }
             break;
         }
         tokio::select! {
@@ -5950,6 +5990,7 @@ pub async fn serve_session_with_ice(
                         // Same line as every other binding end, so one search finds them all (Codex release-1331 P3).
                         let cause = binding.end_cause(Instant::now()).unwrap_or(rmt_agent::session_binding::reason::HOLD_OVERFLOW);
                         tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
+                if let Some(slot) = &binding_end { let _ = slot.set(cause); }
                         video_open = false;
                         input_open = false;
                     }
@@ -6699,6 +6740,7 @@ pub async fn serve_session_with_ice(
                             }
                             if let Some(cause) = binding.end_cause(Instant::now()) {
                                 tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
+                if let Some(slot) = &binding_end { let _ = slot.set(cause); }
                                 video_open = false;
                                 input_open = false;
                             }
@@ -6741,6 +6783,7 @@ pub async fn serve_session_with_ice(
                                 transport.replay_frames(binding.take_held());
                             } else if let Some(cause) = binding.end_cause(Instant::now()) {
                                 tracing::warn!(cp_session = ?control_plane_session, cause, "session binding: the console was not verified; ending the session");
+                if let Some(slot) = &binding_end { let _ = slot.set(cause); }
                                 video_open = false;
                                 input_open = false;
                             }
@@ -10443,6 +10486,7 @@ async fn run_multi_session_stream(
                 session_lease_grace: DEFAULT_LEASE_GRACE,
                 identity: opts_c.identity.clone(),
                 session_binding: opts_c.session_binding,
+                binding_end: None,
                 quality_policy: opts_c.quality_policy,
                 max_session: opts_c.max_session,
                 recording_dir: opts_c.recording_dir.clone(),

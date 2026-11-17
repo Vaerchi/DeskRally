@@ -28,6 +28,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..", "..");
 const TARGET_DIR = process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : resolve(REPO, "target");
 const AGENT_BIN = resolve(TARGET_DIR, "debug", "agent_host.exe");
+// docs/69: these tests drive the guest with a TRANSPORT harness page or stream_probe, neither of which runs the
+// binding exchange, so the guest runs with the lab-only answer-only opt-out (honoured only with --synthetic).
+// Attended binding ENFORCEMENT is covered by attended_console.spec.ts, which drives the real console.
 // The CONTROLLER for the policy-install test. The browser viewer sends InstallSessionPolicy only on its
 // own connect path, so driving it deliberately (and nothing else) needs the probe.
 const PROBE_BIN = resolve(TARGET_DIR, "debug", "stream_probe.exe");
@@ -204,7 +207,7 @@ test("attended: consent gates the ticket, then real RTP video flows over the on-
   guestProc = spawn(
     AGENT_BIN,
     ["attend", "--code", code, "--control-plane-url", CP_BASE, "--signaling", SIGNALING_WS,
-      "--auto-consent", "--synthetic", "--fps", "30"],
+      "--auto-consent", "--synthetic", "--session-binding", "answer-only", "--fps", "30"],
     { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] },
   );
   guestProc.stdout?.on("data", (d: Buffer) => { guestLog += d; process.stdout.write(`[guest] ${d}`); });
@@ -312,7 +315,7 @@ async function guestPolicyRegime(label: string, enforceViewOnly: boolean): Promi
     proc = spawn(
       AGENT_BIN,
       ["attend", "--code", code, "--control-plane-url", CP_BASE, "--signaling", SIGNALING_WS,
-        "--auto-consent", "--synthetic", "--fps", "10"],
+        "--auto-consent", "--synthetic", "--session-binding", "answer-only", "--fps", "10"],
       { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] },
     );
     proc.stdout?.on("data", (d: Buffer) => { log += d; process.stdout.write(`[guest:${label}] ${d}`); });
@@ -393,7 +396,7 @@ test("attended: clearing the group mandate after redeem DISCHARGES the guest's p
     proc = spawn(
       AGENT_BIN,
       ["attend", "--code", code, "--control-plane-url", CP_BASE, "--signaling", SIGNALING_WS,
-        "--auto-consent", "--synthetic", "--fps", "10"],
+        "--auto-consent", "--synthetic", "--session-binding", "answer-only", "--fps", "10"],
       { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] },
     );
     proc.stdout?.on("data", (d: Buffer) => { log += d; process.stdout.write(`[guest:window] ${d}`); });
@@ -487,7 +490,7 @@ async function runAttendedPolicyInstall(
     guest = spawn(
       AGENT_BIN,
       ["attend", "--code", created.json.join_code as string, "--control-plane-url", CP_BASE,
-        "--signaling", SIGNALING_WS, "--auto-consent", "--synthetic", "--fps", "10"],
+        "--signaling", SIGNALING_WS, "--auto-consent", "--synthetic", "--session-binding", "answer-only", "--fps", "10"],
       { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] },
     );
     const collect = (d: Buffer) => { guestLog += d; process.stdout.write(`[guest:${label}] ${d}`); };

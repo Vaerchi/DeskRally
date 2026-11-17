@@ -1115,6 +1115,11 @@ func main() {
 		srv.APITokens = devAPITokens
 		srv.Audit = controlplane.NewInMemoryAuditStore()
 		srv.Grants = grants
+		// docs/69 3.9: dev mode follows the same switch as production (on unless CP_SESSION_BINDING=off), so the e2e
+		// suites exercise binding against enforcing agents instead of a server that never sends a grant.
+		devBindingOn, devBindingLog := controlplane.SessionBindingSwitch(os.Getenv("CP_SESSION_BINDING"))
+		srv.BindingEnabled = devBindingOn
+		log.Print(devBindingLog)
 		// PERMISSIVE machine store (DEV only): any unknown device id resolves to the default group,
 		// so minting works for a fresh per-run device (e.g. the secure_grant e2e) with no prior
 		// enroll. Prod uses the strict PgMachineStore above.
