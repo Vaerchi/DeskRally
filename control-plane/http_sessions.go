@@ -287,7 +287,7 @@ func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not record audit event")
 		return
 	}
-	resp, brokerRefusal := s.brokerSessionStart(r.Context(), rec, m, p.UserID, p.TenantID, groupPolicy, req.ConsolePubkey)
+	resp, brokerRefusal := s.brokerSessionStart(r.Context(), rec, m, p.UserID, p.TenantID, groupPolicy, adm.BindingMode, req.ConsolePubkey)
 	if brokerRefusal != nil {
 		// The deferred compensation above ends the record just created, so a refusal never strands a seat.
 		brokerRefusal.write(w)

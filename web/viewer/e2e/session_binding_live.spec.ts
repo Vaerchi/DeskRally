@@ -96,6 +96,7 @@ let browser: Browser | null = null;
 let cfg: FixtureConfig;
 let agentLog = "";
 let workDir = "";
+let deviceId = "";
 
 test.describe.configure({ mode: "serial" });
 
@@ -134,6 +135,7 @@ test.beforeAll(async () => {
     ["enroll", "--control-plane-url", CP_BASE, "--token", tok, "--name", MACHINE, "--config", configPath],
     { timeout: 30_000 }, (err) => (err ? rej(err) : res())));
   const enrolled = JSON.parse(readFileSync(configPath, "utf8")) as { device_id: string; grant_issuer_pubkey?: string };
+  deviceId = enrolled.device_id;
   // docs/69 §3.7: enrollment pinned the control plane's grant key.
   expect(enrolled.grant_issuer_pubkey).toBe(cfg.grant_issuer_pubkey);
 
@@ -214,5 +216,27 @@ test("a console that cannot bind gets no picture, and the enforcing agent ends t
   // gate saw videoWidth 2 with frames=0); the synthetic screen is hundreds of pixels wide.
   expect(await page.evaluate(() => document.querySelector("video")?.videoWidth ?? 0)).toBeLessThan(16);
   expect(agentLog.slice(before)).not.toContain("console verified; the session is bound");
+  await context.close();
+});
+
+// docs/69 6.2: an agent the server knows to speak binding v2 (0.1.33+) binds over the committed-nonce exchange, and the
+// console offers the 6-digit comparison code. Last, because it changes the machine's recorded version.
+test("binding v2: Verified with a comparison code the technician can open", async () => {
+  test.setTimeout(120_000);
+  const r = await fetch(`${CP_BASE}/fixture/agent-version`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ device_id: deviceId, version: "0.1.33+e2e" }),
+  });
+  expect(r.status).toBe(204);
+  const context = await browser!.newContext({ ...PINNED });
+  const page = await context.newPage();
+  const before = agentLog.length;
+  await loginAndConnect(page);
+  const mark = page.getByTestId("session-binding-status");
+  await expect(mark).toHaveAttribute("data-state", "verified", { timeout: 45_000 });
+  await expect(mark).toHaveAttribute("data-has-code", "");
+  await mark.click();
+  await expect(page.getByTestId("session-binding-code")).toContainText(/\d{3} \d{3}/);
+  expect(agentLog.slice(before)).toContain("console verified; the session is bound");
   await context.close();
 });

@@ -368,8 +368,10 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 	if policyAccess != "" {
 		bindAccess = SessionAccessLevel(policyAccess)
 	}
-	if refusal := s.attachDeviceBinding(r.Context(), resp, active.ID, active.DeviceID, active.AgentPubkey, p.UserID, p.TenantID,
-		bindAccess, keyBody.ConsolePubkey, now); refusal != nil {
+	// docs/69 6.1 (Codex sas-impl r4): the guest's version, for the v2 comparison-code hint, is the one it announced
+	// to signaling (the attended guest registers with the same agent role); no row stores it.
+	if refusal := s.attachDeviceBinding(r.Context(), resp, active.ID, active.DeviceID, active.AgentPubkey, p.UserID, p.TenantID, "",
+		bindAccess, keyBody.ConsolePubkey, s.liveAgentVersion(r.Context(), active.DeviceID), now); refusal != nil {
 		refusal.write(w)
 		return
 	}

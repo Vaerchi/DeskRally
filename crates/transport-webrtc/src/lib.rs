@@ -5481,6 +5481,22 @@ fn build_api(
 ) -> (webrtc::api::API, bool) {
     let mut setting = webrtc::api::setting_engine::SettingEngine::default();
     let mut restricted = false;
+    // TEST ONLY: [`TEST_ICE_LOOPBACK_ENV`] keeps every ICE socket on loopback and turns mDNS off, so a test run
+    // never listens on a real network interface (which makes Windows Firewall prompt on the developer's desktop
+    // for each freshly hashed test executable). Set by .cargo/config.toml for cargo-launched processes only; it
+    // can only REMOVE connectivity, never add any.
+    if test_ice_loopback() {
+        setting.set_include_loopback_candidate(true);
+        setting.set_ip_filter(Box::new(|candidate: std::net::IpAddr| candidate.is_loopback()));
+        setting.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+        tracing::info!(role, "ice: TEST loopback-only mode ({TEST_ICE_LOOPBACK_ENV})");
+        let api = APIBuilder::new()
+            .with_media_engine(media)
+            .with_interceptor_registry(registry)
+            .with_setting_engine(setting)
+            .build();
+        return (api, true);
+    }
     if let Some(ip) = route_ip {
         let suspended = !ICE_RESTRICTION.allowed(unix_ms());
         let allowed = if has_relay && !suspended {
@@ -5505,6 +5521,13 @@ fn build_api(
         .with_setting_engine(setting)
         .build();
     (api, restricted)
+}
+
+/// Environment switch for [`build_api`]'s test-only loopback mode. Any value other than empty or "0" enables it.
+pub const TEST_ICE_LOOPBACK_ENV: &str = "RMT_TEST_ICE_LOOPBACK";
+
+fn test_ice_loopback() -> bool {
+    std::env::var_os(TEST_ICE_LOOPBACK_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 fn unix_ms() -> u64 {

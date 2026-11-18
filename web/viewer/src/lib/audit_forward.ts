@@ -300,3 +300,12 @@ export class AuditForwarder {
     return n;
   }
 }
+
+export const AUDIT_WARNING = "Audit forwarding failed; the audit trail may be incomplete.";
+// Codex sas-impl r2: an audit flush failure lands asynchronously, often after teardown. It must never REPLACE a message
+// already on screen (e.g. why binding ended the session), so it is added to it.
+export function withAuditWarning(prev: string | null): string {
+  if (!prev) return AUDIT_WARNING;
+  // Idempotent (Codex sas-impl r2b): two handlers on one rejected flush must not drop the message the first kept.
+  return prev.endsWith(AUDIT_WARNING) ? prev : `${prev} ${AUDIT_WARNING}`;
+}

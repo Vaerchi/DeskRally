@@ -3783,7 +3783,10 @@ fn is_binding_frame(frame: &Frame) -> bool {
     frame.channel == ChannelId::Control
         && matches!(
             control::decode(&frame.payload),
-            Ok(ControlMessage::BindStart { .. } | ControlMessage::BindConsoleProof { .. })
+            Ok(ControlMessage::BindStart { .. }
+                | ControlMessage::BindConsoleProof { .. }
+                | ControlMessage::BindStartV2 { .. }
+                | ControlMessage::BindConsoleProofV2 { .. })
         )
 }
 
@@ -4278,6 +4281,8 @@ pub async fn serve_session_with_ice(
     // docs/69: the device key signs this session's binding proof (its own domain tag keeps it apart
     // from the registration proof the same key signs).
     let binding_signer = identity.as_ref().map(|id| id.signer.clone());
+    // Binding v2 names this agent's own key in the transcript (docs/69 6.2); the same key `binding_signer` signs with.
+    let binding_pubkey = identity.as_ref().and_then(|id| rmt_protocol::session_binding::decode_field_hex(&id.pubkey));
     let role = agent_role(device, identity, require_session_policy);
 
     // Multi-session path: transport already connected by `run_multi_session_stream`. Single-session
@@ -6706,7 +6711,8 @@ pub async fn serve_session_with_ice(
                             }
                         }
                         // docs/69 session binding, steps 1 and 3 (the agent's side).
-                        Ok(ControlMessage::BindStart { grant, console_nonce }) => {
+                        // v1 and v2 share everything here except the state-machine call (docs/69 §6.2).
+                        Ok(start @ (ControlMessage::BindStart { .. } | ControlMessage::BindStartV2 { .. })) => {
                             let fps = binding_source.fingerprints().await.map(|f| {
                                 rmt_agent::session_binding::AgentFingerprints { agent: f.local, console: f.remote }
                             });
@@ -6717,20 +6723,22 @@ pub async fn serve_session_with_ice(
                             let sign = |m: &[u8]| -> [u8; 64] {
                                 binding_signer.as_ref().map_or([0u8; 64], |s| s.sign(m))
                             };
-                            let reply = binding.on_bind_start(
-                                &grant,
-                                &console_nonce,
-                                rmt_agent::session_binding::BindStartContext {
+                            let cx = rmt_agent::session_binding::BindStartContext {
                                     issuer,
                                     device: device.0,
                                     signaled_session: control_plane_session,
                                     signaled_technician: session_technician,
                                     fingerprints: fps,
                                     signer: binding_signer.as_ref().map(|_| &sign as &dyn Fn(&[u8]) -> [u8; 64]),
+                                    device_pubkey: binding_pubkey,
                                     now_ms: now_unix_ms(),
                                     agent_nonce: rmt_crypto::random_32(),
-                                },
-                            );
+                            };
+                            let reply = match &start {
+                                ControlMessage::BindStart { grant, console_nonce } => binding.on_bind_start(grant, console_nonce, cx),
+                                ControlMessage::BindStartV2 { grant, commitment } => binding.on_bind_start_v2(grant, commitment, cx),
+                                _ => unreachable!("matched above"),
+                            };
                             if let rmt_agent::session_binding::BindReply::Result { reason, .. } = &reply {
                                 tracing::warn!(cp_session = ?control_plane_session, ?reason, "session binding: refused the console's start");
                             }
@@ -6745,11 +6753,15 @@ pub async fn serve_session_with_ice(
                                 input_open = false;
                             }
                         }
-                        Ok(ControlMessage::BindConsoleProof { sig }) => {
+                        Ok(proof @ (ControlMessage::BindConsoleProof { .. } | ControlMessage::BindConsoleProofV2 { .. })) => {
                             let fps = binding_source.fingerprints().await.map(|f| {
                                 rmt_agent::session_binding::AgentFingerprints { agent: f.local, console: f.remote }
                             });
-                            let reply = binding.on_console_proof(&sig, fps);
+                            let reply = match &proof {
+                                ControlMessage::BindConsoleProof { sig } => binding.on_console_proof(sig, fps),
+                                ControlMessage::BindConsoleProofV2 { console_nonce, sig } => binding.on_console_proof_v2(console_nonce, sig, fps),
+                                _ => unreachable!("matched above"),
+                            };
                             let bound = matches!(reply, rmt_agent::session_binding::BindReply::Result { ok: true, .. });
                             if bound {
                                 // The grant is authoritative (docs/69 §3.1): a view-only grant floors the session
@@ -6767,6 +6779,10 @@ pub async fn serve_session_with_ice(
                                     }
                                 }
                                 tracing::info!(cp_session = ?control_plane_session, "session binding: console verified; the session is bound");
+                                // docs/69 6.1: a v2 binding fixes a comparison code for this connection; show it to the guest.
+                                if let (Some(code), Some(s)) = (binding.comparison_code(), guest_surface.as_ref()) {
+                                    s.set_comparison_code(&rmt_protocol::session_binding::format_comparison_code(code));
+                                }
                             } else {
                                 tracing::warn!(cp_session = ?control_plane_session, "session binding: the console's proof was refused");
                             }

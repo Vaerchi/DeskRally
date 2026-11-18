@@ -3397,7 +3397,13 @@ select {
 .app__toolbar-end .viewer__disconnect { white-space: nowrap; }
 .app__toolbar-end .viewer__recording-indicator { color: var(--bad); white-space: nowrap; }
 /* docs/69 session binding mark: same footprint rules as the recording indicator. */
-.viewer__binding { white-space: nowrap; }
+.viewer__binding { white-space: nowrap; position: relative; }
+.viewer__binding[data-has-code] { cursor: pointer; text-decoration: underline dotted; }
+/* docs/69 6.1: floats below the mark, so it never widens the bar. */
+.viewer__binding-code { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; min-width: 220px; white-space: normal; background: var(--bg-elev); color: inherit; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.35); cursor: default; text-decoration: none; }
+.viewer__binding-code-digits { font-size: var(--fs-3xl); font-variant-numeric: tabular-nums; letter-spacing: .08em; font-weight: 600; }
+.viewer__binding-code-note { font-size: var(--fs-sm); opacity: .8; }
+.viewer__binding-code-differ { align-self: flex-start; }
 .viewer__binding[data-state="unverified"], .viewer__binding[data-state="failed"] { color: var(--pending); }
 .app__toolbar-host { mask-image: linear-gradient(to right, #000 calc(100% - 10px), transparent); }
 @media (pointer: coarse) {

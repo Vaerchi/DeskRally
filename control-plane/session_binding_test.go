@@ -42,7 +42,7 @@ func TestAttachDeviceBindingIssuesAVerifiableGrant(t *testing.T) {
 	deviceKey, _ := bindTestDeviceKey()
 	resp := map[string]any{}
 	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, strings.ToUpper(deviceKey), bindTestUser,
-		bindTestTenant, SessionAccessViewOnly, goldenBindConsolePubHex, 1_000); r != nil {
+		bindTestTenant, "", SessionAccessViewOnly, goldenBindConsolePubHex, "", 1_000); r != nil {
 		t.Fatalf("refused: %+v", r)
 	}
 	b := resp["device_binding"].(map[string]any)
@@ -81,8 +81,8 @@ func TestAttachDeviceBindingWithholdsInWarnAndRefusesInRequire(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			warn := &Server{Grants: bindTestIssuer(t), BindingEnabled: true}
 			resp := map[string]any{}
-			if r := warn.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser, tc.tenant,
-				SessionAccessControl, tc.consoleKey, 1); r != nil {
+			if r := warn.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser, tc.tenant, "",
+				SessionAccessControl, tc.consoleKey, "", 1); r != nil {
 				t.Fatalf("warn refused: %+v", r)
 			}
 			b := resp["device_binding"].(map[string]any)
@@ -92,7 +92,7 @@ func TestAttachDeviceBindingWithholdsInWarnAndRefusesInRequire(t *testing.T) {
 
 			require := &Server{Grants: bindTestIssuer(t), BindingEnabled: true, BindingMode: func(string) SessionBindingMode { return SessionBindingRequire }}
 			if r := require.attachDeviceBinding(context.Background(), map[string]any{}, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser,
-				tc.tenant, SessionAccessControl, tc.consoleKey, 1); r == nil {
+				tc.tenant, "", SessionAccessControl, tc.consoleKey, "", 1); r == nil {
 				t.Fatal("require mode brokered a session it cannot bind")
 			}
 		})
@@ -219,8 +219,8 @@ func TestSessionBindingIsOffByDefault(t *testing.T) {
 	srv := &Server{Grants: bindTestIssuer(t)}
 	deviceKey, _ := bindTestDeviceKey()
 	resp := map[string]any{}
-	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser, bindTestTenant,
-		SessionAccessControl, goldenBindConsolePubHex, 1); r != nil {
+	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser, bindTestTenant, "",
+		SessionAccessControl, goldenBindConsolePubHex, "", 1); r != nil {
 		t.Fatalf("refused: %+v", r)
 	}
 	if _, present := resp["device_binding"]; present {
@@ -316,5 +316,85 @@ func TestSetSessionPolicyKeepsBindingModeWhenOmitted(t *testing.T) {
 	}
 	if rec := put(`{"session_binding":"off"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown mode = %d, want 400", rec.Code)
+	}
+}
+
+// One policy read per start (Codex bindmode r1 recommendation): a mode the admission already read is used as is,
+// with no second read (here the store would fail and force require), and an unknown value still fails closed.
+func TestAttachDeviceBindingUsesTheAdmissionMode(t *testing.T) {
+	srv := &Server{BindingEnabled: true, SessionPolicies: &failingSessionPolicies{}}
+	mode := func(known SessionBindingMode) string {
+		resp := map[string]any{}
+		// No console key: under warn that is "unavailable", under require a refusal; either way the mode is recorded.
+		_ = srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, "", bindTestUser,
+			bindTestTenant, known, SessionAccessControl, "", "", 1_000)
+		return resp["device_binding"].(map[string]any)["mode"].(string)
+	}
+	if got := mode(SessionBindingWarn); got != "warn" {
+		t.Fatalf("known warn = %q, want warn without a second (failing) read", got)
+	}
+	if got := mode(""); got != "require" {
+		t.Fatalf("unknown -> lookup on a failing store = %q, want require", got)
+	}
+	if got := mode("bogus"); got != "require" {
+		t.Fatalf("an unknown known value = %q, want require", got)
+	}
+}
+
+// docs/69 6.2: device_binding.v2 is set from the machine's reported agent version (0.1.33+), never for older or
+// unknown versions; it is a hint for which exchange the console runs.
+func TestDeviceBindingV2HintFollowsTheAgentVersion(t *testing.T) {
+	srv := &Server{Grants: bindTestIssuer(t), BindingEnabled: true}
+	deviceKey, _ := bindTestDeviceKey()
+	for _, tc := range []struct {
+		version string
+		want    bool
+	}{
+		{"0.1.33+abcdef12", true}, {"0.2.0", true}, {"1.0.0+x", true},
+		{"0.1.32+d67ce452", false}, {"0.1.0", false}, {"", false}, {"garbage", false},
+	} {
+		resp := map[string]any{}
+		if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser,
+			bindTestTenant, "", SessionAccessControl, goldenBindConsolePubHex, tc.version, 1_000); r != nil {
+			t.Fatalf("%q: refused: %+v", tc.version, r)
+		}
+		_, got := resp["device_binding"].(map[string]any)["v2"]
+		if got != tc.want {
+			t.Fatalf("agent %q: v2 present = %v, want %v", tc.version, got, tc.want)
+		}
+	}
+}
+
+type versionPresence struct {
+	versions map[string]string
+	err      error
+}
+
+func (p versionPresence) FetchPresence(context.Context) (*Presence, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &Presence{VersionByDevice: p.versions}, nil
+}
+
+// Codex sas-impl r4: attended sessions learn the guest's version from live presence, for the v2 hint.
+func TestLiveAgentVersionFeedsTheAttendedV2Hint(t *testing.T) {
+	srv := &Server{}
+	if v := srv.liveAgentVersion(context.Background(), bindTestDevice); v != "" {
+		t.Fatalf("no presence source: %q", v)
+	}
+	srv.Presence = versionPresence{err: errors.New("down")}
+	if v := srv.liveAgentVersion(context.Background(), bindTestDevice); v != "" {
+		t.Fatalf("feed down: %q", v)
+	}
+	srv.Presence = versionPresence{versions: map[string]string{bindTestDevice: "0.1.33"}}
+	if v := srv.liveAgentVersion(context.Background(), "other-device"); v != "" {
+		t.Fatalf("silent device: %q", v)
+	}
+	if v := srv.liveAgentVersion(context.Background(), bindTestDevice); v != "0.1.33" {
+		t.Fatalf("announced: %q", v)
+	}
+	if !agentVersionAtLeast(srv.liveAgentVersion(context.Background(), bindTestDevice), bindingV2MinAgent) {
+		t.Fatal("0.1.33 must earn the v2 hint")
 	}
 }

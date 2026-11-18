@@ -12,6 +12,10 @@ pieces:
 The server side (the installer bundle and `/download`) is covered in
 [server-deployment.md](server-deployment.md).
 
+Self-hosted operators distribute Windows builds signed under their own verified publisher
+identity. Follow [self-hosted Azure signing](self-hosted-signing.md) to set up an account,
+sign the executables and MSI, and verify the release.
+
 For the underlying identity, codec and transport details, see the
 [full build and deployment reference](../10-deployment.md#4a-enrollment-and-agent-identity-m3).
 For blank video or relay-limit failures, see [connection troubleshooting](../connection-troubleshooting.md).

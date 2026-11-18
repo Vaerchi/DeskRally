@@ -275,6 +275,24 @@ pub enum ControlMessage {
         /// Ed25519 signature, hex (128 chars).
         sig: String,
     },
+    /// controller → agent, binding v2 (docs/69 §6.2): like [`ControlMessage::BindStart`], but the console sends a
+    /// COMMITMENT to its nonce (`SHA-256("RMTBIND-COMMIT-v2\0" || nonce)`, 64 hex chars) instead of the nonce, so
+    /// the comparison code cannot be ground. Answered with [`ControlMessage::BindAgentProof`] (over the v2
+    /// transcript) or a refusing [`ControlMessage::BindResult`]. One version per connection.
+    BindStartV2 {
+        /// The signed binding grant JSON.
+        grant: String,
+        /// The console's nonce commitment, hex.
+        commitment: String,
+    },
+    /// controller → agent, binding v2 step 3: reveals the console's nonce and signs the v2 transcript plus the
+    /// opening. The agent checks the opening against the commitment before verifying the signature.
+    BindConsoleProofV2 {
+        /// The console's nonce, hex (64 chars).
+        console_nonce: String,
+        /// Ed25519 signature, hex (128 chars).
+        sig: String,
+    },
     /// agent → controller (step 4): the binding outcome. Only after `ok: true` does an enforcing
     /// agent send a picture or accept input.
     BindResult {
@@ -1032,6 +1050,7 @@ pub fn decode(bytes: &[u8]) -> Result<ControlMessage, ControlCodecError> {
         ControlMessage::InstallSessionPolicy { signed_policy } => Some(signed_policy),
         ControlMessage::ElevatedRun { signed_elevation, .. } => Some(signed_elevation),
         ControlMessage::BindStart { grant, .. } => Some(grant),
+        ControlMessage::BindStartV2 { grant, .. } => Some(grant),
         _ => None,
     };
     // docs/69: binding fields are fixed-length hex; refuse anything else at the codec.
@@ -1039,6 +1058,8 @@ pub fn decode(bytes: &[u8]) -> Result<ControlMessage, ControlCodecError> {
         ControlMessage::BindStart { console_nonce, .. } => &[(console_nonce.as_str(), 64)],
         ControlMessage::BindAgentProof { agent_nonce, sig } => &[(agent_nonce.as_str(), 64), (sig.as_str(), 128)],
         ControlMessage::BindConsoleProof { sig } => &[(sig.as_str(), 128)],
+        ControlMessage::BindStartV2 { commitment, .. } => &[(commitment.as_str(), 64)],
+        ControlMessage::BindConsoleProofV2 { console_nonce, sig } => &[(console_nonce.as_str(), 64), (sig.as_str(), 128)],
         _ => &[],
     };
     for (field, len) in bind_fields {
@@ -1152,7 +1173,10 @@ pub fn observer_rule(msg: &ControlMessage) -> ObserverRule {
         | ControlMessage::InstallSessionPolicy { .. }
         | ControlMessage::SetViewOnly { .. } => Allow,
         // docs/69: an observer's connection is bound like any other (its own grant, its own key).
-        ControlMessage::BindStart { .. } | ControlMessage::BindConsoleProof { .. } => Allow,
+        ControlMessage::BindStart { .. }
+        | ControlMessage::BindConsoleProof { .. }
+        | ControlMessage::BindStartV2 { .. }
+        | ControlMessage::BindConsoleProofV2 { .. } => Allow,
         // Actuating; each handler refuses under view-only with its own reply (EndSession: the session
         // still ends, an uninstall is dropped).
         ControlMessage::SetInputBlocked { .. }

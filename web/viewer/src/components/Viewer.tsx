@@ -394,6 +394,8 @@ export interface ViewerProps {
   inputHeld?: boolean;
   /** docs/69: this connection's binding state, shown in the status bar. */
   bindingStatus?: BindingStatus | null;
+  /** docs/69 6.1: the technician reports that the 6-digit codes on both ends differ; the session ends. */
+  onBindingCodesDiffer?: () => void;
   onReconnect?: () => void;
   /** Monitors advertised by the agent (Control channel). Empty ⇒ single-display fallback. */
   /** Whether the agent is actually sending an audio track — gates the speaker control. */
@@ -729,6 +731,7 @@ export function Viewer({
   recoveryNotice,
   inputHeld = false,
   bindingStatus = null,
+  onBindingCodesDiffer,
   onReconnect,
   audioAvailable = false,
   monitors = [],
@@ -804,6 +807,8 @@ export function Viewer({
   //
   // And it is the behaviour to want anyway: a technician connecting to a machine in an open-plan
   // office should not have the guest's music come out of their laptop unannounced.
+  // docs/69 6.1: the comparison code panel on the binding mark (open/closed).
+  const [codeOpen, setCodeOpen] = useState(false);
   const [audioOn, setAudioOn] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
@@ -2616,6 +2621,8 @@ export function Viewer({
       // and, because it is preventDefault-ed below, trap Tab so keyboard focus could never leave the
       // control (a Space-held [Left] could then never be released by tabbing away).
       if (target?.closest?.("[data-trackpad-ui]")) return;
+      // Same for the binding code panel (Codex sas-impl r5): Tab must reach "Codes differ" and Enter/Space operate it.
+      if (target?.closest?.("[data-binding-ui]")) return;
       // `null` = an IME placeholder (keyCode 229) or an unmapped key: nothing real to inject.
       const info = { code: e.code, keyCode: e.keyCode };
       const ev = liveKeyEvent({ ...info, isComposing: e.isComposing }, down);
@@ -3185,7 +3192,12 @@ export function Viewer({
             // A glyph plus a label that collapses on narrow bars (like the recording indicator), so the
             // mark never adds sideways overflow at phone width.
             <span className="viewer__binding" data-testid="session-binding-status" data-state={bindingStatus.state} role="status"
-              title={bindingStatus.state === "unverified" ? `Not verified: ${bindingStatus.why}` : undefined}>
+              title={bindingStatus.state === "unverified" ? `Not verified: ${bindingStatus.why}`
+                : bindingStatus.state === "verified" && bindingStatus.code ? "Compare the code with the person at the machine" : undefined}
+              {...(bindingStatus.state === "verified" && bindingStatus.code
+                ? { tabIndex: 0, "data-has-code": "", "data-binding-ui": "", onClick: () => setCodeOpen((o) => !o),
+                    onKeyDown: (e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setCodeOpen((o) => !o); } } }
+                : {})}>
               {bindingStatus.state === "pending" ? "…" : bindingStatus.state === "verified" ? "✓" : "!"}
               <span className="viewer__lbl">
                 {bindingStatus.state === "pending" ? " Verifying machine"
@@ -3193,6 +3205,21 @@ export function Viewer({
                   : bindingStatus.state === "unverified" ? " Not verified"
                   : " Verification failed"}
               </span>
+              {codeOpen && bindingStatus.state === "verified" && bindingStatus.code && (
+                // docs/69 6.1 (detection): the person at the machine sees the same six digits in their DeskRally
+                // window. Different digits mean this connection is not the one the machine sees.
+                // Clicks AND keys stop here (Codex sas-impl r4): the mark's Enter/Space toggle must not swallow the
+                // button's own activation.
+                <span className="viewer__binding-code" data-testid="session-binding-code" onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => e.stopPropagation()}>
+                  <span className="viewer__binding-code-digits">{bindingStatus.code}</span>
+                  <span className="viewer__binding-code-note">Ask the person at the machine to read the code in their DeskRally window.</span>
+                  <button type="button" className="viewer__binding-code-differ" data-testid="session-binding-codes-differ"
+                    onClick={() => { setCodeOpen(false); onBindingCodesDiffer?.(); }}>
+                    Codes differ: end session
+                  </button>
+                </span>
+              )}
             </span>
           )}
           {recording &&<span className="viewer__recording-indicator" data-testid="viewer-recording-indicator" role="status" title={recordingRequired ? "Recording required by policy" : "Recording"}>⏺<span className="viewer__lbl"> Recording{recordingRequired ? " (required)" : ""}</span></span>}

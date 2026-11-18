@@ -297,6 +297,7 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 		TechnicianID:        technician,
 		Access:              sess.Access,
 		AccessVersion:       1,
+		PeerAgentVersion:    agent.AgentVersion,
 	}); err != nil {
 		b.dropSession(sessionID)
 		return nil, fmt.Errorf("connect_request: notify requester: %w", err)

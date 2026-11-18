@@ -261,6 +261,8 @@ export class WebRTCTransport implements Transport {
   /** Encoded frames queued while the data channel is not yet "open"; flushed on open. */
   private sendQueue: Uint8Array[] = [];
   private session: SessionId | null = null;
+  /** docs/69 6.1: the build the routed agent announced (signaling's `brokered`), for the binding version choice. */
+  private routedAgentVersion: string | undefined;
   /**
    * Which ICE candidate types this peer actually gathered. Readable via
    * {@link gatheredCandidateKinds} so a WAN deployment can be diagnosed from the console: no
@@ -443,6 +445,7 @@ export class WebRTCTransport implements Transport {
           return;
         }
         this.session = msg.session;
+        this.routedAgentVersion = msg.peer_agent_version;
         // Controller is the offerer: create the offer, set it locally, and deliver it to the
         // agent through the signaling server (peers never self-dial).
         const offer = await pc.createOffer();
@@ -646,6 +649,11 @@ export class WebRTCTransport implements Transport {
    */
   async getStats(): Promise<RTCStatsReport | undefined> {
     return this.pc ? await this.pc.getStats() : undefined;
+  }
+
+  /** docs/69 6.1: the build the agent this connection was routed to announced, if signaling said. */
+  peerAgentVersion(): string | undefined {
+    return this.routedAgentVersion;
   }
 
   /** docs/69: the APPLIED local and remote SDP (the binding fallback for browsers without certificate stats). */

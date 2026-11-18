@@ -25,6 +25,9 @@ export interface DeviceBinding {
   grant?: string;
   /** Present when it cannot (why), e.g. an older console or a machine without an enrolled key. */
   unavailable?: string;
+  /** docs/69 6.2: the server's hint that this machine's agent speaks binding v2 (from its reported version). A hint
+   *  only: a wrong "true" costs one unverified session, a wrong "false" hides the comparison code. */
+  v2?: boolean;
 }
 
 /** Decode `device_binding` from a session-start response; undefined when absent (an older server). */
@@ -39,6 +42,7 @@ export function parseDeviceBinding(body: unknown): DeviceBinding | undefined {
   } else {
     out.unavailable = typeof raw.unavailable === "string" ? raw.unavailable : "no binding material";
   }
+  if (raw.v2 === true) out.v2 = true;
   return out;
 }
 
@@ -182,13 +186,15 @@ export async function verifyEd25519(pubHex: string, msg: Uint8Array<ArrayBuffer>
 /** Where a session stands. `verified` is the only state that may say the machine is who it claims. */
 export type BindingStatus =
   | { state: "pending" }
-  | { state: "verified" }
+  | { state: "verified"; code?: string }
   | { state: "unverified"; why: string }
   | { state: "failed"; reason: BindingFailureReason };
 
 /** The closed set the control plane records (POST /sessions/{id}/binding-failed). */
 export type BindingFailureReason =
-  | "bad_signature" | "fingerprint_mismatch" | "no_proof" | "multiple_transports" | "unsupported_browser" | "agent_refused";
+  | "bad_signature" | "fingerprint_mismatch" | "no_proof" | "multiple_transports" | "unsupported_browser" | "agent_refused"
+  // A person compared the 6-digit codes on both ends and reported they differ (docs/69 6.1, detection).
+  | "sas_mismatch";
 
 export interface ConsoleBindingDeps {
   binding: DeviceBinding | undefined;
@@ -197,6 +203,12 @@ export interface ConsoleBindingDeps {
   sessionId: string;
   sendStart(grant: string, consoleNonceHex: string): void;
   sendConsoleProof(sigHex: string): void;
+  /** Binding v2 senders; when both are present AND the server hints v2, the exchange runs v2 (commitment first). */
+  sendStartV2?(grant: string, commitmentHex: string): void;
+  sendConsoleProofV2?(consoleNonceHex: string, sigHex: string): void;
+  /** docs/69 6.1: the build the ROUTED agent announced (signaling's `brokered`). v2 runs only when this says >= 0.1.33
+   *  as well as the server's hint: the hint is decided before routing and can be stale (a rolled-back agent). */
+  peerAgentVersion?(): string | undefined;
   /** Resolves with the agent's proof, or null on timeout. */
   /** Resolves with the agent's proof, `{ refused }` when the agent answered BindStart with a negative BindResult
    *  (it refused the grant), or null on timeout. */
@@ -226,7 +238,7 @@ export const LATE_PROOF_WINDOW_MS = 30_000;
 /** Control messages that may go out BEFORE the peer is verified: the binding exchange itself and session
  *  setup that carries nothing the technician typed or chose to send (docs/69). Everything else waits. */
 const PRE_BINDING_CONTROL = new Set([
-  "BindStart", "BindConsoleProof", "InstallSessionPolicy", "RequestMonitors", "SelectMonitor", "WatchedMonitors",
+  "BindStart", "BindConsoleProof", "BindStartV2", "BindConsoleProofV2", "InstallSessionPolicy", "RequestMonitors", "SelectMonitor", "WatchedMonitors",
   "FrameDisplayed", "RequestQuality", "SetQuality", "SetBackground", "RequestBackstageFeatures",
 ]);
 
@@ -254,6 +266,20 @@ export async function runConsoleBinding(d: ConsoleBindingDeps): Promise<BindingS
   }
 }
 
+/** The first agent build that speaks binding v2 (control-plane/session_binding.go bindingV2MinAgent). */
+const BINDING_V2_MIN_AGENT: readonly [number, number, number] = [0, 1, 33];
+
+/** Whether an announced agent build ("0.1.33+74408a1f") is at least BINDING_V2_MIN_AGENT. Unknown or unparsable: no. */
+export function speaksBindingV2(version: string | undefined): boolean {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:[+-].*)?$/.exec(version?.trim() ?? "");
+  if (!m) return false;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== BINDING_V2_MIN_AGENT[i]) return v[i] > BINDING_V2_MIN_AGENT[i];
+  }
+  return true;
+}
+
 async function runConsoleBindingSteps(d: ConsoleBindingDeps): Promise<BindingStatus> {
   const mode = d.binding?.mode ?? "warn";
   const unbound = (why: string): BindingStatus =>
@@ -266,7 +292,17 @@ async function runConsoleBindingSteps(d: ConsoleBindingDeps): Promise<BindingSta
   // Narrowed once here: the late path below runs in a closure, where property narrowing does not survive.
   const ready = { ...d, binding: { ...d.binding, device_pubkey: d.binding.device_pubkey }, key: d.key };
   const consoleNonce = d.randomBytes(32);
-  d.sendStart(d.binding.grant, bytesToHex(consoleNonce));
+  // v2 only when the server hints it AND the agent this connection was actually routed to announced a v2 build; one
+  // version per connection, no mid-connection fallback (Codex release-1333 r3).
+  let finish: (r: { agentNonceHex: string; sigHex: string } | { refused: string | null }) => Promise<BindingStatus>;
+  if (d.binding.v2 && d.sendStartV2 && d.sendConsoleProofV2 && speaksBindingV2(d.peerAgentVersion?.())) {
+    const commitment = await commitV2(consoleNonce);
+    d.sendStartV2(d.binding.grant, bytesToHex(commitment));
+    finish = (r) => finishExchangeV2(ready, sessionId, consoleNonce, commitment, r);
+  } else {
+    d.sendStart(d.binding.grant, bytesToHex(consoleNonce));
+    finish = (r) => finishExchange(ready, sessionId, consoleNonce, r);
+  }
   const reply = await d.awaitAgentProof(d.proofTimeoutMs ?? BIND_REPLY_TIMEOUT_MS);
   if (!reply) {
     const late = d.onLateStatus;
@@ -276,7 +312,7 @@ async function runConsoleBindingSteps(d: ConsoleBindingDeps): Promise<BindingSta
         let status: BindingStatus | null;
         try {
           const lateReply = await d.awaitAgentProof(LATE_PROOF_WINDOW_MS);
-          status = lateReply ? await finishExchange(ready, sessionId, consoleNonce, lateReply) : null;
+          status = lateReply ? await finish(lateReply) : null;
         } catch {
           status = { state: "failed", reason: "unsupported_browser" };
         }
@@ -285,7 +321,7 @@ async function runConsoleBindingSteps(d: ConsoleBindingDeps): Promise<BindingSta
     }
     return unbound("the agent did not answer (it may need an update)");
   }
-  return finishExchange(ready, sessionId, consoleNonce, reply);
+  return finish(reply);
 }
 
 /** Everything after the agent's reply: its proof is checked against the live fingerprints, ours is sent, and the
@@ -300,13 +336,7 @@ async function finishExchange(
   if ("refused" in reply) return { state: "failed", reason: "agent_refused" };
   const proof = reply;
 
-  const report = await d.stats();
-  let fps: LiveFingerprints = report ? fingerprintsFromStats(report) : { ok: false, reason: "unsupported_browser" };
-  // No certificate stats (Firefox): fall back to the applied descriptions. Two transports stays a failure.
-  if (!fps.ok && fps.reason === "unsupported_browser" && d.descriptions) {
-    const desc = d.descriptions();
-    fps = fingerprintsFromDescriptions(desc.local, desc.remote);
-  }
+  const fps = await liveFingerprints(d);
   if (!fps.ok) return { state: "failed", reason: fps.reason };
   const transcript: BindTranscript = {
     sessionId,
@@ -324,4 +354,106 @@ async function finishExchange(
   const result = await d.awaitResult(BIND_REPLY_TIMEOUT_MS);
   if (!result || !result.ok) return { state: "failed", reason: "agent_refused" };
   return { state: "verified" };
+}
+
+/** The live DTLS fingerprints: certificate stats, else the applied descriptions (Firefox). */
+async function liveFingerprints(d: ConsoleBindingDeps): Promise<LiveFingerprints> {
+  const report = await d.stats();
+  let fps: LiveFingerprints = report ? fingerprintsFromStats(report) : { ok: false, reason: "unsupported_browser" };
+  // No certificate stats (Firefox): fall back to the applied descriptions. Two transports stays a failure.
+  if (!fps.ok && fps.reason === "unsupported_browser" && d.descriptions) {
+    const desc = d.descriptions();
+    fps = fingerprintsFromDescriptions(desc.local, desc.remote);
+  }
+  return fps;
+}
+
+/** v2 after the agent's reply: verify its proof over the v2 transcript (which names the commitment), then REVEAL
+ *  the nonce with our proof over the transcript and the opening. Verified carries the comparison code. */
+async function finishExchangeV2(
+  d: ConsoleBindingDeps & { binding: DeviceBinding & { device_pubkey: string }; key: ConsoleKey },
+  sessionId: Uint8Array,
+  consoleNonce: Uint8Array,
+  commitment: Uint8Array,
+  reply: { agentNonceHex: string; sigHex: string } | { refused: string | null },
+): Promise<BindingStatus> {
+  if ("refused" in reply) return { state: "failed", reason: "agent_refused" };
+  const fps = await liveFingerprints(d);
+  if (!fps.ok) return { state: "failed", reason: fps.reason };
+  const t: BindTranscriptV2 = {
+    sessionId,
+    agentCertSha256: fps.agent,
+    consoleCertSha256: fps.console,
+    devicePubkey: hexToBytes(d.binding.device_pubkey),
+    consolePubkey: hexToBytes(d.key.publicHex),
+    commitment,
+    agentNonce: hexToBytes(reply.agentNonceHex),
+  };
+  const verify = d.verify ?? verifyEd25519;
+  if (!(await verify(d.binding.device_pubkey, agentSigningBytesV2(t), reply.sigHex))) {
+    return { state: "failed", reason: "bad_signature" };
+  }
+  const sig = await d.key.sign(consoleSigningBytesV2(t, consoleNonce));
+  d.sendConsoleProofV2!(bytesToHex(consoleNonce), bytesToHex(sig));
+  const result = await d.awaitResult(BIND_REPLY_TIMEOUT_MS);
+  if (!result || !result.ok) return { state: "failed", reason: "agent_refused" };
+  return { state: "verified", code: formatComparisonCode(await comparisonCodeV2(t, consoleNonce)) };
+}
+
+// ---- binding v2 bytes, pinned against crates/protocol/src/session_binding.rs by the same golden values ----
+
+const ascii = (s: string) => new TextEncoder().encode(s);
+export const SESSION_BIND_V2_TAG = ascii("RMTSESSBINDv2\0");
+export const BIND_COMMIT_V2_TAG = ascii("RMTBIND-COMMIT-v2\0");
+export const SAS_V2_TAG = ascii("RMTSASv2\0");
+
+export interface BindTranscriptV2 {
+  sessionId: Uint8Array; // 16
+  agentCertSha256: Uint8Array; // 32
+  consoleCertSha256: Uint8Array; // 32
+  devicePubkey: Uint8Array; // 32
+  consolePubkey: Uint8Array; // 32
+  commitment: Uint8Array; // 32
+  agentNonce: Uint8Array; // 32
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+async function sha256(bytes: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
+  return new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+}
+
+/** SHA-256("RMTBIND-COMMIT-v2\0" || nonce). */
+export function commitV2(consoleNonce: Uint8Array): Promise<Uint8Array> {
+  return sha256(concatBytes([BIND_COMMIT_V2_TAG, consoleNonce]));
+}
+
+/** u8(2) || session || agent_fp || console_fp || device_pk || console_pk || commitment || agent_nonce. */
+export function v2Common(t: BindTranscriptV2): Uint8Array<ArrayBuffer> {
+  return concatBytes([new Uint8Array([2]), t.sessionId, t.agentCertSha256, t.consoleCertSha256, t.devicePubkey, t.consolePubkey, t.commitment, t.agentNonce]);
+}
+
+export function agentSigningBytesV2(t: BindTranscriptV2): Uint8Array<ArrayBuffer> {
+  return concatBytes([SESSION_BIND_V2_TAG, v2Common(t), new Uint8Array([ROLE_AGENT])]);
+}
+
+export function consoleSigningBytesV2(t: BindTranscriptV2, consoleNonce: Uint8Array): Uint8Array<ArrayBuffer> {
+  return concatBytes([SESSION_BIND_V2_TAG, v2Common(t), new Uint8Array([ROLE_CONSOLE]), consoleNonce]);
+}
+
+/** u32_be(SHA-256(SAS tag || common || console_nonce)[0..4]) mod 1_000_000. */
+export async function comparisonCodeV2(t: BindTranscriptV2, consoleNonce: Uint8Array): Promise<number> {
+  const d = await sha256(concatBytes([SAS_V2_TAG, v2Common(t), consoleNonce]));
+  return (((d[0] << 24) >>> 0) + (d[1] << 16) + (d[2] << 8) + d[3]) % 1_000_000;
+}
+
+/** "123 456", zero-padded: the form both screens show. */
+export function formatComparisonCode(code: number): string {
+  const s = String(code % 1_000_000).padStart(6, "0");
+  return `${s.slice(0, 3)} ${s.slice(3)}`;
 }

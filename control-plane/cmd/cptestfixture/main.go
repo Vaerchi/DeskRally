@@ -165,6 +165,11 @@ func main() {
 	srv.BindingEnabled = true // docs/69: the live e2e exercises session binding
 	machines := cp.NewInMemoryMachineStore()
 	srv.Machines = machines
+	// A presence feed, as signaling provides in production: every fixture machine is online, and the versions
+	// recorded through POST /fixture/agent-version are what the "running agent" announced. The docs/69 v2 hint is
+	// taken from live presence (Codex release-1333 P2), so a v2 e2e needs this.
+	presence := &fixturePresence{machines: machines, versions: map[string]string{}}
+	srv.Presence = presence
 	srv.MachineProperties = cp.NewInMemoryMachinePropertyStore()
 	records := cp.NewInMemorySessionRecordStore()
 	srv.SessionRecords = records
@@ -223,6 +228,7 @@ func main() {
 			http.Error(w, "device_id and version required", http.StatusBadRequest)
 			return
 		}
+		presence.setVersion(req.DeviceID, req.Version)
 		if _, err := machines.RecordAgentVersion(r.Context(), fixtureTenantID, map[string]string{req.DeviceID: req.Version}); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -233,4 +239,35 @@ func main() {
 	if err := http.Serve(ln, mux); err != nil {
 		log.Fatalf("cptestfixture: serve: %v", err)
 	}
+}
+
+// fixturePresence is the fixture's stand-in for signaling's presence feed (GET /internal/presence).
+type fixturePresence struct {
+	machines *cp.InMemoryMachineStore
+	mu       sync.Mutex
+	versions map[string]string
+}
+
+func (p *fixturePresence) setVersion(deviceID, version string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.versions[deviceID] = version
+}
+
+func (p *fixturePresence) FetchPresence(ctx context.Context) (*cp.Presence, error) {
+	list, err := p.machines.ListMachines(ctx, fixtureTenantID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := &cp.Presence{Online: map[string]time.Time{}, VersionByDevice: map[string]string{}, AsOf: now}
+	for _, m := range list {
+		out.Online[m.DeviceID] = now
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, v := range p.versions {
+		out.VersionByDevice[id] = v
+	}
+	return out, nil
 }

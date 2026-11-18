@@ -750,7 +750,7 @@ function Assert-NoDemoBinariesShipped {
       No insecure development demo may reach a release artifact (docs/25 F16).
 
       `agent/src/bin` holds ONLY dev tools — shell_server (a PowerShell over a loopback socket),
-      backstage_server (file-browse and registry-read over a loopback socket) and ws_probe. The
+      under_the_hood_server (file-browse and registry-read over a loopback socket) and ws_probe. The
       binaries that genuinely ship live in `crates/agent-windows/src/bin` (agent_host,
       stream_probe). Each demo now demands an explicit --insecure-dev and a per-run token, but the
       right place for a demo that hands out shells is "not in the download at all".
@@ -758,7 +758,7 @@ function Assert-NoDemoBinariesShipped {
       THE DENYLIST IS DERIVED FROM THE DIRECTORY, not written out here, so a dev binary added later
       is covered the day it is added rather than the day someone remembers this guard. That is the
       difference between a defence and a defence that exists at one call site (docs/25 F16's
-      sibling: shell_server was found and backstage_server was not, because the finding named one).
+      sibling: shell_server was found and backstage_server (now under_the_hood_server) was not, because the finding named one).
 
       It is a directory scan, so it still means something under -SkipRust: it inspects whatever is
       staged in dist/, including leftovers from an earlier full build.

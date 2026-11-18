@@ -421,6 +421,8 @@ export type ServerToClient =
       peer_pubkey: string;
       access?: string;
       access_version?: number;
+      /** The routed agent's announced build (untrusted; docs/69 6.1 picks the binding version from it). */
+      peer_agent_version?: string;
     }
   | {
       type: "relay_assignment";

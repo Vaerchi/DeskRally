@@ -33,7 +33,9 @@ export class CoreError extends Error {
 
 type CoreApi = Pick<ConsoleApi, "startBrokeredSession" | "endSession" | "setSessionNote" | "requestToolboxRun" | "requestCommandRun" | "renewSessionPolicy" | "ingestAudit"> & Partial<Pick<ConsoleApi, "reportSessionBindingFailed">>;
 type ControlHandlers = NonNullable<ConstructorParameters<typeof ControlClient>[1]>;
-type CoreControl = Pick<ControlClient, "installSessionPolicy" | "runCommand" | "handleMessage" | "sendBindStart" | "sendBindConsoleProof">;
+type CoreControl = Pick<ControlClient, "installSessionPolicy" | "runCommand" | "handleMessage" | "sendBindStart" | "sendBindConsoleProof">
+  // docs/69 6.2: binding v2 senders; optional, and v2 runs only when both exist and the server hints it.
+  & Partial<Pick<ControlClient, "sendBindStartV2" | "sendBindConsoleProofV2">>;
 type CoreSignaling = Pick<SignalingClient, "open" | "send" | "close">;
 
 export interface BrokeredSessionCoreDeps {
@@ -378,6 +380,11 @@ export class BrokeredSessionCore {
       sessionId: this.id,
       sendStart: (grant, nonce) => this.control!.sendBindStart(grant, nonce),
       sendConsoleProof: (sig) => this.control!.sendBindConsoleProof(sig),
+      ...(this.control?.sendBindStartV2 && this.control.sendBindConsoleProofV2
+        ? { sendStartV2: (grant: string, commitment: string) => this.control!.sendBindStartV2!(grant, commitment),
+            sendConsoleProofV2: (nonce: string, sig: string) => this.control!.sendBindConsoleProofV2!(nonce, sig) }
+        : {}),
+      peerAgentVersion: () => (this.transport as { peerAgentVersion?: () => string | undefined } | undefined)?.peerAgentVersion?.(),
       awaitAgentProof: (ms) => waitFor((r) => { this.bindWaiters.proof = r; }, ms),
       awaitResult: (ms) => waitFor((r) => { this.bindWaiters.result = r; }, ms),
       stats: async () => (this.transport as { getStats?: () => Promise<RTCStatsReport | undefined> } | undefined)?.getStats?.(),

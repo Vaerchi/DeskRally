@@ -3,7 +3,7 @@
 //! real [`Dispatcher`] choke point; this binary just issues itself a demo grant and holds one
 //! dispatcher (one audit chain) for the session.
 //!
-//!   cargo run --bin backstage_server -- --insecure-dev   # prints this run's token
+//!   cargo run --bin under_the_hood_server -- --insecure-dev   # prints this run's token
 //!   curl -s -H "Authorization: Bearer <token>" 127.0.0.1:8072/backstage/exec -d '{"type":"GetSystemInfo"}'
 //!
 //! Production replaces the demo grant with the relay-issued signed grant and carries these
@@ -35,11 +35,11 @@ async fn main() {
     if !declared {
         eprintln!(
             "refusing to start.\n\n\
-             backstage_server is an INSECURE DEVELOPMENT DEMO: it grants file-browse and\n\
+             under_the_hood_server is an INSECURE DEVELOPMENT DEMO: it grants file-browse and\n\
              registry-read over a loopback port to whoever presents this run's token. It is\n\
              not a product feature and is never shipped in a release artifact.\n\n\
              If that is what you want, say so:\n\
-             \n    cargo run --bin backstage_server -- --insecure-dev\n\
+             \n    cargo run --bin under_the_hood_server -- --insecure-dev\n\
              \nor set RMT_BACKSTAGE_DEMO_INSECURE_DEV=1."
         );
         std::process::exit(2);

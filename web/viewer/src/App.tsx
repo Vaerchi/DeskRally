@@ -1,4 +1,5 @@
 import { RallyMark, RallyWelcome } from "./components/RallyIdentity";
+import { withAuditWarning } from "./lib/audit_forward";
 import { SessionViewer } from "./components/SessionViewer";
 import { ConnectionDiagnostics } from "./components/ConnectionDiagnostics";
 import { BackgroundTracker } from "./lib/background";
@@ -468,6 +469,9 @@ export default function App() {
   const [viewOnly, setViewOnly] = useState(false);
   // docs/69: whether this connection is bound to the machine's key. null = no live connection.
   const [bindingStatus, setBindingStatus] = useState<BindingStatus | null>(null);
+  // docs/69 6.1: "Codes differ" for the connection whose code is ON SCREEN. Held in state next to the status it came
+  // with, so a stale panel can only reach its own connection's handler (which then fails its currency check).
+  const [bindingDiffer, setBindingDiffer] = useState<(() => void) | null>(null);
   const [observing, setObserving] = useState(false);
   const observingRef = useRef(false);
   // Remote support: a transient status line while a reboot the operator requested is in flight.
@@ -1072,13 +1076,13 @@ export default function App() {
       clearInterval(auditFlushTimer.current);
       auditFlushTimer.current = null;
     }
-    void auditForwarderRef.current?.flush().catch(() => setError("Audit forwarding failed; the audit trail may be incomplete."));
+    void auditForwarderRef.current?.flush().catch(() => setError(withAuditWarning));
 
     auditSessionIdRef.current = sessionId;
     auditForwarderRef.current = makeAuditForwarder(consoleApiRef.current, sessionId, (e) => setError(e.message));
     if (auditForwarderRef.current) {
       auditFlushTimer.current = setInterval(() => {
-        void auditForwarderRef.current?.flush().catch(() => setError("Audit forwarding failed; the audit trail may be incomplete."));
+        void auditForwarderRef.current?.flush().catch(() => setError(withAuditWarning));
       }, AUDIT_FLUSH_INTERVAL_MS);
     }
   }, []);
@@ -1236,7 +1240,7 @@ export default function App() {
       auditFlushTimer.current = null;
     }
     // keepaliveFirstBatch: teardown also runs from `pagehide`, where an ordinary fetch is abandoned.
-    void auditForwarderRef.current?.flush({ keepaliveFirstBatch: true }).catch(() => setError("Audit forwarding failed; the audit trail may be incomplete."));
+    void auditForwarderRef.current?.flush({ keepaliveFirstBatch: true }).catch(() => setError(withAuditWarning));
     auditForwarderRef.current = null;
     auditSessionIdRef.current = null;
 
@@ -2090,6 +2094,7 @@ export default function App() {
         // processes it at once and holds everything after it (the policy, the monitor list request...)
         // until our proof verifies, then replays them in order. Input stays held until this settles.
         setBindingStatus(brokered?.binding?.device ? { state: "pending" } : null);
+        setBindingDiffer(null);
         // How a binding outcome lands, on time or late (a late proof at warn, after the session already settled
         // "not verified" and released its held traffic: a late `verified` upgrades the mark, a late `failed` ends).
         const bindingIsCurrent = () => isCurrent() && transportRef.current === transport;
@@ -2097,6 +2102,10 @@ export default function App() {
           if (!bindingIsCurrent()) return;
           // A server that sends no binding material at all (binding not rolled out) gets no mark.
           setBindingStatus(brokered?.binding?.device ? status : null);
+          // The mismatch action belongs to THIS connection and this code (Codex sas-impl r1).
+          setBindingDiffer(status.state === "verified" && status.code
+            ? () => () => settleBinding({ state: "failed", reason: "sas_mismatch" })
+            : null);
           if (status.state !== "failed") { transport.releaseOutbound(); return; }
           transport.discardOutbound();
           // Not the machine we asked for, or it would not prove it: end the session, say why, record it.
@@ -2107,7 +2116,19 @@ export default function App() {
             : "This connection could not be verified as the machine you asked for. It may have been intercepted, so the session was ended.");
           const sid = brokered?.sessionId;
           if (sid) void consoleApiRef.current.reportSessionBindingFailed(sid, status.reason).catch(() => {});
-          transport.close(); signaling.close();
+          // TERMINAL (Codex sas-impl r1): a failed verification, or a technician's "codes differ", must never be undone
+          // by automatic recovery reconnecting to the same machine. teardown() cancels recovery, releases the brokered
+          // session and closes the transport and signaling; the message stays on screen.
+          const message = status.reason === "sas_mismatch"
+            ? "You reported that the codes differ, so the session was ended. This connection may have been intercepted."
+            : null;
+          teardown();
+          setSession(null);
+          setState("idle");
+          setStream(null);
+          setBindingStatus(null);
+          setBindingDiffer(null);
+          if (message) setError(message);
         };
         // Wait for the channel only when an exchange will run; with no binding material the outcome is immediate.
         void (brokered?.binding?.device?.grant ? channelOpen : Promise.resolve()).then(() => runConsoleBinding({
@@ -2118,6 +2139,9 @@ export default function App() {
           // exchange still running when that happens must not put its proof on the new connection (Codex enforce r3).
           sendStart: (grant, nonce) => { if (bindingIsCurrent()) control.sendBindStart(grant, nonce); },
           sendConsoleProof: (sig) => { if (bindingIsCurrent()) control.sendBindConsoleProof(sig); },
+          sendStartV2: (grant, commitment) => { if (bindingIsCurrent()) control.sendBindStartV2(grant, commitment); },
+          sendConsoleProofV2: (nonce, sig) => { if (bindingIsCurrent()) control.sendBindConsoleProofV2(nonce, sig); },
+          peerAgentVersion: () => transport.peerAgentVersion(),
           awaitAgentProof: (ms) => waitBind((r) => { bindWaiters.proof = r; }, ms),
           awaitResult: (ms) => waitBind((r) => { bindWaiters.result = r; }, ms),
           stats: () => transport.getStats(),
@@ -3377,6 +3401,7 @@ export default function App() {
                   recoveryNotice={recoveryNotice}
                   inputHeld={bindingStatus?.state === "pending" || bindingStatus?.state === "failed"}
                   bindingStatus={bindingStatus}
+          onBindingCodesDiffer={bindingDiffer ?? undefined}
                   onReconnect={reconnectManually}
                   audioAvailable={audioAvailable}
                   monitors={toMonitorInfo(monitors)}

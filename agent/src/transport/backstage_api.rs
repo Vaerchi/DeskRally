@@ -209,7 +209,7 @@ pub mod http {
     /// token check there would be meaningless. This wrapper is for the DEMO binary, which listens
     /// on a loopback port and issues itself a grant.
     ///
-    /// It exists because `backstage_server` is `shell_server`'s sibling and had the identical hole.
+    /// It exists because `under_the_hood_server` (formerly backstage_server) is `shell_server`'s sibling and had the identical hole.
     /// F16 names only the shell demo, but this one served `FileBrowse` and `RegistryRead` to any
     /// caller that could reach 127.0.0.1:8072 — and fixing one sibling while leaving the other is
     /// the failure shape this project has already paid for more than once.

@@ -75,7 +75,7 @@ impl BackstageWorker {
         let load = Arc::new(Load::default());
         let worker_load = Arc::clone(&load);
         std::thread::Builder::new()
-            .name("backstage-worker".into())
+            .name("under-the-hood-worker".into())
             .spawn(move || run(rx, replies, now_ms, worker_load))
             .expect("spawn backstage worker");
         Self { tx, load }

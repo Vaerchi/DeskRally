@@ -54,3 +54,9 @@ OPUS_LIB_DIR = { value = "C:/vcpkg/installed/x64-windows-static/lib", force = fa
 VPX_LIB_DIR = { value = "C:/vcpkg/installed/x64-windows-static/lib", force = false }
 VPX_INCLUDE_DIR = { value = "C:/vcpkg/installed/x64-windows-static/include", force = false }
 VPX_VERSION = { value = "1.13.0", force = false }
+# Tests never listen on a real network interface: WebRTC gathers loopback candidates only, with mDNS off
+# (crates/transport-webrtc build_api). Windows Firewall otherwise prompts on the desktop for every freshly hashed
+# test executable. Cargo passes [env] to processes it launches (cargo test / cargo run), and the e2e agents those
+# tests spawn inherit it; an installed agent never sees it. `force = false`: export RMT_TEST_ICE_LOOPBACK=0 to
+# exercise real interfaces deliberately.
+RMT_TEST_ICE_LOOPBACK = { value = "1", force = false }

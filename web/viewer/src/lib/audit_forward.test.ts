@@ -6,6 +6,8 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
+  AUDIT_WARNING,
+  withAuditWarning,
   AuditForwarder,
   GAP_HOLD_MS,
   KEEPALIVE_BODY_BUDGET,
@@ -352,5 +354,17 @@ describe("AuditForwarder holds back a seq gap (1.3.18 release review)", () => {
     f.enqueue(ev(2));
     await f.flush({ keepaliveFirstBatch: true });
     expect(calls.map((c) => c.events.map((e) => e.seq))).toEqual([[0], [2]]);
+  });
+});
+
+describe("withAuditWarning (Codex sas-impl r2/r3)", () => {
+  it("adds to the message on screen instead of replacing it, once", () => {
+    expect(withAuditWarning(null)).toBe(AUDIT_WARNING);
+    const why = "You reported that the codes differ, so the session was ended.";
+    const once = withAuditWarning(why);
+    expect(once).toBe(`${why} ${AUDIT_WARNING}`);
+    // A second handler on the same rejected flush keeps the reason.
+    expect(withAuditWarning(once)).toBe(once);
+    expect(withAuditWarning(AUDIT_WARNING)).toBe(AUDIT_WARNING);
   });
 });

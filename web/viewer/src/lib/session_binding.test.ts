@@ -2,7 +2,7 @@ import { ChannelId } from "./protocol";
 import { describe, expect, it } from "vitest";
 import {
   allowedBeforeBinding, bytesToHex, createConsoleKey, fingerprintFromSdp, fingerprintsFromDescriptions, fingerprintsFromStats, hexToBytes, parseDeviceBinding, ROLE_AGENT, ROLE_CONSOLE,
-  runConsoleBinding, transcriptBytes, uuidBytes, verifyEd25519, type BindingStatus, type BindTranscript, type ConsoleBindingDeps,
+  runConsoleBinding, speaksBindingV2, transcriptBytes, uuidBytes, verifyEd25519, commitV2, v2Common, comparisonCodeV2, formatComparisonCode, agentSigningBytesV2, consoleSigningBytesV2, type BindTranscriptV2, type BindingStatus, type BindTranscript, type ConsoleBindingDeps,
 } from "./session_binding";
 
 const subtle = globalThis.crypto.subtle;
@@ -242,5 +242,97 @@ describe("a late agent proof (an enforcing agent whose loop started late, Codex 
     expect((await run({ lateNever: true, onLate: (st) => calls.push(st) })).state).toBe("unverified");
     await new Promise((r) => setTimeout(r, 20));
     expect(calls).toEqual([]);
+  });
+});
+
+describe("binding v2 bytes (golden values pinned in crates/protocol/src/session_binding.rs)", () => {
+  const fill = (n: number, b: number) => new Uint8Array(n).fill(b);
+  it("commitment, transcript and comparison code match the Rust vectors", async () => {
+    const nonce = fill(32, 0xd4);
+    const commitment = await commitV2(nonce);
+    expect(bytesToHex(commitment)).toBe("8b105150116754b88aa06c646a02d57c5c63f07aa7d07b885fc4dfd88ef891cd");
+    const t: BindTranscriptV2 = {
+      sessionId: fill(16, 0x22), agentCertSha256: fill(32, 0xa1), consoleCertSha256: fill(32, 0xb2),
+      devicePubkey: fill(32, 0xe5), consolePubkey: fill(32, 0xf6), commitment, agentNonce: fill(32, 0xc3),
+    };
+    expect(v2Common(t).length).toBe(1 + 16 + 6 * 32);
+    expect(await comparisonCodeV2(t, nonce)).toBe(697670);
+    expect(formatComparisonCode(697670)).toBe("697 670");
+    expect(formatComparisonCode(42)).toBe("000 042");
+    const a = agentSigningBytesV2(t);
+    const c = consoleSigningBytesV2(t, nonce);
+    expect(a[a.length - 1]).toBe(ROLE_AGENT);
+    expect(c.slice(0, a.length - 1)).toEqual(a.slice(0, a.length - 1));
+    expect(c[a.length - 1]).toBe(ROLE_CONSOLE);
+  });
+
+  it("an honest v2 exchange verifies and both ends compute the same code; a server hint is required", async () => {
+    const agentKey = (await createConsoleKey(subtle))!; // an Ed25519 key standing in for the device key
+    const key = (await createConsoleKey(subtle))!;
+    const nonceFill = 0xd4;
+    let commitHex = "";
+    let revealed = "";
+    let consoleSig = "";
+    let usedV1 = false;
+    const agentOwn = 0xa1, agentSees = 0xb2;
+    const deps = (v2: boolean): ConsoleBindingDeps => ({
+      binding: { mode: "warn", device_pubkey: agentKey.publicHex, grant: "{}", ...(v2 ? { v2: true } : {}) },
+      peerAgentVersion: () => "0.1.33+74408a1f",
+      key,
+      sessionId: SESSION,
+      sendStart: () => { usedV1 = true; },
+      sendConsoleProof: () => {},
+      sendStartV2: (_g, c) => { commitHex = c; },
+      sendConsoleProofV2: (n, s) => { revealed = n; consoleSig = s; },
+      awaitAgentProof: async () => {
+        const t: BindTranscriptV2 = {
+          sessionId: uuidBytes(SESSION), agentCertSha256: fill(32, agentOwn), consoleCertSha256: fill(32, agentSees),
+          devicePubkey: hexToBytes(agentKey.publicHex), consolePubkey: hexToBytes(key.publicHex),
+          commitment: hexToBytes(commitHex), agentNonce: fill(32, 0xc3),
+        };
+        return { agentNonceHex: bytesToHex(fill(32, 0xc3)), sigHex: bytesToHex(await agentKey.sign(agentSigningBytesV2(t))) };
+      },
+      awaitResult: async () => {
+        // The agent's checks: the nonce opens the commitment, and the console signature verifies.
+        const opens = bytesToHex(await commitV2(hexToBytes(revealed))) === commitHex;
+        const t: BindTranscriptV2 = {
+          sessionId: uuidBytes(SESSION), agentCertSha256: fill(32, agentOwn), consoleCertSha256: fill(32, agentSees),
+          devicePubkey: hexToBytes(agentKey.publicHex), consolePubkey: hexToBytes(key.publicHex),
+          commitment: hexToBytes(commitHex), agentNonce: fill(32, 0xc3),
+        };
+        const ok = opens && (await verifyEd25519(key.publicHex, consoleSigningBytesV2(t, hexToBytes(revealed)), consoleSig, subtle));
+        return { ok, reason: ok ? null : "console_proof_refused" };
+      },
+      stats: async () => statsFor(agentSees, agentOwn),
+      randomBytes: (n) => fill(n, nonceFill),
+      verify: (p, m, s) => verifyEd25519(p, m, s, subtle),
+    });
+    const st = await runConsoleBinding(deps(true));
+    expect(st.state).toBe("verified");
+    expect(usedV1).toBe(false);
+    // The agent computes the code from ITS transcript; it must be the same one the console shows.
+    const agentView: BindTranscriptV2 = {
+      sessionId: uuidBytes(SESSION), agentCertSha256: fill(32, agentOwn), consoleCertSha256: fill(32, agentSees),
+      devicePubkey: hexToBytes(agentKey.publicHex), consolePubkey: hexToBytes(key.publicHex),
+      commitment: hexToBytes(commitHex), agentNonce: fill(32, 0xc3),
+    };
+    expect(st.state === "verified" && st.code).toBe(formatComparisonCode(await comparisonCodeV2(agentView, fill(32, nonceFill))));
+    // Without the server's hint the console runs v1 (no code).
+    usedV1 = false;
+    await runConsoleBinding({ ...deps(false), awaitAgentProof: async () => null });
+    expect(usedV1).toBe(true);
+    // A stale hint: the agent this connection was ROUTED to announced an older build, or nothing (Codex release-1333 r3).
+    for (const routed of ["0.1.32+d67ce452", undefined, "garbage"]) {
+      usedV1 = false;
+      await runConsoleBinding({ ...deps(true), peerAgentVersion: () => routed, awaitAgentProof: async () => null });
+      expect(usedV1).toBe(true);
+    }
+  });
+});
+
+describe("speaksBindingV2 (the routed agent's announced build)", () => {
+  it("is true from 0.1.33 and false below, unknown or unparsable", () => {
+    for (const v of ["0.1.33", "0.1.33+74408a1f", "0.1.40", "0.2.0", "1.0.0-rc1"]) expect(speaksBindingV2(v)).toBe(true);
+    for (const v of ["0.1.32+d67ce452", "0.0.99", "", undefined, "v0.1.33", "0.1"]) expect(speaksBindingV2(v)).toBe(false);
   });
 });

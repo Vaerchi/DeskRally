@@ -21,7 +21,7 @@
 //! To run it for real:
 //! ```
 //! cd server/signaling && go build -o signaling.exe . && SIGNALING_ALLOWED_ORIGINS='*' ./signaling.exe   # listens on :8080
-//! cargo test -p rmt-agent-windows --test e2e_backstage -- --nocapture
+//! cargo test -p rmt-agent-windows --test e2e_under_the_hood -- --nocapture
 //! ```
 //! Override the URL with `SIGNALING_WS_URL` (default `ws://127.0.0.1:8080/ws`).
 

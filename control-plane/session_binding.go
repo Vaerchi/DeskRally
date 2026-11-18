@@ -133,7 +133,12 @@ var bindingFailureReasons = map[string]bool{
 	"multiple_transports":  true, // the peer connection used more than one DTLS transport
 	"unsupported_browser":  true, // no WebCrypto Ed25519 or certificate stats
 	"agent_refused":        true, // the agent refused the console's proof or the grant
+	"sas_mismatch":         true, // docs/69 6.1: a person compared the 6-digit codes and reported they differ
 }
+
+// bindingV2MinAgent is the first agent release that speaks binding v2 (docs/69 6.2). device_binding.v2 is a HINT
+// from the signaling-reported version: a wrong "true" costs one unverified session, a wrong "false" hides the code.
+var bindingV2MinAgent = [3]uint64{0, 1, 33}
 
 type bindingFailedRequest struct {
 	Reason string `json:"reason"`
@@ -203,12 +208,21 @@ func (s *Server) handleSessionBindingFailed(w http.ResponseWriter, r *http.Reque
 // verified.
 // sessionID is the control-plane session id the ticket carries; deviceID the agent's device id;
 // storedDeviceKey the key the control plane holds for that device.
+//
+// known is the mode a caller already read with its session admission (one policy read per start); empty means
+// "look it up" (the attended path, which has no admission). A known value goes through the same validation.
 func (s *Server) attachDeviceBinding(ctx context.Context, resp map[string]any, sessionID, deviceID, storedDeviceKey, userID, tenantID string,
-	access SessionAccessLevel, consolePubkey string, nowMs int64) *sessionRefusal {
+	known SessionBindingMode, access SessionAccessLevel, consolePubkey, agentVersion string, nowMs int64) *sessionRefusal {
 	if !s.BindingEnabled {
 		return nil // not rolled out yet: no device_binding at all, and the console shows no mark
 	}
-	mode := s.sessionBindingMode(ctx, tenantID)
+	mode := known
+	switch {
+	case s.BindingMode != nil, mode == "":
+		mode = s.sessionBindingMode(ctx, tenantID) // tests' override, or no admission read to reuse
+	case mode != SessionBindingWarn && mode != SessionBindingRequire:
+		mode = SessionBindingRequire // an unknown stored value fails closed (§3.6)
+	}
 	binding := map[string]any{"mode": string(mode)}
 	resp["device_binding"] = binding
 	if consolePubkey == "" {
@@ -243,5 +257,26 @@ func (s *Server) attachDeviceBinding(ctx context.Context, resp map[string]any, s
 	}
 	binding["device_pubkey"] = deviceKey
 	binding["grant"] = js
+	if agentVersion != "" && agentVersionAtLeast(agentVersion, bindingV2MinAgent) {
+		binding["v2"] = true
+	}
 	return nil
+}
+
+// liveAgentVersion is the build a connected device announced to signaling, or "" when the feed is unavailable or
+// the device announced none. It feeds ONLY the device_binding.v2 hint, which is advisory (docs/69 6.2: a wrong
+// value can suppress the optional code comparison or fail the binding closed, never weaken it), so this fails soft
+// and is bounded so a slow feed cannot stall a connect.
+func (s *Server) liveAgentVersion(ctx context.Context, deviceID string) string {
+	if s.Presence == nil || deviceID == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	snap, err := s.Presence.FetchPresence(ctx)
+	if err != nil {
+		return ""
+	}
+	v, _ := snap.ObservedAgentVersion(deviceID)
+	return v
 }

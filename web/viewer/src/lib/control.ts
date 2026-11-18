@@ -310,6 +310,9 @@ export type ControlMessage =
   | { t: "BindStart"; c: { grant: string; console_nonce: string } }
   | { t: "BindAgentProof"; c: { agent_nonce: string; sig: string } }
   | { t: "BindConsoleProof"; c: { sig: string } }
+  // Binding v2 (docs/69 6.2): the start carries a COMMITMENT to the console nonce; the proof reveals the nonce.
+  | { t: "BindStartV2"; c: { grant: string; commitment: string } }
+  | { t: "BindConsoleProofV2"; c: { console_nonce: string; sig: string } }
   | { t: "BindResult"; c: { ok: boolean; reason: string | null } }
   // Loops 79/80: agent → controller ack. `access` is the level the POLICY carried; `view_only` is the
   // session's EFFECTIVE input state afterwards, which can differ — the agent applies a policy as a
@@ -572,6 +575,12 @@ export function encodeControl(msg: ControlMessage): Uint8Array {
       break;
     case "BindConsoleProof":
       obj = { t: msg.t, c: { sig: msg.c.sig } };
+      break;
+    case "BindStartV2":
+      obj = { t: msg.t, c: { grant: msg.c.grant, commitment: msg.c.commitment } };
+      break;
+    case "BindConsoleProofV2":
+      obj = { t: msg.t, c: { console_nonce: msg.c.console_nonce, sig: msg.c.sig } };
       break;
     case "BindResult":
       obj = { t: msg.t, c: { ok: msg.c.ok, reason: msg.c.reason } };
@@ -918,6 +927,16 @@ export function decodeControl(bytes: Uint8Array): ControlMessage {
       const c = obj.c as { sig?: unknown } | undefined;
       if (!c || !isHexOfLength(c.sig, 128)) throw new Error("malformed BindConsoleProof");
       return { t: "BindConsoleProof", c: { sig: c.sig } };
+    }
+    case "BindStartV2": {
+      const c = obj.c as { grant?: unknown; commitment?: unknown } | undefined;
+      if (!c || typeof c.grant !== "string" || !isHexOfLength(c.commitment, 64)) throw new Error("malformed BindStartV2");
+      return { t: "BindStartV2", c: { grant: c.grant, commitment: c.commitment } };
+    }
+    case "BindConsoleProofV2": {
+      const c = obj.c as { console_nonce?: unknown; sig?: unknown } | undefined;
+      if (!c || !isHexOfLength(c.console_nonce, 64) || !isHexOfLength(c.sig, 128)) throw new Error("malformed BindConsoleProofV2");
+      return { t: "BindConsoleProofV2", c: { console_nonce: c.console_nonce, sig: c.sig } };
     }
     case "BindResult": {
       const c = obj.c as { ok?: unknown; reason?: unknown } | undefined;
@@ -1354,6 +1373,18 @@ export const bindStart = (grant: string, consoleNonceHex: string): ControlMessag
 /** docs/69 step 3: the console's proof. */
 export const bindConsoleProof = (sigHex: string): ControlMessage => ({ t: "BindConsoleProof", c: { sig: sigHex } });
 
+/** docs/69 6.2, binding v2 step 1: start with a commitment to the console nonce. */
+export const bindStartV2 = (grant: string, commitmentHex: string): ControlMessage => ({
+  t: "BindStartV2",
+  c: { grant, commitment: commitmentHex },
+});
+
+/** Binding v2 step 3: reveal the nonce with the console's proof. */
+export const bindConsoleProofV2 = (consoleNonceHex: string, sigHex: string): ControlMessage => ({
+  t: "BindConsoleProofV2",
+  c: { console_nonce: consoleNonceHex, sig: sigHex },
+});
+
 /** Install a control-plane-signed session access policy (loops 79/80). `signedPolicy` is the
  *  `SignedSessionPolicy` JSON exactly as `POST /sessions` returned it — forwarded verbatim, never
  *  re-serialized, because the signature covers the claims and the agent re-derives them from these bytes. */
@@ -1778,6 +1809,16 @@ export class ControlClient {
   /** docs/69 step 3. */
   sendBindConsoleProof(sigHex: string): void {
     this.send(encodeControl(bindConsoleProof(sigHex)));
+  }
+
+  /** docs/69 6.2, binding v2 step 1. */
+  sendBindStartV2(grant: string, commitmentHex: string): void {
+    this.send(encodeControl(bindStartV2(grant, commitmentHex)));
+  }
+
+  /** Binding v2 step 3. */
+  sendBindConsoleProofV2(consoleNonceHex: string, sigHex: string): void {
+    this.send(encodeControl(bindConsoleProofV2(consoleNonceHex, sigHex)));
   }
 
   /** Ask the agent to enumerate its monitors. The reply arrives via {@link handleMessage}. */

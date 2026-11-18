@@ -297,6 +297,10 @@ impl GuestSurface for GuestWindow {
         self.push(GuestEvent::ClipboardShared { to_technician });
     }
 
+    fn set_comparison_code(&self, code: &str) {
+        self.push(GuestEvent::ComparisonCode(code.to_string()));
+    }
+
     fn close(&mut self) {
         if let Some(thread) = self.thread.take() {
             unsafe {
@@ -1443,7 +1447,10 @@ mod tests {
         use windows::Win32::Graphics::Gdi::*;
         unsafe {
             for compact in [false, true] {
-                let width = 380i32;
+                // RMT_GUEST_RENDER_CODE: the real window width, a v2 connection code, and a maximal host and reason
+                // (docs/69 6.1, Codex sas-impl r6: the digits must survive both).
+                let with_code = std::env::var("RMT_GUEST_RENDER_CODE").is_ok();
+                let width = if with_code { WIN_W } else { 380i32 };
                 let height = if compact { BANNER_H + LAYOUT_H + 6 } else { 270 };
                 let dc = CreateCompatibleDC(None);
                 assert!(!dc.0.is_null());
@@ -1457,6 +1464,14 @@ mod tests {
                 let old = SelectObject(dc, bitmap);
                 let (mut st, _) = ui_state(SessionPhase::Active);
                 if compact { st.expanded_height = Some(270); }
+                if with_code {
+                    st.presenter = GuestPresenter::new(SessionInfo {
+                        control_plane_host: format!("{}.example", "h".repeat(240)),
+                        reason: "r".repeat(120),
+                        ..Default::default()
+                    });
+                    st.presenter.on(GuestEvent::ComparisonCode("697 670".into()));
+                }
                 st.presenter.on(GuestEvent::Posted { from: ChatFrom::Technician,
                     body: "Testing the support window layout.".into(), at_unix_ms: 0 });
                 for c in "Draft stays when chat is hidden".chars() { st.presenter.on(GuestEvent::Typed(c)); }

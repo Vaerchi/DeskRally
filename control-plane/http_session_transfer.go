@@ -627,7 +627,7 @@ func (s *Server) handleTransferTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	resp, refusal := s.brokerSessionStart(r.Context(), held.Rec, held.Machine, p.UserID, p.TenantID, groupPolicy, keyBody.ConsolePubkey)
+	resp, refusal := s.brokerSessionStart(r.Context(), held.Rec, held.Machine, p.UserID, p.TenantID, groupPolicy, adm.BindingMode, keyBody.ConsolePubkey)
 	if refusal != nil {
 		refusal.write(w)
 		return

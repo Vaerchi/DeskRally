@@ -1,5 +1,10 @@
 # Opt-in Azure Artifact Signing
 
+Self-hosted operators use their own signing account and publisher identity for distributed
+Windows releases. Start with the [self-hosted signing guide](guides/self-hosted-signing.md)
+for Azure onboarding, pricing and end-to-end instructions. This page documents the existing
+build helper's behavior and coverage.
+
 `scripts/build-release.ps1` keeps its unsigned default and existing local-certificate
 `-Sign -CertThumbprint ...` path. Azure signing requires explicit `-Sign`, provider,
 account/profile, regional endpoint, and installed tool paths. No login, account provisioning,

@@ -21,6 +21,9 @@ type sessionAdmission struct {
 	Limits                  SessionStartLimits
 	GroupPolicy             GroupSessionPolicy
 	TenantMaxSessionSeconds int
+	// BindingMode is the tenant's docs/69 mode from the SAME policy read the seat caps came from, so one session
+	// start reads the policy once and decides consistently. Empty when there is no policy store (warn then).
+	BindingMode SessionBindingMode
 }
 
 // outOfServiceMachineMsg is the refusal for a quarantined or retired machine ("" when it is in service).
@@ -107,6 +110,7 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 		limits.MaxObserversPerMachine = 2
 	}
 	var tenantMaxSessionSeconds int
+	var bindingMode SessionBindingMode
 	if s.SessionPolicies != nil {
 		pol, perr := s.SessionPolicies.Get(ctx, tenantID)
 		if perr != nil {
@@ -114,6 +118,7 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 		}
 		limits.Tenant = pol.MaxConcurrentSessions
 		tenantMaxSessionSeconds = pol.MaxSessionSeconds
+		bindingMode = SessionBindingMode(bindingOrWarn(pol.SessionBinding))
 	}
 	// The machine group's policy drives BOTH the seat cap (below, enforced in the store) and the ACCESS
 	// LEVEL this session is admitted at (used further down to mint the signed session policy).
@@ -162,7 +167,7 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 				"agent capability negotiation is available"}
 		}
 	}
-	return &sessionAdmission{Rec: rec, Limits: limits, GroupPolicy: groupPolicy, TenantMaxSessionSeconds: tenantMaxSessionSeconds}, nil
+	return &sessionAdmission{Rec: rec, Limits: limits, GroupPolicy: groupPolicy, TenantMaxSessionSeconds: tenantMaxSessionSeconds, BindingMode: bindingMode}, nil
 }
 
 // brokerSessionStart is the rendezvous half of a session start: the signaling coordinates plus a
@@ -172,7 +177,7 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 //
 // consolePubkey is the console's ephemeral session key (docs/69), "" when the console sent none; the
 // caller has already refused a malformed one (refuseMalformedConsoleKey).
-func (s *Server) brokerSessionStart(ctx context.Context, rec *SessionRecord, m *Machine, userID, tenantID string, groupPolicy GroupSessionPolicy, consolePubkey string) (map[string]any, *sessionRefusal) {
+func (s *Server) brokerSessionStart(ctx context.Context, rec *SessionRecord, m *Machine, userID, tenantID string, groupPolicy GroupSessionPolicy, bindingMode SessionBindingMode, consolePubkey string) (map[string]any, *sessionRefusal) {
 	// M2 (ADR-002): broker the rendezvous. When the issuer is wired, hand back the signaling
 	// coordinates plus a short-TTL signed session ticket the signaling server verifies before
 	// brokering connect_request → this device (server/signaling/ticket.go).
@@ -202,7 +207,11 @@ func (s *Server) brokerSessionStart(ctx context.Context, rec *SessionRecord, m *
 		if rec.Access == "view_only" || groupPolicy.EnforceViewOnly {
 			bindAccess = SessionAccessViewOnly
 		}
-		if refusal := s.attachDeviceBinding(ctx, resp, rec.ID, m.DeviceID, m.Pubkey, userID, tenantID, bindAccess, consolePubkey, now); refusal != nil {
+		// The v2 hint follows the version the RUNNING agent announced to signaling, never machine.agent_version:
+		// that row is refreshed write-behind, so after a rollback (1.3.33 -> 1.3.32) it would still say 0.1.33 and
+		// steer the console into a v2 start the old agent ignores, ending an honest session at its binding
+		// deadline (Codex release-1333 P2). No live version means v1: the comparison code is optional (DETECT).
+		if refusal := s.attachDeviceBinding(ctx, resp, rec.ID, m.DeviceID, m.Pubkey, userID, tenantID, bindingMode, bindAccess, consolePubkey, s.liveAgentVersion(ctx, m.DeviceID), now); refusal != nil {
 			return nil, refusal
 		}
 		// The SIGNED SESSION POLICY (docs/01 §3/§5, loops 79/80): what the ORGANISATION says this session

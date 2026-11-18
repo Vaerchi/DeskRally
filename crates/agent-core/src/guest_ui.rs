@@ -123,6 +123,9 @@ pub enum GuestEvent {
     /// Without this the unread counter is dead for the rest of the session after the guest's first
     /// click: `focused` latches true and every later message counts as already-read.
     Blurred,
+    /// docs/69 6.1: the six-digit code ("123 456") this connection's binding produced. The technician may ask the
+    /// guest to read it; different digits on their screen mean the connection is not the one this machine sees.
+    ComparisonCode(String),
     /// The guest clicked the window's **End session** button.
     ///
     /// This is the guest exercising control over their own machine — docs/12 §5 asks for it, and
@@ -261,6 +264,8 @@ pub trait GuestSurface: Send {
     /// is happening to their machine must decide about this one, not inherit silence.
     /// See [`GuestEvent::ClipboardShared`].
     fn clipboard_shared(&self, to_technician: bool);
+    /// docs/69 6.1: show this connection's comparison code. Default: no surface to show it on.
+    fn set_comparison_code(&self, _code: &str) {}
     /// Tear the surface down and wait for it to be gone.
     fn close(&mut self);
 }
@@ -302,6 +307,8 @@ pub struct GuestPresenter {
     /// would otherwise find a window that says only "no longer shared", with nothing anywhere on
     /// their screen indicating that a video of it is sitting on their disk.
     recorded_ever: bool,
+    /// docs/69 6.1: this connection's comparison code once a v2 binding completed; shown on the detail line.
+    comparison_code: Option<String>,
     /// `true` once the guest's clipboard has been sent to the technician at least once.
     ///
     /// Latching for the same reason as [`Self::recorded_ever`], and with the same safe direction:
@@ -338,6 +345,7 @@ impl GuestPresenter {
             // Nothing is being recorded until a controller asks for it.
             recording: false,
             recorded_ever: false,
+        comparison_code: None,
             clipboard_out_ever: false,
             clipboard_in_ever: false,
             dirty: true,
@@ -448,6 +456,13 @@ impl GuestPresenter {
                 if self.recording != recording {
                     self.recording = recording;
                     self.recorded_ever |= recording;
+                    self.dirty = true;
+                }
+                GuestCommand::None
+            }
+            GuestEvent::ComparisonCode(code) => {
+                if self.comparison_code.as_deref() != Some(code.as_str()) {
+                    self.comparison_code = Some(code);
                     self.dirty = true;
                 }
                 GuestCommand::None
@@ -575,10 +590,22 @@ impl GuestPresenter {
         } else {
             &self.info.control_plane_host
         };
-        let mut out = match self.phase {
+        // docs/69 6.1: the code LEADS the line, only while the session runs (after it ends there is nothing to
+        // compare). The window paints this line in a fixed box that wraps and ends in an ellipsis, and the hostname
+        // and reason before it are unbounded for display, so the digits go first: the box's first line always shows
+        // them (Codex sas-impl r5, r6).
+        let mut out = String::new();
+        if self.phase == SessionPhase::Active {
+            if let Some(code) = &self.comparison_code {
+                out.push_str("Connection code: ");
+                out.push_str(code);
+                out.push_str(" · ");
+            }
+        }
+        out.push_str(&match self.phase {
             SessionPhase::Active => format!("Connected via {host}"),
             SessionPhase::Ended => format!("Was connected via {host}"),
-        };
+        });
         if !self.info.reason.is_empty() {
             out.push_str(" · Reason: ");
             out.push_str(&self.info.reason);
@@ -1234,5 +1261,21 @@ mod tests {
         p.take_dirty();
         p.on(GuestEvent::Focused); // already focused, nothing unread
         assert!(!p.take_dirty(), "focusing an already-focused window changed nothing");
+    }
+
+    // docs/69 6.1: the comparison code sits on the detail line while the session runs, and only then.
+    #[test]
+    fn comparison_code_is_shown_while_active_only() {
+        let mut p = active();
+        assert!(!p.detail().contains("Connection code"));
+        p.on(GuestEvent::ComparisonCode("697 670".into()));
+        assert!(p.detail().contains("Connection code: 697 670"), "{}", p.detail());
+        // First on the line, ahead of an unbounded hostname and a maximal reason, so the window's ellipsis can never
+        // clip the digits (Codex sas-impl r5, r6).
+        p.info.reason = "r".repeat(120);
+        p.info.control_plane_host = format!("{}.example", "h".repeat(250));
+        assert!(p.detail().starts_with("Connection code: 697 670 · Connected via "), "{}", p.detail());
+        p.on(GuestEvent::Ended);
+        assert!(!p.detail().contains("Connection code"), "after the session the code means nothing: {}", p.detail());
     }
 }

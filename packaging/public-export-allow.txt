@@ -13,7 +13,7 @@ agent/src/backstage/mod.rs:literal-credential
 agent/src/backstage/panels/local_path.rs:personal-workspace
 agent/src/backstage/panels/local_path.rs:private-path
 agent/src/backstage/token.rs:literal-credential
-agent/src/bin/backstage_server.rs:literal-credential
+agent/src/bin/under_the_hood_server.rs:literal-credential
 agent/src/bin/shell_server.rs:literal-credential
 agent/src/elevation.rs:literal-credential
 agent/src/elevation.rs:long-base64
@@ -565,3 +565,4 @@ crates/protocol/src/session_binding.rs:long-hex
 web/viewer/e2e/session_binding_live.spec.ts:credential-assignment-review
 web/viewer/e2e/session_binding_live.spec.ts:literal-credential
 web/viewer/e2e/session_binding_live.spec.ts:long-hex
+web/viewer/src/lib/session_binding.test.ts:long-hex

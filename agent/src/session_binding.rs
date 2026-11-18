@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use rmt_crypto::PublicIdentity;
-use rmt_protocol::session_binding::{decode_field_hex, BindTranscript, ROLE_AGENT, ROLE_CONSOLE};
+use rmt_protocol::session_binding::{commit_v2, decode_field_hex, BindTranscript, BindTranscriptV2, ROLE_AGENT, ROLE_CONSOLE};
 
 use crate::binding_grant::{SignedBindingGrant, VerifiedBindingGrant};
 
@@ -55,6 +55,9 @@ pub struct BindStartContext<'a> {
     pub fingerprints: Option<AgentFingerprints>,
     /// Signs with the device key; `None` when the agent has no enrolled identity.
     pub signer: Option<&'a dyn Fn(&[u8]) -> [u8; 64]>,
+    /// This agent's enrolled Ed25519 public key (raw), the key `signer` signs with. Required by binding v2, whose
+    /// transcript names both keys; `None` refuses a v2 start (`no_identity`).
+    pub device_pubkey: Option<[u8; 32]>,
     /// Wall clock, Unix ms (grant validity).
     pub now_ms: i64,
     /// A fresh 32-byte nonce from a CSPRNG.
@@ -74,6 +77,8 @@ pub enum BindReply {
 enum State {
     Unbound,
     AwaitingConsole { grant: VerifiedBindingGrant, transcript: BindTranscript },
+    /// Binding v2 (docs/69 6.2): the console committed to its nonce; it reveals it in its proof.
+    AwaitingConsoleV2 { grant: VerifiedBindingGrant, transcript: BindTranscriptV2 },
     Bound { grant: VerifiedBindingGrant },
     /// Carries the reason, so the host can say WHY the session ended.
     Failed(&'static str),
@@ -86,6 +91,8 @@ pub struct AgentBinding {
     deadline: Instant,
     held: Vec<rmt_protocol::Frame>,
     held_bytes: usize,
+    /// The six-digit comparison code, once a v2 exchange has bound (docs/69 6.1). v1 sessions have none.
+    code: Option<u32>,
 }
 
 /// Why a binding failed (the reason string sent in `BindResult`).
@@ -108,12 +115,14 @@ pub mod reason {
     pub const CONSOLE_PROOF: &str = "console_proof_refused";
     /// A proof or a second start arrived out of order.
     pub const OUT_OF_ORDER: &str = "out_of_order";
+    /// v2: the revealed console nonce does not open the commitment from BindStartV2.
+    pub const COMMITMENT: &str = "commitment_mismatch";
 }
 
 impl AgentBinding {
     /// A fresh binding for a connection that started at `now`.
     pub fn new(enforcement: Enforcement, now: Instant) -> Self {
-        Self { enforcement, state: State::Unbound, deadline: now + BINDING_DEADLINE, held: Vec::new(), held_bytes: 0 }
+        Self { enforcement, state: State::Unbound, deadline: now + BINDING_DEADLINE, held: Vec::new(), held_bytes: 0, code: None }
     }
 
     /// Restart the deadline at `now`, but only while nothing has happened yet. The host calls it when its loop
@@ -125,7 +134,30 @@ impl AgentBinding {
         }
     }
 
-    /// Handle `BindStart`. On success the reply is the agent's proof and the state awaits the console.
+    /// The checks every start shares (v1 and v2), in the order v1 always applied them. Returns the verified grant
+    /// and the live fingerprints, or the refusal reason.
+    fn check_start(&self, grant_json: &str, cx: &BindStartContext<'_>) -> Result<(VerifiedBindingGrant, AgentFingerprints), &'static str> {
+        let Some(issuer) = cx.issuer else { return Err(reason::NO_ISSUER_PIN) };
+        let grant = SignedBindingGrant::from_json(grant_json)
+            .and_then(|g| g.verify(issuer, cx.now_ms, cx.device))
+            .map_err(|_| reason::GRANT)?;
+        if cx.signaled_session != Some(grant.session_id) {
+            return Err(reason::SESSION_MISMATCH);
+        }
+        // The session acts and audits as signaling's technician, so it must be exactly the grant's (absent counts as
+        // different). A STRICTER grant level (view-only for a control ticket, e.g. a view-only group) is not a
+        // mismatch: the host applies it once bound (`bound_grant().access`).
+        if cx.signaled_technician != Some(grant.technician_id) {
+            return Err(reason::IDENTITY_MISMATCH);
+        }
+        let Some(fps) = cx.fingerprints else { return Err(reason::NO_FINGERPRINTS) };
+        if cx.signer.is_none() {
+            return Err(reason::NO_IDENTITY);
+        }
+        Ok((grant, fps))
+    }
+
+    /// Handle `BindStart` (v1). On success the reply is the agent's proof and the state awaits the console.
     pub fn on_bind_start(&mut self, grant_json: &str, console_nonce_hex: &str, cx: BindStartContext<'_>) -> BindReply {
         if !matches!(self.state, State::Unbound) {
             return self.fail(reason::OUT_OF_ORDER);
@@ -133,21 +165,10 @@ impl AgentBinding {
         let Some(console_nonce) = decode_field_hex(console_nonce_hex) else {
             return self.fail(reason::OUT_OF_ORDER);
         };
-        let Some(issuer) = cx.issuer else { return self.fail(reason::NO_ISSUER_PIN) };
-        let grant = match SignedBindingGrant::from_json(grant_json).and_then(|g| g.verify(issuer, cx.now_ms, cx.device)) {
-            Ok(g) => g,
-            Err(_) => return self.fail(reason::GRANT),
+        let (grant, fps) = match self.check_start(grant_json, &cx) {
+            Ok(v) => v,
+            Err(why) => return self.fail(why),
         };
-        if cx.signaled_session != Some(grant.session_id) {
-            return self.fail(reason::SESSION_MISMATCH);
-        }
-        // The session acts and audits as signaling's technician, so it must be exactly the grant's (absent counts as
-        // different). A STRICTER grant level (view-only for a control ticket, e.g. a view-only group) is not a
-        // mismatch: the host applies it once bound (`bound_grant().access`).
-        if cx.signaled_technician != Some(grant.technician_id) {
-            return self.fail(reason::IDENTITY_MISMATCH);
-        }
-        let Some(fps) = cx.fingerprints else { return self.fail(reason::NO_FINGERPRINTS) };
         let Some(sign) = cx.signer else { return self.fail(reason::NO_IDENTITY) };
         let transcript = BindTranscript {
             session_id: *grant.session_id.as_bytes(),
@@ -161,9 +182,87 @@ impl AgentBinding {
         BindReply::AgentProof { agent_nonce: hex::encode(cx.agent_nonce), sig: hex::encode(sig) }
     }
 
+    /// Handle `BindStartV2` (docs/69 6.2): the console sent a COMMITMENT to its nonce, not the nonce. Same checks as
+    /// v1; the agent signs a transcript naming both keys and the commitment. One version per association: a v2 start
+    /// after any start (either version) is out of order.
+    pub fn on_bind_start_v2(&mut self, grant_json: &str, commitment_hex: &str, cx: BindStartContext<'_>) -> BindReply {
+        if !matches!(self.state, State::Unbound) {
+            return self.fail(reason::OUT_OF_ORDER);
+        }
+        let Some(commitment) = decode_field_hex(commitment_hex) else {
+            return self.fail(reason::OUT_OF_ORDER);
+        };
+        let (grant, fps) = match self.check_start(grant_json, &cx) {
+            Ok(v) => v,
+            Err(why) => return self.fail(why),
+        };
+        let (Some(sign), Some(device_pubkey)) = (cx.signer, cx.device_pubkey) else {
+            return self.fail(reason::NO_IDENTITY);
+        };
+        let transcript = BindTranscriptV2 {
+            session_id: *grant.session_id.as_bytes(),
+            agent_cert_sha256: fps.agent,
+            console_cert_sha256: fps.console,
+            device_pubkey,
+            console_pubkey: grant.console_pubkey,
+            commitment,
+            agent_nonce: cx.agent_nonce,
+        };
+        let sig = sign(&transcript.agent_signing_bytes());
+        self.state = State::AwaitingConsoleV2 { grant, transcript };
+        BindReply::AgentProof { agent_nonce: hex::encode(cx.agent_nonce), sig: hex::encode(sig) }
+    }
+
+    /// Handle `BindConsoleProofV2`: the console reveals its nonce. It must open the commitment, and the console's
+    /// signature (over the transcript AND the opening) must verify on the same live association. On success the
+    /// six-digit comparison code is fixed for this association ([`Self::comparison_code`]).
+    pub fn on_console_proof_v2(&mut self, console_nonce_hex: &str, sig_hex: &str, current: Option<AgentFingerprints>) -> BindReply {
+        if matches!(self.state, State::Bound { .. }) {
+            return self.fail(reason::OUT_OF_ORDER);
+        }
+        let State::AwaitingConsoleV2 { grant, transcript } = std::mem::replace(&mut self.state, State::Failed(reason::OUT_OF_ORDER)) else {
+            return self.fail(reason::OUT_OF_ORDER);
+        };
+        let same_association = current
+            .is_some_and(|f| f.agent == transcript.agent_cert_sha256 && f.console == transcript.console_cert_sha256);
+        if !same_association {
+            return self.fail(reason::NO_FINGERPRINTS);
+        }
+        let Some(console_nonce) = decode_field_hex(console_nonce_hex) else {
+            return self.fail(reason::COMMITMENT);
+        };
+        if commit_v2(&console_nonce) != transcript.commitment {
+            return self.fail(reason::COMMITMENT);
+        }
+        let sig: Option<[u8; 64]> = hex::decode(sig_hex).ok().and_then(|b| b.try_into().ok());
+        let key = PublicIdentity::from_hex(&hex::encode(grant.console_pubkey));
+        let ok = match (sig, key) {
+            (Some(sig), Ok(key)) => key.verify(&transcript.console_signing_bytes(&console_nonce), &sig).is_ok(),
+            _ => false,
+        };
+        if !ok {
+            return self.fail(reason::CONSOLE_PROOF);
+        }
+        self.code = Some(transcript.comparison_code(&console_nonce));
+        self.state = State::Bound { grant };
+        BindReply::Result { ok: true, reason: None }
+    }
+
+    /// The comparison code once a v2 exchange has bound on this association; `None` for v1 or unbound.
+    pub fn comparison_code(&self) -> Option<u32> {
+        if matches!(self.state, State::Bound { .. }) {
+            self.code
+        } else {
+            None
+        }
+    }
+
     /// Handle `BindConsoleProof`. `current` re-reads the live fingerprints: a verification is only good
     /// for the association it was made on (docs/69 §3.4), so a changed pair fails it.
     pub fn on_console_proof(&mut self, sig_hex: &str, current: Option<AgentFingerprints>) -> BindReply {
+        if matches!(self.state, State::Bound { .. }) {
+            return self.fail(reason::OUT_OF_ORDER);
+        }
         let State::AwaitingConsole { grant, transcript } = std::mem::replace(&mut self.state, State::Failed(reason::OUT_OF_ORDER)) else {
             return self.fail(reason::OUT_OF_ORDER);
         };
@@ -186,7 +285,11 @@ impl AgentBinding {
     }
 
     fn fail(&mut self, why: &'static str) -> BindReply {
-        self.state = State::Failed(why);
+        // An accepted binding is immutable (Codex sas-impl r1): a duplicate or late binding message after Bound is
+        // refused without unbinding the session or invalidating the code the guest is already showing.
+        if !matches!(self.state, State::Bound { .. }) {
+            self.state = State::Failed(why);
+        }
         BindReply::Result { ok: false, reason: Some(why.to_string()) }
     }
 
@@ -217,7 +320,7 @@ impl AgentBinding {
             // No BindStart at all: the console sent no grant. The server's CP_SESSION_BINDING is off, or
             // the console is an older viewer, or someone between them dropped it.
             State::Unbound => "no_grant_received",
-            State::AwaitingConsole { .. } => "no_console_proof",
+            State::AwaitingConsole { .. } | State::AwaitingConsoleV2 { .. } => "no_console_proof",
             State::Bound { .. } => unreachable!("must_end is false once bound"),
         })
     }
@@ -307,6 +410,7 @@ mod tests {
                 signaled_technician: Some(uuid::Uuid::nil()),
                 fingerprints: fps,
                 signer: Some(&signer),
+                device_pubkey: decode_field_hex(&f.device_key.public_hex()),
                 now_ms: 2_000,
                 agent_nonce: [0xc3; 32],
             },
@@ -407,6 +511,7 @@ mod tests {
             signaled_technician: technician,
             fingerprints: Some(f.fps),
             signer: Some(&signer),
+            device_pubkey: decode_field_hex(&f.device_key.public_hex()),
             now_ms: 2_000,
             agent_nonce: [0xc3; 32],
         };
@@ -464,6 +569,7 @@ mod tests {
                 signaled_technician: Some(uuid::Uuid::nil()),
                 fingerprints: Some(f.fps),
                 signer: Some(&signer),
+                device_pubkey: decode_field_hex(&f.device_key.public_hex()),
                 now_ms: 2_000,
                 agent_nonce: [0xe5; 32],
             },
@@ -521,5 +627,143 @@ mod tests {
         assert!(b.hold(Frame::new(ChannelId::Input, vec![0])));
         b.start_clock(later);
         assert!(b.must_end(t0 + BINDING_DEADLINE));
+    }
+
+    fn start_v2(b: &mut AgentBinding, f: &Fixture, commitment: [u8; 32], fps: Option<AgentFingerprints>) -> BindReply {
+        let signer = |m: &[u8]| f.device_key.sign(m);
+        let issuer = f.issuer.public();
+        b.on_bind_start_v2(
+            &grant_json(f, SESSION, 100_000),
+            &hex::encode(commitment),
+            BindStartContext {
+                issuer: Some(&issuer),
+                device: DEVICE.parse().unwrap(),
+                signaled_session: Some(SESSION.parse().unwrap()),
+                signaled_technician: Some(uuid::Uuid::nil()),
+                fingerprints: fps,
+                signer: Some(&signer),
+                device_pubkey: decode_field_hex(&f.device_key.public_hex()),
+                now_ms: 2_000,
+                agent_nonce: [0xc3; 32],
+            },
+        )
+    }
+
+    /// The console's v2 view of the transcript, from ITS fingerprints.
+    fn console_v2(f: &Fixture, view: AgentFingerprints, commitment: [u8; 32]) -> BindTranscriptV2 {
+        BindTranscriptV2 {
+            session_id: *uuid::Uuid::parse_str(SESSION).unwrap().as_bytes(),
+            agent_cert_sha256: view.agent,
+            console_cert_sha256: view.console,
+            device_pubkey: decode_field_hex(&f.device_key.public_hex()).unwrap(),
+            console_pubkey: decode_field_hex(&f.console_key.public_hex()).unwrap(),
+            commitment,
+            agent_nonce: [0xc3; 32],
+        }
+    }
+
+    #[test]
+    fn v2_honest_exchange_binds_and_both_sides_compute_the_same_code() {
+        let f = fixture();
+        let nonce = [0xd4; 32];
+        let commitment = commit_v2(&nonce);
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        let BindReply::AgentProof { agent_nonce, sig } = start_v2(&mut b, &f, commitment, Some(f.fps)) else { panic!("no proof") };
+        assert_eq!(agent_nonce, hex::encode([0xc3; 32]));
+        // The console verifies the agent's proof over its own view, then signs with the opening.
+        let t = console_v2(&f, f.fps, commitment);
+        let agent_sig: [u8; 64] = hex::decode(sig).unwrap().try_into().unwrap();
+        assert!(f.device_key.public().verify(&t.agent_signing_bytes(), &agent_sig).is_ok());
+        let console_sig = hex::encode(f.console_key.sign(&t.console_signing_bytes(&nonce)));
+        assert_eq!(b.on_console_proof_v2(&hex::encode(nonce), &console_sig, Some(f.fps)), BindReply::Result { ok: true, reason: None });
+        assert!(b.open());
+        assert_eq!(b.comparison_code(), Some(t.comparison_code(&nonce)));
+    }
+
+    #[test]
+    fn v2_refuses_a_nonce_that_does_not_open_the_commitment() {
+        let f = fixture();
+        let commitment = commit_v2(&[0xd4; 32]);
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        assert!(matches!(start_v2(&mut b, &f, commitment, Some(f.fps)), BindReply::AgentProof { .. }));
+        // A validly signed proof over a DIFFERENT nonce (an attacker picking it after the fact) is refused.
+        let other = [0xd5; 32];
+        let t = console_v2(&f, f.fps, commitment);
+        let sig = hex::encode(f.console_key.sign(&t.console_signing_bytes(&other)));
+        assert_eq!(
+            b.on_console_proof_v2(&hex::encode(other), &sig, Some(f.fps)),
+            BindReply::Result { ok: false, reason: Some(reason::COMMITMENT.into()) }
+        );
+        assert_eq!(b.comparison_code(), None);
+    }
+
+    #[test]
+    fn v2_man_in_the_middle_cannot_complete_and_no_code_is_shown() {
+        let f = fixture();
+        let nonce = [0xd4; 32];
+        let commitment = commit_v2(&nonce);
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        assert!(matches!(start_v2(&mut b, &f, commitment, Some(f.fps)), BindReply::AgentProof { .. }));
+        // The console's leg sees the attacker's certificates, so its signature is over a different transcript.
+        let mitm_view = AgentFingerprints { agent: [0xee; 32], console: [0xff; 32] };
+        let t = console_v2(&f, mitm_view, commitment);
+        let sig = hex::encode(f.console_key.sign(&t.console_signing_bytes(&nonce)));
+        assert_eq!(
+            b.on_console_proof_v2(&hex::encode(nonce), &sig, Some(f.fps)),
+            BindReply::Result { ok: false, reason: Some(reason::CONSOLE_PROOF.into()) }
+        );
+        assert_eq!(b.comparison_code(), None);
+    }
+
+    #[test]
+    fn one_version_per_association() {
+        let f = fixture();
+        // v1 start, then a v2 start: out of order.
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        assert!(matches!(start(&mut b, &f, &grant_json(&f, SESSION, 100_000), SESSION, Some(f.fps)), BindReply::AgentProof { .. }));
+        assert_eq!(start_v2(&mut b, &f, commit_v2(&[0xd4; 32]), Some(f.fps)), BindReply::Result { ok: false, reason: Some(reason::OUT_OF_ORDER.into()) });
+        // v2 start, then a v1 console proof: out of order; and a v1 session never has a code.
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        assert!(matches!(start_v2(&mut b, &f, commit_v2(&[0xd4; 32]), Some(f.fps)), BindReply::AgentProof { .. }));
+        assert_eq!(b.on_console_proof(&"00".repeat(64), Some(f.fps)), BindReply::Result { ok: false, reason: Some(reason::OUT_OF_ORDER.into()) });
+        // v2 needs the agent's own public key in the transcript.
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        let signer = |m: &[u8]| f.device_key.sign(m);
+        let issuer = f.issuer.public();
+        let r = b.on_bind_start_v2(&grant_json(&f, SESSION, 100_000), &hex::encode(commit_v2(&[0xd4; 32])), BindStartContext {
+            issuer: Some(&issuer),
+            device: DEVICE.parse().unwrap(),
+            signaled_session: Some(SESSION.parse().unwrap()),
+            signaled_technician: Some(uuid::Uuid::nil()),
+            fingerprints: Some(f.fps),
+            signer: Some(&signer),
+            device_pubkey: None,
+            now_ms: 2_000,
+            agent_nonce: [0xc3; 32],
+        });
+        assert_eq!(r, BindReply::Result { ok: false, reason: Some(reason::NO_IDENTITY.into()) });
+    }
+
+    // Codex sas-impl r1: an accepted binding is immutable; late or duplicate binding traffic is refused without
+    // unbinding the session or changing the code the guest already shows.
+    #[test]
+    fn a_bound_session_stays_bound_against_late_binding_traffic() {
+        let f = fixture();
+        let nonce = [0xd4; 32];
+        let commitment = commit_v2(&nonce);
+        let mut b = AgentBinding::new(Enforcement::Enforce, Instant::now());
+        assert!(matches!(start_v2(&mut b, &f, commitment, Some(f.fps)), BindReply::AgentProof { .. }));
+        let t = console_v2(&f, f.fps, commitment);
+        let sig = hex::encode(f.console_key.sign(&t.console_signing_bytes(&nonce)));
+        assert_eq!(b.on_console_proof_v2(&hex::encode(nonce), &sig, Some(f.fps)), BindReply::Result { ok: true, reason: None });
+        let code = b.comparison_code();
+        assert!(code.is_some());
+        let refused = BindReply::Result { ok: false, reason: Some(reason::OUT_OF_ORDER.into()) };
+        assert_eq!(start_v2(&mut b, &f, commitment, Some(f.fps)), refused);
+        assert_eq!(start(&mut b, &f, &grant_json(&f, SESSION, 100_000), SESSION, Some(f.fps)), refused);
+        assert_eq!(b.on_console_proof_v2(&hex::encode(nonce), &sig, Some(f.fps)), refused);
+        assert_eq!(b.on_console_proof(&"00".repeat(64), Some(f.fps)), refused);
+        assert!(b.open() && !b.must_end(Instant::now() + BINDING_DEADLINE * 2));
+        assert_eq!(b.comparison_code(), code);
     }
 }

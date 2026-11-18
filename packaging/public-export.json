@@ -83,6 +83,7 @@
     "docs/guides/server-deployment.md",
     "docs/guides/server-configuration.md",
     "docs/guides/native-server.md",
+    "docs/guides/self-hosted-signing.md",
     "docs/10-deployment.md",
     "docs/22-backup-and-restore.md",
     "docs/21-agent-auto-update.md",

@@ -60,3 +60,5 @@ web/viewer/assets/
 
 # Local release-gate run directory (docs/66 step 8)
 .gate-out/
+# Local review packets/diffs written for Codex (never committed)
+.review/

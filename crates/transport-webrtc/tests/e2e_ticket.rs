@@ -143,7 +143,8 @@ fn start_enforcing_signaling(pubkey_hex: &str, port: u16) -> Option<Signaling> {
         }
     }
     let child = Command::new(&exe)
-        .args(["-addr", &format!(":{port}"), "-insecure-no-agent-auth"])
+        // 127.0.0.1, not ":port" (every interface): a test must never listen on a real interface (firewall prompt).
+        .args(["-addr", &format!("127.0.0.1:{port}"), "-insecure-no-agent-auth"])
         .current_dir(&dir)
         .env("SIGNALING_TICKET_PUBKEY", pubkey_hex)
         .env("SIGNALING_ALLOWED_ORIGINS", "*") // fails closed without an origin policy; lab opt-out

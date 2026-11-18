@@ -23,6 +23,9 @@ async fn without_a_dialer_tcp_turn_yields_no_relay_candidate() {
         urls: vec![u],
         network_types: vec![NetworkType::Udp4],
         candidate_types: vec![CandidateType::Relay],
+        // mDNS off: its default (QueryOnly) listens on UDP 5353 on every interface, which makes Windows Firewall
+        // prompt on the developer's desktop for each freshly hashed test exe (Ed 11-17).
+        multicast_dns_mode: webrtc::ice::mdns::MulticastDnsMode::Disabled,
         ..Default::default()
     })
     .await

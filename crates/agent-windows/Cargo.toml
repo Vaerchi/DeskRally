@@ -167,7 +167,7 @@ rmt-protocol = { path = "../protocol" }
 tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite = "0.23"
 futures-util = "0.3"
-# e2e_backstage: parse the returned backstage Envelope JSON.
+# e2e_under_the_hood: parse the returned backstage Envelope JSON.
 serde_json.workspace = true
 # e2e tests: unique temp transfer dirs + transfer ids.
 uuid.workspace = true

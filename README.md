@@ -38,6 +38,10 @@ real-control-plane tests need the fixture binary first: `go build -o cptestfixtu
 
 To deploy a server, start with `docs/guides/server-deployment.md`.
 
+Self-hosted operators sign their Windows releases with their own verified publisher identity.
+Follow the [Azure Artifact Signing setup guide](docs/guides/self-hosted-signing.md) for
+account setup, cost, signing and verification.
+
 ## Security and contributing
 
 How DeskRally is secured, and its current limits: `docs/security-model.md`. To report a vulnerability privately,

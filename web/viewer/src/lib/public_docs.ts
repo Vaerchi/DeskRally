@@ -5,6 +5,7 @@ import deployment from "../../../../docs/10-deployment.md?raw";
 import backups from "../../../../docs/22-backup-and-restore.md?raw";
 import troubleshooting from "../../../../docs/connection-troubleshooting.md?raw";
 import configuration from "../../../../docs/guides/server-configuration.md?raw";
+import signing from "../../../../docs/guides/self-hosted-signing.md?raw";
 import environmentTemplate from "../../../../deploy/.env.example?raw";
 
 export interface PublicDoc {
@@ -25,6 +26,8 @@ export const PUBLIC_DOCS: PublicDoc[] = [
     summary: "Build native packages and configure Windows services or Linux systemd. Preview deployment path." },
   { id: "clients", title: "Install agents", group: "Installation guides", source: "docs/guides/client-deployment.md", text: clients,
     summary: "Interactive and silent installation, enrollment, support tools and desktop clients." },
+  { id: "signing", title: "Sign your own releases", group: "Installation guides", source: "docs/guides/self-hosted-signing.md", text: signing,
+    summary: "Sign self-hosted installers and executables with your own Azure Artifact Signing identity." },
   { id: "deployment", title: "Build & deployment reference", group: "Technical reference", source: "docs/10-deployment.md", text: deployment,
     summary: "Full source-build instructions: codecs, backend processes, migrations, agent identity, HTTPS and TURN." },
   { id: "configuration", title: "Server configuration reference", group: "Technical reference", source: "docs/guides/server-configuration.md",

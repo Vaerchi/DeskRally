@@ -438,6 +438,10 @@ type Brokered struct {
 	// Access and AccessVersion are always emitted together by the broker.
 	Access        string `json:"access"`
 	AccessVersion int    `json:"access_version"`
+	// PeerAgentVersion is the build the ROUTED agent announced at register_agent (bounded, agent-asserted,
+	// UNTRUSTED). Sent to the requester only. docs/69 6.1: the console runs binding v2 only when this peer says it
+	// speaks it, so a stale control-plane hint can never send v2 to an older agent (Codex release-1333 r3).
+	PeerAgentVersion string `json:"peer_agent_version,omitempty"`
 }
 
 // RelayAssignment nominates a relay both peers present the token to (the guaranteed fallback).

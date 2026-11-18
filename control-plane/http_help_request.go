@@ -542,7 +542,7 @@ func (s *Server) handleAcceptHelpRequest(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	resp, brokerRefusal := s.brokerSessionStart(r.Context(), rec, m, p.UserID, p.TenantID, adm.GroupPolicy, body.ConsolePubkey)
+	resp, brokerRefusal := s.brokerSessionStart(r.Context(), rec, m, p.UserID, p.TenantID, adm.GroupPolicy, adm.BindingMode, body.ConsolePubkey)
 	if brokerRefusal != nil {
 		brokerRefusal.write(w)
 		return

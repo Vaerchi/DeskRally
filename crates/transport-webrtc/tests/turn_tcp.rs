@@ -84,7 +84,8 @@ async fn turn_server(tls: Option<Arc<rustls::ServerConfig>>) -> u16 {
                 conn,
                 relay_addr_generator: Box::new(RelayAddressGeneratorStatic {
                     relay_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    address: "0.0.0.0".to_owned(),
+                    // Loopback, not 0.0.0.0: a test must never listen on a real interface (firewall prompt).
+                    address: "127.0.0.1".to_owned(),
                     net: Arc::new(Net::new(None)),
                 }),
             }],
@@ -231,6 +232,9 @@ async fn ice_gathers_a_relay_candidate_over_tcp_turn() {
         urls: vec![url("turn", "127.0.0.1", port)],
         network_types: vec![NetworkType::Udp4],
         candidate_types: vec![CandidateType::Relay],
+        // mDNS off: its default (QueryOnly) listens on UDP 5353 on every interface, which makes Windows Firewall
+        // prompt on the developer's desktop for each freshly hashed test exe (Ed 11-17).
+        multicast_dns_mode: webrtc::ice::mdns::MulticastDnsMode::Disabled,
         ..Default::default()
     })
     .await
