@@ -15,6 +15,9 @@
     <MajorUpgrade Schedule="afterInstallInitialize"
                   DowngradeErrorMessage="A newer version of DeskRally Remote Agent is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <!-- Ed 11-18: the Windows "Installed apps" entry shows the agent's own pit-stop icon, not a generic one. -->
+    <Icon Id="DeskRallyAgent.ico" SourceFile="$(RepoRoot)\crates\agent-windows\resources\deskrally.ico" />
+    <Property Id="ARPPRODUCTICON" Value="DeskRallyAgent.ico" />
 
     <!-- R1: without Windows Installer rollback the in-transaction health gate cannot restore the
          previous product, so installing (or updating) is refused. Uninstall stays possible. -->

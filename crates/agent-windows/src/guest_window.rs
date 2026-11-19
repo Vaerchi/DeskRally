@@ -693,6 +693,11 @@ pub(crate) unsafe fn pill_view_only(guest: HWND) -> bool {
     state_of(guest).map(|st| st.presenter.view_only()).unwrap_or(false)
 }
 
+/// docs/69 6.1 (Ed 11-18): the session's comparison code for the pill, while the session runs.
+pub(crate) unsafe fn pill_code(guest: HWND) -> Option<String> {
+    state_of(guest).and_then(|st| st.presenter.active_comparison_code().map(str::to_owned))
+}
+
 /// Whether the panel must stay visible: it is the session's only indicator and the session is live.
 fn panel_must_stay(panel_is_indicator: bool, phase: SessionPhase) -> bool {
     panel_is_indicator && phase != SessionPhase::Ended
@@ -1014,6 +1019,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 unsafe fn repaint_if_dirty(hwnd: HWND, st: &mut UiState) {
     if st.presenter.take_dirty() && !st.offscreen {
         let _ = InvalidateRect(hwnd, None, true);
+        // The pill shows presenter state too (view-only, the connection code): repaint it with the panel.
+        if st.pill != 0 {
+            let _ = InvalidateRect(HWND(st.pill as *mut _), None, true);
+        }
     }
 }
 

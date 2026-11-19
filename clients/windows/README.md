@@ -1,8 +1,14 @@
-# DeskRally Windows Client 0.8.4
+# DeskRally Windows Client 0.8.5
 
 A minimal native Windows shell for the DeskRally web console, built with Win32 and Microsoft WebView2.
 Each window is pinned to one organization, `https://<organization>.deskrally.com`. The app contains
 no list of organizations.
+
+## 0.8.5 changes
+
+- **New icon.** The app, its window and its Start menu shortcut show the DeskRally rally car.
+- **Self-hosted builds.** The organization domain and the update source are build options; official builds keep
+  updating from DeskRally as before.
 
 ## 0.8.4 changes
 

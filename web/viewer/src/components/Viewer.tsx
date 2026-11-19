@@ -1,3 +1,4 @@
+import { isFullscreenBreakout, lockEscape, unlockKeys } from "../lib/fullscreen_keys";
 import { contentRect } from "../lib/viewport";
 import type { RecoveryNotice } from "../lib/session_recovery";
 import type { ToolboxItem } from "../lib/console_api";
@@ -2050,6 +2051,15 @@ export function Viewer({
     doc.addEventListener("fullscreenchange", onFsChange);
     return () => doc.removeEventListener("fullscreenchange", onFsChange);
   }, [elEpoch]);
+  // Ed 11-18: in full screen, Escape goes to the remote machine and Shift+Esc leaves (lib/fullscreen_keys.ts). The
+  // lock is held ONLY while keys are being captured for the remote: otherwise (view-only, no session, input paused)
+  // Escape has nowhere to go, so the browser keeps its normal Escape exit. Holding Escape always exits.
+  useEffect(() => {
+    const win = (surfaceRef.current?.ownerDocument ?? ownerDocument).defaultView;
+    if (isFullscreen && inputActive) lockEscape(win);
+    else unlockKeys(win);
+    return () => unlockKeys(win);
+  }, [isFullscreen, inputActive, elEpoch]);
   const toggleFullscreen = useCallback(() => {
     const doc = surfaceRef.current?.ownerDocument ?? ownerDocument;
     if (doc.fullscreenElement) {
@@ -2604,6 +2614,14 @@ export function Viewer({
       }
       // Let the browser keep a couple of escape hatches so the tech can't trap themselves.
       if (e.key === "F11" || (e.ctrlKey && e.shiftKey && e.key === "Escape")) return;
+      // Shift+Esc leaves full screen and is never sent to the remote; plain Escape is (lib/fullscreen_keys.ts).
+      if (isFullscreenBreakout(e) && e.view?.document.fullscreenElement) {
+        if (down) {
+          e.preventDefault();
+          void e.view.document.exitFullscreen().catch(() => {});
+        }
+        return;
+      }
       // code is a Windows virtual-key code (agent injects VIRTUAL_KEY(code)); see dom_input.
       // A release of a key we PRESSED on the guest always goes out, with the mapping it was pressed
       // with — even if this keyup is flagged as composing / 229, which would otherwise filter it and
@@ -2826,12 +2844,12 @@ export function Viewer({
             </button>
           ))}
           {/* Full screen is one click from the tab, not behind ▾ (Ed, 10-29: "i do not see an option
-              to make it full screen"). In full screen the inline bar carries Exit; Esc also leaves. */}
+              to make it full screen"). In full screen the inline bar carries Exit; Shift+Esc also leaves (Esc goes to the remote, Ed 11-18). */}
           <button
             type="button"
             className="session-tab__fullscreen"
             aria-label="Full screen"
-            title="Full screen (Esc to leave)"
+            title="Full screen (Shift+Esc to leave; Esc goes to the remote machine)"
             onClick={toggleFullscreen}
             data-testid="session-tab-fullscreen"
           >

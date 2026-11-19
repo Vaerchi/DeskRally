@@ -371,8 +371,10 @@ impl Admission {
 /// sessions:
 ///
 /// - Key/button DOWN: record this session as a holder; inject to OS only when going from 0 → 1
-///   (first holder). Subsequent sessions pressing the same key update the refcount but skip OS
-///   injection because the OS already has the key down.
+///   (first holder). A different session's first press of the same key updates the refcount but
+///   skips OS injection because the OS already has the key down. A key DOWN from a session that
+///   already holds the key is its auto-repeat and IS injected (Windows does not auto-repeat injected
+///   keys; Ed 11-18), without changing the holders.
 /// - Key/button UP: remove this session from holders; inject to OS only when going from 1 → 0
 ///   (last holder released). Intermediate releases are silently suppressed at the OS level.
 ///   The lock is held across the OS inject call (key-up) so that a concurrent session's key-down
@@ -458,7 +460,16 @@ impl InputCoordinator {
             InputEvent::Key { code, down: true } => {
                 let entry = s.key_holders.entry(code).or_default();
                 let was_empty = entry.is_empty();
-                entry.insert(session);
+                let newly_held = entry.insert(session);
+                if !was_empty && !newly_held {
+                    // Ed 11-18 ("held keys don't repeat"): a down from a session that ALREADY holds the key is
+                    // the browser's auto-repeat. Windows does not auto-repeat injected keys, so the remote only
+                    // repeats if every repeat is injected. The holder set is unchanged, so the single key-up
+                    // still comes from the last holder's release. A different session's FIRST press of a key
+                    // another session holds stays suppressed below.
+                    self.os_sink.inject(InputEvent::Key { code, down: true })?;
+                    return Ok(());
+                }
                 if was_empty {
                     // Inject with lock held: OS state and coordinator state transition together.
                     if let Err(e) = self.os_sink.inject(InputEvent::Key { code, down: true }) {
@@ -2769,6 +2780,27 @@ mod tests {
 
     /// `release_session` cleans up coordinator state and suppresses OS injection for keys still
     /// held by other sessions.
+    /// Ed 11-18: a held key's auto-repeat (downs from the session that already holds it) reaches the OS, so the
+    /// remote repeats; a second session's first press of the same key stays suppressed; the release still sends
+    /// exactly one key-up.
+    #[test]
+    fn auto_repeat_from_the_holder_reaches_the_os() {
+        let (coordinator, log) = recording_coordinator();
+        let (a, b): (u64, u64) = (10, 20);
+        let code: u32 = 0x41; // 'A'
+        for _ in 0..3 {
+            coordinator.inject(a, InputEvent::Key { code, down: true }).unwrap();
+        }
+        assert_eq!(recorded(&log), vec!["[INJECT] key_down code=65"; 3], "every repeat down from the holder is injected");
+        coordinator.inject(b, InputEvent::Key { code, down: true }).unwrap();
+        assert_eq!(recorded(&log).len(), 3, "another session's first press of a held key stays suppressed");
+        coordinator.inject(b, InputEvent::Key { code, down: false }).unwrap();
+        coordinator.inject(a, InputEvent::Key { code, down: false }).unwrap();
+        let log_now = recorded(&log);
+        assert_eq!(log_now.iter().filter(|l| l.contains("key_up")).count(), 1, "one key-up, from the last holder");
+        assert_eq!(log_now.last().map(String::as_str), Some("[INJECT] key_up code=65"));
+    }
+
     #[test]
     fn release_session_only_injects_for_last_holder() {
         let (coordinator, log) = recording_coordinator();

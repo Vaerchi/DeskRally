@@ -494,9 +494,9 @@ if (-not $SkipBuild) {
 # 2. Start relay + signaling (DEV/insecure) for the Rust e2e wire shape
 # =============================================================================================
 Section "Start dependencies: relay :$RelayTcpPort, signaling :$SigPort (insecure dev flags)"
-StartServer "relay" $RelayExe @("-tcp", ":$RelayTcpPort", "-ws", ":$RelayWsPort") $RelayDir $null | Out-Null
+StartServer "relay" $RelayExe @("-tcp", "127.0.0.1:$RelayTcpPort", "-ws", "127.0.0.1:$RelayWsPort") $RelayDir $null | Out-Null
 if (-not (WaitTcp "127.0.0.1" $RelayTcpPort 15000)) { StopServers; throw "relay did not come up on :$RelayTcpPort" }
-StartServer "signaling" $SignalingExe @("-addr", ":$SigPort", "-insecure-no-ticket-verification", "-insecure-no-agent-auth") $SignalingDir @{ SIGNALING_ALLOWED_ORIGINS = "*" } | Out-Null
+StartServer "signaling" $SignalingExe @("-addr", "127.0.0.1:$SigPort", "-insecure-no-ticket-verification", "-insecure-no-agent-auth") $SignalingDir @{ SIGNALING_ALLOWED_ORIGINS = "*" } | Out-Null
 if (-not (WaitTcp "127.0.0.1" $SigPort 15000)) { StopServers; throw "signaling did not come up on :$SigPort" }
 Write-Host "  relay + signaling up." -ForegroundColor Green
 

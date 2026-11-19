@@ -205,7 +205,7 @@ test.describe("Phase 1 — insecure signaling: multi-session mechanics", () => {
     // conflating the result with the auth stack — that is Phase 2's job.
     sigProcInsec = spawn(
       SIGNALING_EXE,
-      ["-addr", `:${SIG_PORT_INSEC}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"],
+      ["-addr", `127.0.0.1:${SIG_PORT_INSEC}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"],
       { cwd: SIGNALING_DIR, stdio: ["ignore", "pipe", "pipe"] },
     );
     sigProcInsec.stdout?.on("data", (d: Buffer) => process.stdout.write(`[sig-insec] ${d}`));
@@ -649,7 +649,7 @@ test.describe("Phase 2 — enforcing signaling: separate signed session leases",
     // that is Phase 1 of secure_posture.spec.ts). Tickets ARE verified — that is the gate.
     sigProcEnf = spawn(
       SIGNALING_EXE,
-      ["-addr", `:${SIG_PORT_ENF}`, "-insecure-no-agent-auth"],
+      ["-addr", `127.0.0.1:${SIG_PORT_ENF}`, "-insecure-no-agent-auth"],
       {
         cwd: SIGNALING_DIR,
         stdio: ["ignore", "pipe", "pipe"],

@@ -74,6 +74,15 @@ pub fn pill_text(view_only: bool) -> &'static str {
     }
 }
 
+/// The pill's label. With a connection code (docs/69 6.1) the code comes FIRST: the pill ends long text with an
+/// ellipsis, and the digits are what the person at the machine is asked to read (Ed 11-18).
+pub fn pill_label(view_only: bool, code: Option<&str>) -> String {
+    match code {
+        Some(code) => format!("Code {code} \u{00b7} {}", pill_text(view_only)),
+        None => pill_text(view_only).to_owned(),
+    }
+}
+
 /// What a click at client x-coordinate `x` does. Pure, for the same reason.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PillClick {
@@ -278,7 +287,8 @@ extern "system" fn pill_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                         let previous = SelectObject(hdc, HGDIOBJ(font.0));
                         SetBkMode(hdc, TRANSPARENT);
                         SetTextColor(hdc, COLORREF(TEXT_COLOR));
-                        let mut text: Vec<u16> = pill_text(view_only).encode_utf16().collect();
+                        let code = crate::guest_window::pill_code(HWND(st.guest as *mut _));
+                        let mut text: Vec<u16> = pill_label(view_only, code.as_deref()).encode_utf16().collect();
                         let mut body = RECT { right: rc.right - COLLAPSE_W, ..rc };
                         DrawTextW(hdc, &mut text, &mut body, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
                         let mut collapse: Vec<u16> = "—".encode_utf16().collect();
@@ -319,6 +329,15 @@ extern "system" fn pill_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
 mod tests {
     use super::*;
 
+    // Ed 11-18: the connection code leads the pill, so the ellipsis can never hide it.
+    #[test]
+    fn pill_label_leads_with_the_connection_code() {
+        assert_eq!(pill_label(false, None), pill_text(false));
+        assert_eq!(pill_label(true, None), pill_text(true));
+        let l = pill_label(false, Some("697 670"));
+        assert!(l.starts_with("Code 697 670 \u{00b7} "), "{l}");
+        assert!(l.ends_with(pill_text(false)), "{l}");
+    }
     /// The slot table is process-global, and the test harness runs tests in parallel: a test that frees
     /// a slot and expects to get it back raced one taking twelve at once (a gate flake, 2026-10-30:
     /// "a freed slot is reused", left 12, right 0). Every test that touches the table holds this.

@@ -174,7 +174,7 @@ test.beforeAll(async () => {
   // presence, and the enforcing posture has its own spec (secure_posture.spec.ts).
   signalingProc = spawn(
     SIGNALING_EXE,
-    ["-addr", `:${SIG_PORT}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"],
+    ["-addr", `127.0.0.1:${SIG_PORT}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"],
     {
       cwd: SIGNALING_DIR,
       stdio: ["ignore", "pipe", "pipe"],

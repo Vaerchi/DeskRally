@@ -102,7 +102,7 @@ test.beforeAll(async () => {
     // The signaling server refuses to start without SIGNALING_TICKET_PUBKEY (unverified brokering
     // would let any WS client reach any agent). This local harness has no control plane to take the
     // key from, so it opts out explicitly — the same flag a developer uses by hand.
-    signalingProc = spawn(SIGNALING_EXE, ["-addr", `:${SIG_PORT}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"], { cwd: SIGNALING_DIR, stdio: "ignore" });
+    signalingProc = spawn(SIGNALING_EXE, ["-addr", `127.0.0.1:${SIG_PORT}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"], { cwd: SIGNALING_DIR, stdio: "ignore" });
     const up = await waitFor(() => wsReachable(SIGNALING_WS, 500), 10_000);
     if (!up) {
       skipReason = `signaling server did not come up on :${SIG_PORT}`;

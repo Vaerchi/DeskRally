@@ -148,7 +148,7 @@ test.beforeAll(async () => {
   expect(pub.grant_issuer_pubkey).toMatch(/^[0-9a-f]{64}$/);
 
   // Signaling: ENFORCING — no -insecure flags.
-  signalingProc = spawn(SIGNALING_EXE, ["-addr", `:${SIG_PORT}`], {
+  signalingProc = spawn(SIGNALING_EXE, ["-addr", `127.0.0.1:${SIG_PORT}`], {
     cwd: SIGNALING_DIR,
     stdio: ["ignore", "pipe", "pipe"],
     env: {

@@ -226,7 +226,7 @@ test.beforeAll(async () => {
   // `-insecure-no-agent-auth` stays: it lets an unenrolled agent register with no tenant, and
   // signaling's tenant check short-circuits on an empty agent tenant. It gates a DIFFERENT half from
   // ticket verification, which is exactly why the two flags are not coupled.
-  signalingProc = spawn(SIGNALING_EXE, ["-addr", `:${SIG_PORT}`, "-insecure-no-agent-auth"], {
+  signalingProc = spawn(SIGNALING_EXE, ["-addr", `127.0.0.1:${SIG_PORT}`, "-insecure-no-agent-auth"], {
     cwd: SIGNALING_DIR,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, SIGNALING_TICKET_PUBKEY: issuerPubkey },

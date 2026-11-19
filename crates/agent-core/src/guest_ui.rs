@@ -542,6 +542,11 @@ impl GuestPresenter {
 
     /// Whether the technician is currently WATCHING only (view-only) rather than controlling. Drives
     /// the headline and the window title so the guest can tell the two apart.
+    /// docs/69 6.1: this connection's comparison code while the session runs (shown on the pill and the panel).
+    pub fn active_comparison_code(&self) -> Option<&str> {
+        if self.phase == SessionPhase::Active { self.comparison_code.as_deref() } else { None }
+    }
+
     pub fn view_only(&self) -> bool {
         self.view_only
     }

@@ -1574,7 +1574,7 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
     std::wstring ua(uaW);
     CoTaskMemFree(uaW);
     if (ua.find(L"DeskRallyDesktop/") == std::wstring::npos)
-        ua += L" DeskRallyDesktop/0.8.4";
+        ua += L" DeskRallyDesktop/0.8.5";
     if (g_helloVerifiedAtStartup) ua += L" DeskRallyHello/1";
     ua += L" DeskRallySSO/1";
     // The clipboard answer is remembered for the run (g_consentAnswers), so the console may read the

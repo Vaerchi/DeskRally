@@ -72,7 +72,7 @@ test.beforeAll(async () => {
       skipReason = `${SIGNALING_EXE} is missing — globalSetup should have built it`;
       return;
     }
-    signalingProc = spawn(SIGNALING_EXE, ["-addr", `:${SIG_PORT}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"], { cwd: SIGNALING_DIR, stdio: "ignore" });
+    signalingProc = spawn(SIGNALING_EXE, ["-addr", `127.0.0.1:${SIG_PORT}`, "-insecure-no-ticket-verification", "-insecure-no-agent-auth"], { cwd: SIGNALING_DIR, stdio: "ignore" });
     if (!(await waitFor(() => wsReachable(SIGNALING_WS, 500), 10_000))) {
       skipReason = `signaling server did not come up on :${SIG_PORT}`;
       return;

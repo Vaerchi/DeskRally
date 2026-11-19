@@ -992,8 +992,15 @@ impl WebRtcTransport {
             let pc = pc.clone();
             let sig = sig.clone();
             tokio::spawn(async move {
+                // docs/69 3.4, as in the multi-session path: a binding verifies ONE association, so this
+                // connection takes exactly one remote description and refuses any later one. This is the path
+                // the attended guest uses (Codex sas-impl r1 note). Trickled candidates still apply.
+                let mut remote_applied = false;
                 while let Some(msg) = sig_in.recv().await {
                     match msg {
+                        ServerToClient::Sdp { .. } if remote_applied => {
+                            tracing::warn!(role = tag, "refused a second remote description (renegotiation is not supported)");
+                        }
                         ServerToClient::Sdp { sdp, kind, .. } => match kind {
                             SdpKind::Offer => {
                                 tracing::debug!(role = tag, media = %sdp_media_summary(&sdp), "remote OFFER media sections");
@@ -1002,6 +1009,7 @@ impl WebRtcTransport {
                                     tracing::warn!(role = tag, error = %e, "set_remote(offer)");
                                     continue;
                                 }
+                                remote_applied = true;
                                 let answer = match pc.create_answer(None).await {
                                     Ok(a) => a,
                                     Err(e) => { tracing::warn!(role = tag, error = %e, "create_answer"); continue }
@@ -1024,8 +1032,9 @@ impl WebRtcTransport {
                             }
                             SdpKind::Answer => {
                                 if let Ok(answer) = RTCSessionDescription::answer(sdp) {
-                                    if let Err(e) = pc.set_remote_description(answer).await {
-                                        tracing::warn!(role = tag, error = %e, "set_remote(answer)");
+                                    match pc.set_remote_description(answer).await {
+                                        Ok(()) => remote_applied = true,
+                                        Err(e) => tracing::warn!(role = tag, error = %e, "set_remote(answer)"),
                                     }
                                 }
                             }
@@ -5526,8 +5535,10 @@ fn build_api(
 /// Environment switch for [`build_api`]'s test-only loopback mode. Any value other than empty or "0" enables it.
 pub const TEST_ICE_LOOPBACK_ENV: &str = "RMT_TEST_ICE_LOOPBACK";
 
+/// Debug builds only (Codex release-1334 low): every test, the gate and the e2e agents are debug builds, and a
+/// release agent (what the MSI installs) must never be steerable into loopback-only ICE by its environment.
 fn test_ice_loopback() -> bool {
-    std::env::var_os(TEST_ICE_LOOPBACK_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+    cfg!(debug_assertions) && std::env::var_os(TEST_ICE_LOOPBACK_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 fn unix_ms() -> u64 {

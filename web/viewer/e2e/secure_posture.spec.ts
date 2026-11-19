@@ -315,7 +315,7 @@ test.beforeAll(async () => {
 
   // --- Signaling: ENFORCING. No -insecure-no-ticket-verification, no -insecure-no-agent-auth.
   // Both gates are live, and signaling would log.Fatalf here if either env pair were missing. ---
-  signalingProc = spawn(SIGNALING_EXE, ["-addr", `:${SIG_PORT}`], {
+  signalingProc = spawn(SIGNALING_EXE, ["-addr", `127.0.0.1:${SIG_PORT}`], {
     cwd: SIGNALING_DIR,
     stdio: ["ignore", "pipe", "pipe"],
     env: {

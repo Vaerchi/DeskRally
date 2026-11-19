@@ -240,3 +240,34 @@ test("binding v2: Verified with a comparison code the technician can open", asyn
   expect(agentLog.slice(before)).toContain("console verified; the session is bound");
   await context.close();
 });
+
+// Codex sas-impl r6 follow-up: with remote keyboard capture ON (the default), the comparison panel is reachable and
+// operable from the keyboard alone: Enter opens it, Tab reaches "Codes differ", and Enter there ends the session for
+// good (no recovery reconnect) with the technician's own explanation on screen.
+test("binding v2: the keyboard alone reaches and operates Codes differ while input is captured", async () => {
+  test.setTimeout(120_000);
+  const r = await fetch(`${CP_BASE}/fixture/agent-version`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ device_id: deviceId, version: "0.1.33+e2e" }),
+  });
+  expect(r.status).toBe(204);
+  const context = await browser!.newContext({ ...PINNED });
+  const page = await context.newPage();
+  await loginAndConnect(page);
+  const mark = page.getByTestId("session-binding-status");
+  await expect(mark).toHaveAttribute("data-state", "verified", { timeout: 45_000 });
+  await expect(mark).toHaveAttribute("data-has-code", "");
+  await mark.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("session-binding-code")).toContainText(/\d{3} \d{3}/);
+  const differ = page.getByTestId("session-binding-codes-differ");
+  await page.keyboard.press("Tab");
+  await expect(differ).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("You reported that the codes differ, so the session was ended.")).toBeVisible({ timeout: 15_000 });
+  await expect(mark).toHaveCount(0);
+  // Terminal: no recovery brings the session back.
+  await page.waitForTimeout(8_000);
+  await expect(page.getByTestId("session-binding-status")).toHaveCount(0);
+  await context.close();
+});
