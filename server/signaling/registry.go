@@ -69,8 +69,11 @@ type Peer struct {
 	// value (older agents). Re-emitted in the presence feed; never read by the broker or auth path.
 	MultiSessionCapable *bool
 
-	conn    peerConn
-	writeMu sync.Mutex // gorilla/websocket forbids concurrent writers
+	agentConnection atomic.Bool // Set when the connection registers as an agent.
+	roster          rosterMailbox
+	transportClose  sync.Once // closeTransport: one close shared by roster failure and cleanup
+	conn            peerConn
+	writeMu         sync.Mutex // gorilla/websocket forbids concurrent writers
 
 	// sessionEndedStale: this peer qualified for session_ended_v1 (authenticated, tenanted) but its
 	// Registered left it out, because the capability probe had not confirmed it yet. Agents learn
@@ -143,6 +146,7 @@ type Peer struct {
 	// identity lookup (0 = none, dev mode / tests). Publication is refused when a newer lookup for the same
 	// device has already published: an older, slower answer must never overwrite a newer one.
 	authSeq uint64
+	wake    peerWakeState
 }
 
 // Send pushes a server message to the peer, tagging it with the correct discriminant.
@@ -174,6 +178,25 @@ func (p *Peer) Send(payload any) error {
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	if roster, ok := payload.(SessionParticipants); ok && roster.Revision != 0 {
+		if p.wake.disconnected.Load() {
+			return nil
+		}
+		if !p.agentConnection.Load() {
+			return p.sendLocked(tag, payload)
+		}
+		// A connection can register after this requester snapshot was built.
+		roster.Revision = 0
+		roster.Participants = append(make([]SessionParticipantEntry, 0, len(roster.Participants)), roster.Participants...)
+		for i := range roster.Participants {
+			roster.Participants[i].DisplayName = ""
+		}
+		payload = roster
+	}
+	return p.sendLocked(tag, payload)
+}
+
+func (p *Peer) sendLocked(tag string, payload any) error {
 	// A deadline this cannot set (a fake in tests, an odd transport) must not stop the send: the
 	// bound is defence in depth, not a correctness precondition.
 	_ = p.conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout))
@@ -196,19 +219,25 @@ type Registry struct {
 	now      func() time.Time // injectable clock for deterministic expiry tests
 	// help is the per-DEVICE help message budget and in-flight cap (helprequest.go). It lives here, not on
 	// the Peer, so it survives a reconnect: a device that drops its socket does not get a fresh budget.
-	help *helpGate
+	help        *helpGate
+	gates       deviceLocks
+	targetGone  func(*Peer) // Set by NewBroker before serving.
+	incarnation string
+	generation  uint64 // guarded by mu and assigned at publication
+	wakeActive  atomic.Bool
 }
 
 // NewRegistry builds an empty registry. ttl is the heartbeat freshness window: a peer not
 // seen within ttl is considered expired by Lookup.
 func NewRegistry(ttl time.Duration) *Registry {
 	return &Registry{
-		peers:      make(map[string]*Peer),
-		restricted: make(map[string]*Peer),
-		lastAuth:   make(map[string]uint64),
-		ttl:        ttl,
-		now:        time.Now,
-		help:       newHelpGate(),
+		peers:       make(map[string]*Peer),
+		restricted:  make(map[string]*Peer),
+		lastAuth:    make(map[string]uint64),
+		ttl:         ttl,
+		now:         time.Now,
+		help:        newHelpGate(),
+		incarnation: newIncarnation(),
 	}
 }
 
@@ -223,9 +252,15 @@ func NewRegistry(ttl time.Duration) *Registry {
 // an agent requires a signature from the key the control plane pinned for that device id; a
 // connection that merely claims the device id is never entered here.
 func (r *Registry) Register(p *Peer) *Peer {
+	p.agentConnection.Store(true)
+	release, ok := r.gates.acquire(p.DeviceId, deviceGateTimeout)
+	if !ok {
+		return nil
+	}
 	r.mu.Lock()
 	if r.staleAuthLocked(p) {
 		r.mu.Unlock()
+		release()
 		return nil
 	}
 	old := r.peers[p.DeviceId]
@@ -234,8 +269,14 @@ func (r *Registry) Register(p *Peer) *Peer {
 	oldRestricted := r.restricted[p.DeviceId]
 	delete(r.restricted, p.DeviceId)
 	p.LastSeen = r.now()
+	r.generation++
+	p.wake.ref = wakeConnRef{r.incarnation, r.generation}
 	r.peers[p.DeviceId] = p
 	r.mu.Unlock()
+	release()
+	if old != nil && old != p && r.targetGone != nil {
+		r.targetGone(old)
+	}
 	// Socket writes and the peer write lock must never stall the shared registry.
 	// Remove's connection identity check protects the newly published replacement.
 	if old != nil && old != p && old.conn != nil && old.conn != p.conn {
@@ -273,17 +314,29 @@ func (r *Registry) staleAuthLocked(p *Peer) bool {
 // is superseded. It returns false (publishing nothing) when a newer identity lookup for the device has
 // already published - an older answer must not overwrite a newer one.
 func (r *Registry) RegisterRestricted(p *Peer) bool {
+	p.agentConnection.Store(true)
+	release, ok := r.gates.acquire(p.DeviceId, deviceGateTimeout)
+	if !ok {
+		return false
+	}
 	r.mu.Lock()
 	if r.staleAuthLocked(p) {
 		r.mu.Unlock()
+		release()
 		return false
 	}
 	old := r.restricted[p.DeviceId]
 	oldNormal := r.peers[p.DeviceId]
 	delete(r.peers, p.DeviceId)
 	p.LastSeen = r.now()
+	r.generation++
+	p.wake.ref = wakeConnRef{r.incarnation, r.generation}
 	r.restricted[p.DeviceId] = p
 	r.mu.Unlock()
+	release()
+	if oldNormal != nil && r.targetGone != nil {
+		r.targetGone(oldNormal)
+	}
 	if old != nil && old != p && old.conn != nil && old.conn != p.conn {
 		closePeer(old, "superseded by re-registration")
 	}
@@ -359,46 +412,99 @@ func (r *Registry) isCurrent(p *Peer) bool {
 	return r.peers[p.DeviceId] == p || r.restricted[p.DeviceId] == p
 }
 
-// Heartbeat refreshes a registered peer's LastSeen. Returns false if the device is unknown.
+type heartbeatResult uint8
+
+const (
+	heartbeatMissing heartbeatResult = iota
+	heartbeatContended
+	heartbeatUpdated
+)
+
+// Heartbeat reports whether the registered peer's LastSeen was refreshed.
 func (r *Registry) Heartbeat(device string) bool {
+	return r.heartbeat(device, nil) == heartbeatUpdated
+}
+
+func (r *Registry) heartbeat(device string, conn peerConn) heartbeatResult {
+	release, ok := r.gates.acquire(device, deviceGateTimeout)
+	if !ok {
+		return heartbeatContended
+	}
+	defer release()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	p, ok := r.peers[device]
-	if !ok {
-		return false
+	if !ok || (conn != nil && p.conn != conn) {
+		return heartbeatMissing
 	}
 	p.LastSeen = r.now()
-	return true
+	return heartbeatUpdated
 }
 
 // Lookup returns a peer by DeviceId only if it is registered and still fresh. An expired peer
 // (heartbeats lapsed beyond ttl) is reported as absent and lazily evicted.
 func (r *Registry) Lookup(device string) (*Peer, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	p, ok := r.peers[device]
+	r.mu.RLock()
+	p := r.peers[device]
+	stale := p != nil && r.expired(p)
+	r.mu.RUnlock()
+	if !stale {
+		return p, p != nil
+	}
+	release, ok := r.gates.acquire(device, deviceGateTimeout)
 	if !ok {
 		return nil, false
 	}
-	if r.expired(p) {
+	r.mu.Lock()
+	p = r.peers[device]
+	stale = p != nil && r.expired(p)
+	if stale {
 		delete(r.peers, device)
+	}
+	r.mu.Unlock()
+	release()
+	if stale {
+		if r.targetGone != nil {
+			r.targetGone(p)
+		}
 		return nil, false
 	}
-	return p, true
+	return p, p != nil
 }
 
 // Remove evicts a peer. It only removes the entry if it still refers to the given connection,
 // so a race where a reconnect replaced the entry does not evict the fresh peer. Pass nil conn
 // to force removal regardless.
 func (r *Registry) Remove(device string, conn peerConn) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if p, ok := r.peers[device]; ok && (conn == nil || p.conn == conn) {
-		delete(r.peers, device)
+	if !r.remove(device, conn) && conn != nil {
+		// Cleanup must eventually evict a disconnected socket even if a wake held the gate.
+		go func() {
+			for !r.remove(device, conn) {
+			}
+		}()
 	}
-	if p, ok := r.restricted[device]; ok && (conn == nil || p.conn == conn) {
+}
+
+func (r *Registry) remove(device string, conn peerConn) bool {
+	release, ok := r.gates.acquire(device, deviceGateTimeout)
+	if !ok {
+		return false
+	}
+	r.mu.Lock()
+	var removed *Peer
+	if p := r.peers[device]; p != nil && (conn == nil || p.conn == conn) {
+		delete(r.peers, device)
+		removed = p
+	}
+	if p := r.restricted[device]; p != nil && (conn == nil || p.conn == conn) {
 		delete(r.restricted, device)
 	}
+	r.mu.Unlock()
+	release()
+	if removed != nil && r.targetGone != nil {
+		r.targetGone(removed)
+	}
+	return true
 }
 
 // Len reports the number of currently-registered peers (fresh or not).
@@ -411,6 +517,9 @@ func (r *Registry) Len() int {
 // expired reports whether the peer's last heartbeat is older than the TTL. Caller holds the
 // lock. A non-positive TTL disables expiry.
 func (r *Registry) expired(p *Peer) bool {
+	if p.wake.disconnected.Load() {
+		return true
+	}
 	if r.ttl <= 0 {
 		return false
 	}
@@ -430,7 +539,7 @@ type deviceLock struct {
 	refs int           // holders + waiters, guarded by deviceLocks.mu
 }
 
-// acquire takes the device's lock, waiting at most wait. The returned release is idempotent. ok is false
+// acquire takes the device's lock, waiting at most wait (a negative wait has no timeout). The returned release is idempotent. ok is false
 // (nothing held) when the wait timed out.
 func (d *deviceLocks) acquire(device string, wait time.Duration) (release func(), ok bool) {
 	d.mu.Lock()
@@ -453,11 +562,15 @@ func (d *deviceLocks) acquire(device string, wait time.Duration) (release func()
 		}
 		d.mu.Unlock()
 	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
+	var deadline <-chan time.Time
+	if wait >= 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		deadline = timer.C
+	}
 	select {
 	case l.ch <- struct{}{}:
-	case <-timer.C:
+	case <-deadline:
 		leave()
 		return nil, false
 	}

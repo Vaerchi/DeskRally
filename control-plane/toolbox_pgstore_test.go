@@ -34,6 +34,8 @@ func newToolboxFixture(t *testing.T) *toolboxFixture {
 	applyMgmtAuditChainMigration(t, su)
 	applyAttendedMigration(t, su)
 	applyMigrationFile(t, su, "migrations/0056_toolbox.sql") // group_session_policy is in the base test schema
+	applyMigrationFile(t, su, "migrations/0060_session_transfer.sql") // session_record's composite reference
+	applyMigrationFile(t, su, "migrations/0087_run_record.sql")
 	f := &toolboxFixture{su: su}
 	f.tenant, f.owner = provisionUser(t, su, "acme", "owner@acme.test", "password-1234")
 	f.other, f.alien = provisionUser(t, su, "other", "owner@other.test", "password-1234")

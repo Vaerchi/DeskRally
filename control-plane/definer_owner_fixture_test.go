@@ -90,7 +90,7 @@ func ownDefinersLikeProduction(ctx context.Context, pool *pgxpool.Pool) error {
 	// 0079 UPDATE on machine.last_seen).
 	var b []byte
 	for _, f := range []string{"migrations/0076_definer_owner.sql", "migrations/0078_download_reach.sql",
-		"migrations/0079_presence_sweep.sql"} {
+		"migrations/0079_presence_sweep.sql", "migrations/0084_wake_on_lan.sql"} {
 		part, err := os.ReadFile(f)
 		if err != nil {
 			return err

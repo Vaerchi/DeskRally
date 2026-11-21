@@ -170,9 +170,10 @@ func bufferTenantBody(w http.ResponseWriter, r *http.Request) (func(), bool) {
 		tenantBodyCounts.Unlock()
 		<-tenantBodySlots
 	}
+	// Machine field definitions and ordering use the same small tier as single-property edits.
 	limit := int64(maxSmallJSONBodyBytes)
 	switch r.URL.Path {
-	case "/audit/ingest", "/machines/bulk-status", "/machines/bulk-group",
+	case "/audit/ingest", "/machines/bulk-status", "/machines/bulk-group", "/machines/bulk-property",
 		// The public-API alias of bulk-group (docs/59) carries the same up-to-200-id list and gets
 		// the same tier; the exact-path match means the alias would otherwise silently fall to the
 		// small default.
@@ -183,6 +184,11 @@ func bufferTenantBody(w http.ResponseWriter, r *http.Request) (func(), bool) {
 	// default (maxToolboxRequestBytes, toolbox.go). The handler enforces the same cap again.
 	if r.URL.Path == "/toolbox" || strings.HasPrefix(r.URL.Path, "/toolbox/") {
 		limit = maxToolboxRequestBytes
+	}
+	// Multi-condition dynamic groups: up to 10 conditions of up to 4 KiB values, worst-case JSON escaping
+	// (maxDynamicGroupJSONBodyBytes, http_tenant_admin.go). The handler enforces the same cap again.
+	if r.URL.Path == "/dynamic-groups" {
+		limit = maxDynamicGroupJSONBodyBytes
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	_ = r.Body.Close()

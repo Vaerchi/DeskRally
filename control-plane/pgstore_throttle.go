@@ -3,7 +3,7 @@ package controlplane
 // PgThrottleStore — the Postgres-backed ThrottleStore (migrations/0015_throttle.sql), giving
 // every control-plane replica ONE shared online-guessing budget instead of a per-process one.
 //
-// Unlike every other Pg store here it deliberately does NOT go through withTenant/RLS: throttle
+// The pre-tenant throttle methods run directly on the pool: throttle
 // state is global, pre-tenant by nature (login/redeem run before any tenant is resolved, IP keys
 // have no tenant at all), so queries run directly on the pool — the same posture as the
 // SECURITY DEFINER cp_* lookups on other pre-tenant paths, minus the function (the table holds
@@ -265,4 +265,54 @@ func (s *PgThrottleStore) FailBatch(ctx context.Context, keys []string, now, sta
 			END
 	`, ks, ns, now, free, base.Seconds(), max.Seconds(), staleBefore)
 	return err
+}
+
+// ReserveWake charges the target cooldown and one tenant slot in one transaction.
+// Each slot is held for a full minute, enforcing a rolling 30-request budget.
+func (s *PgThrottleStore) ReserveWake(ctx context.Context, tenantID, machineID string) (time.Duration, error) {
+	var retry time.Duration
+	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('wake_throttle:' || $1, 0))`, tenantID); err != nil {
+			return err
+		}
+		var now time.Time
+		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			return err
+		}
+		targetKey := storeKey("wake:target:" + tenantID + ":" + machineID)
+		var targetUntil *time.Time
+		if err := tx.QueryRow(ctx, `SELECT (SELECT locked_until FROM throttle_counter WHERE key = $1)`, targetKey).Scan(&targetUntil); err != nil {
+			return err
+		}
+		if targetUntil != nil && targetUntil.After(now) {
+			retry = targetUntil.Sub(now)
+			return nil
+		}
+		slots := make([]string, 30)
+		for i := range slots {
+			slots[i] = storeKey(fmt.Sprintf("wake:tenant:%s:%d", tenantID, i))
+		}
+		var slot string
+		var slotUntil *time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT slot.key, counters.locked_until
+			FROM unnest($1::text[]) AS slot(key)
+			LEFT JOIN throttle_counter AS counters USING (key)
+			ORDER BY counters.locked_until NULLS FIRST, slot.key LIMIT 1`, slots).Scan(&slot, &slotUntil)
+		if err != nil {
+			return err
+		}
+		if slotUntil != nil && slotUntil.After(now) {
+			retry = slotUntil.Sub(now)
+			return nil
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO throttle_counter (key, failures, last_failure, locked_until)
+			VALUES ($1, 1, $3, $4), ($2, 1, $3, $5)
+			ON CONFLICT (key) DO UPDATE
+			SET failures = 1, last_failure = EXCLUDED.last_failure, locked_until = EXCLUDED.locked_until`,
+			targetKey, slot, now, now.Add(30*time.Second), now.Add(time.Minute))
+		return err
+	})
+	return retry, err
 }

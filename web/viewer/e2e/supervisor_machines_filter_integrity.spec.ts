@@ -12,6 +12,7 @@
  */
 
 import { test, expect, type Page, type Route } from "@playwright/test";
+import type { MachineField } from "../src/lib/console_api";
 import { consoleTab } from "./nav";
 
 const machine = (id: string, name: string) => ({
@@ -45,7 +46,7 @@ const FILTER_OLDER = "older-site";
 const listing = (...machines: ReturnType<typeof machine>[]) => ({ machines, presence_known: true });
 const baseHandler: Handler = async (route) => route.fulfill({ json: listing(machine("b-1", "base-machine")) });
 
-async function mount(page: Page, byKey: Record<string, Handler>, status?: Handler) {
+async function mount(page: Page, byKey: Record<string, Handler>, status?: Handler, fields: readonly MachineField[] = []) {
   const BASE = test.info().project.use.baseURL ?? "http://127.0.0.1:5173";
   const baseUrl = new URL(BASE);
   // Network isolation: the test may only talk to a loopback origin.
@@ -56,6 +57,8 @@ async function mount(page: Page, byKey: Record<string, Handler>, status?: Handle
       await route.abort(); // anything outside the approved local origin
     } else if (url.pathname === "/cp/auth/session") {
       await route.fulfill({ status: 204 });
+    } else if (url.pathname === "/cp/machine-fields") {
+      await route.fulfill({ json: { fields, order_revision: 0 } });
     } else if (url.pathname === "/cp/machines" && route.request().method() === "GET") {
       const handler = byKey[url.searchParams.get("property_key") ?? ""];
       if (handler) await handler(route);
@@ -77,6 +80,35 @@ async function applyFilter(page: Page, key: string) {
   await page.getByTestId("machine-filter-key").fill(key);
   await page.getByTestId("machine-filter-apply").click();
 }
+
+test("a defined number filter preserves its key and can find a legacy raw value", async ({ page }) => {
+  const key = "\uFEFFscore";
+  const values: (string | null)[] = [];
+  await mount(page, {
+    "": baseHandler,
+    [key]: async (route) => {
+      const value = new URL(route.request().url()).searchParams.get("property_value");
+      values.push(value);
+      const rows = value === "1" ? [machine("n-1", "canonical-machine")]
+        : value === "1.00" ? [machine("l-1", "legacy-machine")] : [];
+      await route.fulfill({ json: listing(...rows) });
+    },
+  }, undefined, [{ key, label: "Score", type: "number", id: "score-id", position: 0, version: 1, choices: null }]);
+
+  const tbody = page.locator(".panel--machines table tbody");
+  await page.getByTestId("machine-filter-key").fill(key);
+  const raw = page.getByRole("checkbox", { name: "Raw value" });
+  await expect(raw).toBeVisible();
+  await expect(raw).not.toBeChecked();
+  await page.getByTestId("machine-filter-value").fill("1.00");
+  await page.getByTestId("machine-filter-apply").click();
+  await expect(tbody).toContainText("canonical-machine");
+
+  await raw.check();
+  await page.getByTestId("machine-filter-apply").click();
+  await expect(tbody).toContainText("legacy-machine");
+  expect(values).toEqual(["1", "1.00"]);
+});
 
 test("a delayed older filter response cannot replace the newer listing's rows", async ({ page }) => {
   const older = held(listing(machine("o-1", "older-machine")));

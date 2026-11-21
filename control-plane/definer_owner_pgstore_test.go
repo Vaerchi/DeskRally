@@ -35,6 +35,8 @@ const definerOwnerMigration = "0076_definer_owner.sql"
 // expectedDefinerPrivileges is EXACTLY what rmt_definer may do, written independently of the migration's
 // GRANT lines. A new privilege is a deliberate change to this list AND to a migration, never a side effect.
 var expectedDefinerPrivileges = []string{
+	"COLUMN machine_lan.received_at SELECT",
+	"machine_lan DELETE",
 	"COLUMN machine.last_seen UPDATE", // 0079: cp_presence_stamp writes this one column
 	"agent_directive SELECT",
 	"api_token SELECT",
@@ -385,7 +387,7 @@ func TestPgDefinerOwnerRole(t *testing.T) {
 	}
 
 	// (3) Its privileges equal the expected set exactly: no schema, sequence, function or database grants but USAGE on
-	// public, and no column grant but 0079's machine.last_seen.
+	// public.
 	got := queryStrings(t, pool, definerPrivilegesSQL("rmt_definer"))
 	want := append([]string{"SCHEMA public USAGE"}, expectedDefinerPrivileges...)
 	if g, w := normalizeSet(got), normalizeSet(want); g != w {
@@ -455,11 +457,11 @@ func TestPgDefinerOwnerRole(t *testing.T) {
 
 	// (7) Re-running the migration is a no-op: same owners, same grants.
 	// 0076 refuses a pre-existing rmt_definer that holds more than ITS grants, and later migrations added some
-	// (0078 download_daily SELECT, 0079 UPDATE on machine.last_seen): take them away for the re-run and give them
+	// (0078, 0079 and 0084): take them away for the re-run and give them
 	// back after, as the real order would have it.
-	execScript(t, pool, `REVOKE SELECT ON TABLE download_daily FROM rmt_definer; REVOKE UPDATE (last_seen) ON TABLE machine FROM rmt_definer`)
+	execScript(t, pool, `REVOKE SELECT ON TABLE download_daily FROM rmt_definer; REVOKE UPDATE (last_seen) ON TABLE machine FROM rmt_definer; REVOKE SELECT (received_at), DELETE ON TABLE machine_lan FROM rmt_definer`)
 	execScript(t, pool, string(migration))
-	execScript(t, pool, `GRANT SELECT ON TABLE download_daily TO rmt_definer; GRANT UPDATE (last_seen) ON TABLE machine TO rmt_definer`)
+	execScript(t, pool, `GRANT SELECT ON TABLE download_daily TO rmt_definer; GRANT UPDATE (last_seen) ON TABLE machine TO rmt_definer; GRANT SELECT (received_at), DELETE ON TABLE machine_lan TO rmt_definer`)
 	if notOwned := queryStrings(t, pool, applicationDefinersNotOwnedSQL); len(notOwned) != 0 {
 		t.Fatalf("after re-running 0076: %v", notOwned)
 	}

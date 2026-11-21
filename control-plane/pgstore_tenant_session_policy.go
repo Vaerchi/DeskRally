@@ -32,8 +32,8 @@ func (s *PgTenantSessionPolicyStore) Get(ctx context.Context, tenantID string) (
 	var p SessionPolicy
 	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx,
-			`SELECT max_concurrent_sessions, max_session_seconds, session_binding FROM tenant_session_policy WHERE tenant_id = $1`, tenantID).
-			Scan(&p.MaxConcurrentSessions, &p.MaxSessionSeconds, &p.SessionBinding)
+			`SELECT max_concurrent_sessions, max_session_seconds, session_binding, default_max_idle_seconds FROM tenant_session_policy WHERE tenant_id = $1`, tenantID).
+			Scan(&p.MaxConcurrentSessions, &p.MaxSessionSeconds, &p.SessionBinding, &p.DefaultMaxIdleSeconds)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // unset → the zero SessionPolicy (no limits)
 		}
@@ -49,15 +49,16 @@ func (s *PgTenantSessionPolicyStore) Get(ctx context.Context, tenantID string) (
 func (s *PgTenantSessionPolicyStore) Set(ctx context.Context, tenantID string, p SessionPolicy) error {
 	return withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO tenant_session_policy (tenant_id, max_concurrent_sessions, max_session_seconds, session_binding, updated_at)
-			VALUES ($1, $2, $3, COALESCE($4::text, 'warn'), now())
+			INSERT INTO tenant_session_policy (tenant_id, max_concurrent_sessions, max_session_seconds, session_binding, default_max_idle_seconds, updated_at)
+			VALUES ($1, $2, $3, COALESCE($4::text, 'warn'), COALESCE($5::integer, 0), now())
 			ON CONFLICT (tenant_id) DO UPDATE
-			SET max_concurrent_sessions = EXCLUDED.max_concurrent_sessions,
-			    max_session_seconds     = EXCLUDED.max_session_seconds,
-			    -- NULL = the caller did not say: keep the stored mode, decided inside this one statement (docs/69 step 4).
-			    session_binding         = COALESCE($4::text, tenant_session_policy.session_binding),
-			    updated_at              = now()
-		`, tenantID, p.MaxConcurrentSessions, p.MaxSessionSeconds, nullIfEmpty(p.SessionBinding))
+			SET max_concurrent_sessions  = EXCLUDED.max_concurrent_sessions,
+			    max_session_seconds      = EXCLUDED.max_session_seconds,
+			    -- NULL keeps the stored setting atomically.
+			    session_binding          = COALESCE($4::text, tenant_session_policy.session_binding),
+			    default_max_idle_seconds = COALESCE($5::integer, tenant_session_policy.default_max_idle_seconds),
+			    updated_at               = now()
+		`, tenantID, p.MaxConcurrentSessions, p.MaxSessionSeconds, nullIfEmpty(p.SessionBinding), p.DefaultMaxIdleSeconds)
 		return err
 	})
 }

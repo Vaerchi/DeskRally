@@ -61,10 +61,11 @@ var ErrAPITokenNotFound = errors.New("api token not found")
 //     approver) assumes a person, and CapManageMachines, which a token CAN hold, must never be enough to
 //     wipe a fleet. Pinned by TestRemoveAgentIsNeverTokenGrantable.
 //
-// The remaining five drive only handlers that reach the DB tenant-pinned and record audit with an
+// The fleet and reporting capabilities drive handlers that reach the DB tenant-pinned and record audit with an
 // opaque actor (0016) — no user-FK, no real-user lookup — so an independent token principal is
-// safe on exactly these paths.
+// safe on these paths. Wake-on-LAN also reserves a grantable capability for phase 3.
 var apiTokenGrantableCaps = map[Capability]struct{}{
+	CapWakeMachine:    {},
 	CapViewMachines:   {},
 	CapManageMachines: {},
 	CapManageGroups:   {},

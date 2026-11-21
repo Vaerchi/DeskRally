@@ -550,3 +550,35 @@ func TestStaleRecordedAfterTheFlipStillBounces(t *testing.T) {
 		t.Fatalf("the late-recorded stale peer was not bounced: %q", got)
 	}
 }
+
+func TestSessionEndedClearsOpenRequesterRoster(t *testing.T) {
+	for _, outcome := range []string{"ended", "already_ended"} {
+		t.Run(outcome, func(t *testing.T) {
+			cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]string{"outcome": outcome})
+			}))
+			defer cp.Close()
+
+			b, agent := nameTestBroker(t, &fakeConn{})
+			agent.registered = true
+			s := &Server{reg: b.reg, broker: b, guestEnd: guestEndTestReporter(t, cp.URL), identity: guestEndStubResolver{}}
+			conn := &fakeConn{}
+			controller := &Peer{conn: conn}
+			defer controller.stopRoster()
+			ticket := ticketGoldenClaims()
+			ticket.SessionID = guestEndTestSession
+			session, err := b.ConnectRequest(controller, agent.DeviceId, mintTicket(t, ticket))
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := waitRoster(t, conn, 1, 0)
+			s.dispatch(agent, ClientToServer{Payload: &SessionEnded{
+				ControlPlaneSession: session.controlPlaneID, Reason: "idle",
+			}})
+			after := waitRoster(t, conn, 0, before.Revision)
+			if after.Participants == nil || conn.closed {
+				t.Fatal("session_ended did not clear the open controller roster")
+			}
+		})
+	}
+}

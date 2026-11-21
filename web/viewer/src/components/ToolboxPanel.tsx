@@ -8,7 +8,8 @@
  * verbatim. One save or delete at a time (synchronous guard), and only the newest listing applies.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { RunHistory } from "./RunHistory";
 import { formatIsoUtc } from "../backstage/panels";
 import type { ConsoleApi, ToolboxItem, ToolboxItemInput, ToolboxListing, ToolboxRunAs, ToolboxScope, ToolboxShell } from "../lib/console_api";
 import { createLatestWins } from "../lib/latest_wins";
@@ -55,6 +56,7 @@ const EMPTY_DRAFT: Draft = { name: "", description: "", shell: "powershell", run
 export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
   const [bulk, setBulk] = useState<{ task?: BulkTask; compose: boolean } | null>(null);
   const fileBulkInput = useRef<HTMLInputElement>(null);
+  const [historyItemId, setHistoryItemId] = useState<string | null>(null);
   const [listing, setListing] = useState<ToolboxListing | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -327,34 +329,42 @@ export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
             </tr>
           )}
           {items.map((it) => (
-            <tr key={it.id} data-testid={`toolbox-row-${it.name}`}>
-              <td className="panel__name" title={it.description}>
-                {it.name}
-              </td>
-              <td>{it.scope === "shared" ? "Shared" : "Personal"}</td>
-              <td className="panel__mono">{it.shell === "powershell" ? "PowerShell" : "cmd"}</td>
-              <td>{it.run_as === "user" ? "Signed-in user" : "SYSTEM"}</td>
-              <td className="panel__mono">{formatIsoUtc(it.updated_at)}</td>
-              <td>
-                {openBulkCore && (
-                  <button className="panel__action" data-testid={`toolbox-bulk-${it.id}`} onClick={() => {
-                    setBulk({ task: { kind: "toolbox", item: { ...it } }, compose: false });
-                  }}>
-                    Run on machines…
-                  </button>
-                )}
-                {canChange(it) && (
-                  <>
-                    <button className="panel__action" onClick={() => openEdit(it)} disabled={saving}>
-                      Edit
+            <Fragment key={it.id}>
+              <tr data-testid={`toolbox-row-${it.name}`}>
+                <td className="panel__name" title={it.description}>
+                  {it.name}
+                </td>
+                <td>{it.scope === "shared" ? "Shared" : "Personal"}</td>
+                <td className="panel__mono">{it.shell === "powershell" ? "PowerShell" : "cmd"}</td>
+                <td>{it.run_as === "user" ? "Signed-in user" : "SYSTEM"}</td>
+                <td className="panel__mono">{formatIsoUtc(it.updated_at)}</td>
+                <td>
+                  <button className="panel__action" aria-expanded={historyItemId === it.id} onClick={() => {
+                    setHistoryItemId((current) => current === it.id ? null : it.id);
+                  }}>Run history</button>
+                  {openBulkCore && (
+                    <button className="panel__action" data-testid={`toolbox-bulk-${it.id}`} onClick={() => {
+                      setBulk({ task: { kind: "toolbox", item: { ...it } }, compose: false });
+                    }}>
+                      Run on machines…
                     </button>
-                    <button className="panel__action" onClick={() => setConfirmDelete(it)} disabled={saving}>
-                      Delete
-                    </button>
-                  </>
-                )}
-              </td>
-            </tr>
+                  )}
+                  {canChange(it) && (
+                    <>
+                      <button className="panel__action" onClick={() => openEdit(it)} disabled={saving}>
+                        Edit
+                      </button>
+                      <button className="panel__action" onClick={() => setConfirmDelete(it)} disabled={saving}>
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </td>
+              </tr>
+              {historyItemId === it.id && (
+                <tr><td colSpan={6}><RunHistory api={api} scope="toolbox" id={it.id} showEmpty /></td></tr>
+              )}
+            </Fragment>
           ))}
         </tbody>
       </table>

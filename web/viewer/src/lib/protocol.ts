@@ -342,6 +342,11 @@ export interface SignedSessionTicket {
   sig: string;
 }
 
+export interface SignedNameAttestation {
+  claims: { v: 1; session_id: string; technician_id: string; display_name: string; exp_ms: number };
+  sig: string;
+}
+
 /** Controller/agent -> signaling server. Internally tagged by `type`. */
 export type ClientToServer =
   | {
@@ -359,6 +364,7 @@ export type ClientToServer =
       target: DeviceId;
       /** Session ticket from `POST /sessions` (M2). Omitted on the direct-connect dev path. */
       ticket?: SignedSessionTicket;
+      name_attestation?: SignedNameAttestation;
     }
   | { type: "candidate"; session: SessionId; candidate: Candidate }
   | { type: "sdp"; session: SessionId; sdp: string; kind: SdpKind };
@@ -408,6 +414,7 @@ export interface SessionParticipantEntry {
   session_id: string;
   /** Technician id extracted from the session ticket, if any. Empty for unauthenticated paths. */
   technician_id?: string;
+  display_name?: string;
   access?: string;
 }
 
@@ -440,6 +447,7 @@ export type ServerToClient =
       device_id: string;
       /** All currently-connected controllers for this device, including the receiver. */
       participants: SessionParticipantEntry[];
+      revision?: number;
     };
 
 /** Serialize a client message to the exact JSON the Rust signaling server expects. */

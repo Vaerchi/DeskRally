@@ -23,7 +23,7 @@ func (s *Server) handleGetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	pol.SessionBinding = bindingOrWarn(pol.SessionBinding)
-	writeJSON(w, http.StatusOK, pol)
+	writeSessionPolicy(w, pol)
 }
 
 func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +37,7 @@ func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req SessionPolicy
-	// docs/25 F05: two integers. The CapManageTenant gate above already precedes the decode, so this
+	// docs/25 F05: bounded settings body. The CapManageTenant gate above already precedes the decode, so this
 	// bounds what an authorized Owner can make the handler buffer against the pinned connection.
 	if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &req, "malformed session policy body"); err != nil {
 		return
@@ -53,7 +53,7 @@ func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest,
 			"invalid session policy: max_concurrent_sessions must be 0 (unlimited) to 100000, and "+
 				"max_session_seconds must be 0 (no maximum) or between 60 and 2592000, and session_binding must be "+
-				"\"warn\" or \"require\"")
+				"\"warn\" or \"require\", and default_max_idle_seconds must be between 0 and 3600")
 		return
 	}
 	if err := s.SessionPolicies.Set(r.Context(), p.TenantID, norm); err != nil {
@@ -62,7 +62,7 @@ func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := s.recordMgmtAudit(r, "tenant.session_policy.set", "tenant", p.TenantID,
 		map[string]any{"max_concurrent_sessions": norm.MaxConcurrentSessions, "max_session_seconds": norm.MaxSessionSeconds,
-			"session_binding": norm.SessionBinding /* "" = kept */}); err != nil {
+			"session_binding": norm.SessionBinding, "default_max_idle_seconds": norm.DefaultMaxIdleSeconds}); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not record audit event")
 		return
 	}
@@ -73,5 +73,13 @@ func (s *Server) handleSetSessionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	stored.SessionBinding = bindingOrWarn(stored.SessionBinding)
-	writeJSON(w, http.StatusOK, stored)
+	writeSessionPolicy(w, stored)
+}
+
+func writeSessionPolicy(w http.ResponseWriter, policy SessionPolicy) {
+	if policy.DefaultMaxIdleSeconds == nil {
+		zero := 0
+		policy.DefaultMaxIdleSeconds = &zero
+	}
+	writeJSON(w, http.StatusOK, policy)
 }

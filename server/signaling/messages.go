@@ -362,8 +362,9 @@ type Heartbeat struct {
 // signed session ticket authorizing this rendezvous (ticket.go); optional on the wire for
 // backward compatibility, but REQUIRED when the server is started with SIGNALING_TICKET_PUBKEY.
 type ConnectRequest struct {
-	Target string               `json:"target"`
-	Ticket *SignedSessionTicket `json:"ticket,omitempty"`
+	Target          string               `json:"target"`
+	Ticket          *SignedSessionTicket `json:"ticket,omitempty"`
+	NameAttestation json.RawMessage      `json:"name_attestation,omitempty"`
 }
 
 // CandidateMsg trickles a locally-gathered candidate to the peer via the server. It is used
@@ -520,16 +521,16 @@ type SessionParticipantEntry struct {
 	// broker was not in ticket-enforced mode (dev / no-ticket path). Absent when empty.
 	TechnicianID string `json:"technician_id,omitempty"`
 	Access       string `json:"access"`
+	// DisplayName is populated only in snapshots for eligible controllers.
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 // SessionParticipants is sent by the server to both the agent and all controllers connected to a
 // device whenever a session targeting that device starts or ends. It provides a live view of
 // concurrent sessions so technicians know they are not alone, and agents know to share resources.
 //
-// SECURITY: this message carries only session ids and verified technician ids — no keys, no
-// credentials, no IP addresses. The broker sends it only to peers that are already members of a
-// session targeting DeviceID (the agent itself or a verified controller). A passive observer cannot
-// receive it.
+// The agent receives the legacy payload. The broker adds revisions to controller snapshots
+// and verified display names only for eligible recipients on the same tenant and target.
 //
 // WIRE COMPATIBILITY: old clients (pre-multi-session) ignore unknown message types. Old agents
 // continue to serve sessions normally; they simply never see participant lists.
@@ -537,6 +538,7 @@ type SessionParticipants struct {
 	// DeviceID is the agent's device id that all participants are targeting.
 	DeviceID     string                    `json:"device_id"`
 	Participants []SessionParticipantEntry `json:"participants"`
+	Revision     uint64                    `json:"revision,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +564,10 @@ type ServerToClient struct {
 // clientTag returns the wire "type" tag for a client payload.
 func clientTag(payload any) (string, bool) {
 	switch payload.(type) {
+	case *LanReport, LanReport:
+		return "lan_report", true
+	case *WakeHello, WakeHello:
+		return "wake_hello", true
 	case *RegisterAgent, RegisterAgent:
 		return "register_agent", true
 	case *AgentAuthResponse, AgentAuthResponse:
@@ -594,6 +600,10 @@ func clientTag(payload any) (string, bool) {
 // serverTag returns the wire "type" tag for a server payload.
 func serverTag(payload any) (string, bool) {
 	switch payload.(type) {
+	case *LanReportAck, LanReportAck:
+		return "lan_report_ack", true
+	case *Wake, Wake:
+		return "wake", true
 	case *Registered, Registered:
 		return "registered", true
 	case *AgentAuthChallenge, AgentAuthChallenge:
@@ -672,6 +682,14 @@ func (m *ClientToServer) UnmarshalJSON(data []byte) error {
 		err     error
 	)
 	switch probe.Type {
+	case "lan_report":
+		var p LanReport
+		err = json.Unmarshal(data, &p)
+		payload = &p
+	case "wake_hello":
+		var p WakeHello
+		err = json.Unmarshal(data, &p)
+		payload = &p
 	case "register_agent":
 		var p RegisterAgent
 		err = json.Unmarshal(data, &p)
@@ -795,6 +813,14 @@ func (m *ServerToClient) UnmarshalJSON(data []byte) error {
 		payload = &p
 	case "session_ended_result":
 		var p SessionEndedResult
+		err = json.Unmarshal(data, &p)
+		payload = &p
+	case "lan_report_ack":
+		var p LanReportAck
+		err = json.Unmarshal(data, &p)
+		payload = &p
+	case "wake":
+		var p Wake
 		err = json.Unmarshal(data, &p)
 		payload = &p
 	case "directive":

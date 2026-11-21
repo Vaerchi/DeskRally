@@ -903,6 +903,7 @@ func main() {
 		machines := controlplane.NewPgMachineStore(pool)
 		machines.LookupPool = lookupPool // KeyTombstoned only: the pre-authentication read on the redeem and enroll doors
 		srv.Machines = machines
+		srv.LAN = machines
 		// Machine custom properties (migration 0024): operator-set key/value fields, RLS-scoped and
 		// tenant-consistent via the composite FK to machine(tenant_id, id).
 		srv.MachineProperties = controlplane.NewPgMachinePropertyStore(pool)
@@ -925,6 +926,7 @@ func main() {
 		srv.SessionRecords = controlplane.NewPgSessionRecordStore(pool)
 		mgmtAudit := controlplane.NewPgMgmtAuditStore(pool)
 		srv.MgmtAudit = mgmtAudit
+		srv.WakeStore = &controlplane.PgWakeStore{Pool: pool, Audit: mgmtAudit}
 		// Platform operator (migration 0055): one store sharing the audit store, so a lifecycle
 		// change and both audit appends run in one transaction.
 		srv.Platform = controlplane.NewPgPlatformStore(pool, mgmtAudit)
@@ -1045,6 +1047,7 @@ func main() {
 		// BOTH owners share one instance (key prefixes namespace the endpoints); without this,
 		// each would lazily build its own in-memory default.
 		throttleStore := controlplane.NewPgThrottleStore(pool)
+		srv.WakeThrottle = throttleStore
 		sharedThrottle := controlplane.NewStoreThrottle(controlplane.DefaultThrottleConfig, throttleStore)
 		srv.Throttle = sharedThrottle
 		authAPI.Throttle = sharedThrottle
@@ -1125,6 +1128,7 @@ func main() {
 		// enroll. Prod uses the strict PgMachineStore above.
 		devMachines := controlplane.NewPermissiveMachineStore(controlplane.DevDefaultMachineGroupID)
 		srv.Machines = devMachines
+		srv.LAN = devMachines
 		// In-memory machine custom properties so the console properties panel works in demos too.
 		srv.MachineProperties = controlplane.NewInMemoryMachinePropertyStore()
 		// In-memory per-tenant IP allow-list so the console Security panel works in demos too.
@@ -1322,6 +1326,8 @@ func main() {
 			"the matching SIGNALING_DEVICE_IDENTITY_TOKEN) before running signaling in enforcing mode.")
 	}
 
+	srv.WakeOnLAN = os.Getenv("CP_WAKE_ON_LAN") == "on"
+
 	// Fleet directives (docs/65 D-C3): signed with a DEDICATED key derived from DIRECTIVE_SIGNING_SEED, so a
 	// compromise of the grant issuer cannot also order a fleet wipe, and agents pin THIS key separately (the
 	// enroll-redeem response carries its public half). Without a seed the directive routes, the internal
@@ -1341,6 +1347,9 @@ func main() {
 			srv.DirectiveIssuer = iss
 			if url := os.Getenv("CP_SIGNALING_NOTIFY_URL"); url != "" && srv.DeviceIdentityToken != "" {
 				srv.DirectiveNotifier = &controlplane.HTTPDirectiveNotifier{BaseURL: url, Token: srv.DeviceIdentityToken}
+				if srv.WakeOnLAN {
+					srv.WakeDispatcher = &controlplane.HTTPWakeDispatcher{BaseURL: url, Token: srv.DeviceIdentityToken}
+				}
 			} else {
 				log.Printf("CP_SIGNALING_NOTIFY_URL not set — directives reach a connected agent only when it next registers")
 			}
@@ -1374,6 +1383,10 @@ func main() {
 	} else {
 		log.Printf("CP_PRESENCE_URL/CP_PRESENCE_TOKEN not set — GET /machines reports " +
 			"\"presence_known\": false and omits per-machine online status")
+	}
+
+	if srv.LAN != nil {
+		go srv.RunLanRetention(context.Background())
 	}
 
 	// Top-level mux: a public health check plus the wired control-plane handler. "/healthz" is a

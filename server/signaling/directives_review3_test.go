@@ -183,8 +183,10 @@ func (d delayAckTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func TestDirectiveAcksReachTheControlPlaneInReceiveOrder(t *testing.T) {
 	cp, srv, _, _ := directiveEnv(t)
-	peer, conn := registerGolden(t, srv, dirFeature)
+	// Swap the transport BEFORE registering: registration starts the directive relay goroutine, which reads
+	// the same client (go test -race reported the late write as a DATA RACE).
 	srv.guestEnd.client.Transport = delayAckTransport{inner: http.DefaultTransport}
+	peer, conn := registerGolden(t, srv, dirFeature)
 	const id = "11111111-aaaa-4aaa-8aaa-111111111111"
 	for _, step := range [][2]string{{"issued", "accepted"}, {"accepted", "executing"}, {"executing", "complete"}} {
 		srv.dispatch(peer, ClientToServer{Payload: &DirectiveAck{DirectiveID: id, From: step[0], To: step[1], TsMs: 1, Sig: "00"}})

@@ -12,7 +12,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import { createLatestWins } from "../lib/latest_wins";
 import {
   MACHINE_STATUSES,
+  ConsoleApiError,
   type AgentVersionInfo,
+  type BulkStatusResult,
   type ConsoleApi,
   type MachineGroup,
   type MachinePropertyFilter,
@@ -36,8 +38,12 @@ import {
 import { policyPostureBadge } from "../lib/machine_posture";
 import { groupOptions, groupPaths, pathLabelFor } from "../lib/group_tree";
 import { machinesToCsv } from "../lib/report_csv";
+import { machinePropertyKeys, machinePropertyValue, togglePropertyColumn } from "../lib/machine_property_columns";
 import { connectState, IN_SESSION_LABEL } from "../lib/connect_rule";
 import { MachinePropertiesPanel } from "./MachinePropertiesPanel";
+import { MachineFieldInput } from "./MachineFieldInput";
+import { canonicalFieldValue, compareFieldValues, fieldFilterOperand, storedFieldValue } from "../lib/machine_fields";
+import { useMachineFields } from "../lib/use_machine_fields";
 import { ToolbarMenu } from "./ToolbarMenu";
 import { saveBytesAsFile } from "./FileTransferPanel";
 import { DirectivePolicyToggle, ForgetMachineDialog, PendingRemovalsPanel, RemoveAgentDialog, describeDirectiveError } from "./FleetDirectives";
@@ -53,14 +59,60 @@ import {
   type MachineLike,
   type MeCapability,
 } from "../lib/fleet_directives";
+import { WAKE_GUIDE_PATH, wakeMenuState, wakeResultMessage } from "../lib/wake";
 
 export interface MachinesPanelProps {
   api: ConsoleApi;
   onConnect?: (machine: MachineRecord) => void;
 }
 
+export function BulkPropertyResults({ results }: { results: readonly BulkStatusResult[] }) {
+  return (
+    <>
+      {/* The summary keeps its own status element (its text is a stable contract); the per-machine
+          outcomes (docs/74 §5c.6) are a separate list beside it. */}
+      <div role="status" data-testid="bulk-property-result">{bulkStatusSummary(results)}</div>
+      <ul data-testid="bulk-property-outcomes">{results.map((result) => (
+        <li key={result.machine_id}>{result.machine_id} — {result.ok ? "Updated" : result.error || "Failed"}</li>
+      ))}</ul>
+    </>
+  );
+}
+
+const PROPERTY_COLUMNS_STORAGE_KEY = "deskrally.machinePropertyColumns";
+
 export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
   const [rows, setRows] = useState<readonly MachineRecord[]>([]);
+  const [selectedPropertyKeys, setSelectedPropertyKeys] = useState<string[]>(() => {
+    try {
+      const saved: unknown = JSON.parse(window.localStorage.getItem(PROPERTY_COLUMNS_STORAGE_KEY) ?? "[]");
+      if (Array.isArray(saved)) {
+        return [...new Set(saved.filter((key): key is string => typeof key === "string"))];
+      }
+    } catch {
+      // Column preferences are optional when storage is unavailable.
+    }
+    return [];
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PROPERTY_COLUMNS_STORAGE_KEY, JSON.stringify(selectedPropertyKeys));
+    } catch {
+      // The current table still reflects the selection.
+    }
+  }, [selectedPropertyKeys]);
+  const { fields } = useMachineFields(api);
+  const fieldsByKey = useMemo(() => new Map(fields.map((field) => [field.key, field])), [fields]);
+  const propertyLabels = useMemo(() => new Map(fields.map((field) => [field.key, field.label])), [fields]);
+  const propertyKeys = useMemo(
+    () => [...fields.map((field) => field.key), ...machinePropertyKeys(rows).filter((key) => !fieldsByKey.has(key))],
+    [fields, fieldsByKey, rows],
+  );
+  const [propertySort, setPropertySort] = useState<{ key: string; descending: boolean }>();
+  const visiblePropertyKeys = useMemo(() => {
+    const available = new Set(propertyKeys);
+    return selectedPropertyKeys.filter((key) => available.has(key));
+  }, [propertyKeys, selectedPropertyKeys]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // The machine whose custom-property editor is open below the table (by PRIMARY KEY), or null.
@@ -68,6 +120,10 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
   // The custom-property search form, and the filter currently APPLIED to the listing (undefined = all).
   const [filterKey, setFilterKey] = useState("");
   const [filterValue, setFilterValue] = useState("");
+  const [rawFilter, setRawFilter] = useState(false);
+  const [filterError, setFilterError] = useState("");
+  const filterDefinition = fieldsByKey.get(filterKey);
+  const filterField = rawFilter ? undefined : filterDefinition;
   const [applied, setApplied] = useState<MachinePropertyFilter | undefined>(undefined);
   // The machine (by PRIMARY KEY) whose status change is in flight, or null.
   const [statusPending, setStatusPending] = useState<string | null>(null);
@@ -88,6 +144,13 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
   const [bulkGroupId, setBulkGroupId] = useState<string>("");
   const [bulkGroupPending, setBulkGroupPending] = useState(false);
   const [bulkGroupResult, setBulkGroupResult] = useState<string | null>(null);
+  const [bulkPropertyAction, setBulkPropertyAction] = useState<"set" | "remove" | null>(null);
+  const [bulkPropertyKey, setBulkPropertyKey] = useState("");
+  const [bulkPropertyValue, setBulkPropertyValue] = useState("");
+  const [bulkPropertyPending, setBulkPropertyPending] = useState(false);
+  const [bulkPropertyResults, setBulkPropertyResults] = useState<BulkStatusResult[] | null>(null);
+  const [bulkPropertyError, setBulkPropertyError] = useState("");
+  const bulkField = fieldsByKey.get(bulkPropertyKey);
   // ALIAS (friendly-name) inline editor: the machine PK being edited (null = none), the draft text, and
   // the machine whose alias write is in flight.
   const [aliasEditId, setAliasEditId] = useState<string | null>(null);
@@ -127,7 +190,9 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
   const [forgetFor, setForgetFor] = useState<MachineLike | null>(null);
   const [directiveReload, setDirectiveReload] = useState(0);
   const [reinstallPending, setReinstallPending] = useState<string | null>(null);
-  const [directiveNote, setDirectiveNote] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const wakeInFlight = useRef(new Set<string>());
+  const [wakePending, setWakePending] = useState<ReadonlySet<string>>(new Set());
+  const [directiveNote, setDirectiveNote] = useState<{ kind: "ok" | "error"; text: string; guide?: boolean } | null>(null);
 
   // Latest-wins guard for the listing: the filter, Refresh and every row action's re-list can overlap, and
   // only the newest request may touch the rows, badges, error or busy flag.
@@ -150,7 +215,7 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
       setError(null);
       try {
         const [listing, sessions] = await Promise.all([
-          api.listMachinesWithPresence(filter),
+          api.listMachinesWithPresence(filter, { includeProperties: true }),
           api.listLiveSessions().catch((): SessionRecord[] => []),
         ]);
         if (!listGuard.current.isCurrent(token)) return; // superseded: a newer request owns the state
@@ -184,7 +249,14 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
   }, [refresh, applied]);
 
   // Client-side text filter applied on top of the server-side property filter — no extra fetch.
-  const filteredRows = useMemo(() => filterMachinesByText(rows, textQuery), [rows, textQuery]);
+  const filteredRows = useMemo(() => {
+    const visible = filterMachinesByText(rows, textQuery);
+    if (!propertySort || !visiblePropertyKeys.includes(propertySort.key)) return visible;
+    const { key, descending } = propertySort;
+    const field = fieldsByKey.get(key);
+    if (!field) return visible;
+    return [...visible].sort((a, b) => compareFieldValues(field, storedFieldValue(a, key), storedFieldValue(b, key), descending));
+  }, [rows, textQuery, propertySort, visiblePropertyKeys, fieldsByKey]);
 
   // O(1) device_id → session lookup for per-row "active" badges. Recomputed only when the session
   // list changes (independent of the text filter — all rows get badges, not just the visible slice).
@@ -234,6 +306,26 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
     void api.getDirectivePolicy().then((p) => { if (live) setDirectivePolicy(p); }, () => { if (live) setDirectivePolicy(null); });
     return () => { live = false; };
   }, [api, holdsRemoveAgentAnywhere]);
+
+  const handleWake = async (id: string) => {
+    if (wakeInFlight.current.has(id)) return;
+    wakeInFlight.current.add(id);
+    setWakePending(new Set(wakeInFlight.current));
+    setDirectiveNote(null);
+    try {
+      const status = await api.requestWake(id);
+      setDirectiveNote({ kind: "ok", text: wakeResultMessage(status), guide: true });
+    } catch (e) {
+      let outcome: string | number | undefined;
+      if (e instanceof ConsoleApiError) {
+        outcome = e.status === 404 || e.status === 429 ? e.status : e.code;
+      }
+      setDirectiveNote({ kind: "error", text: wakeResultMessage(outcome) });
+    } finally {
+      wakeInFlight.current.delete(id);
+      setWakePending(new Set(wakeInFlight.current));
+    }
+  };
 
   const handleReinstall = useCallback(
     async (m: MachineRecord) => {
@@ -311,15 +403,24 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
 
   const handleFilter = useCallback((e: FormEvent) => {
     e.preventDefault();
-    const key = filterKey.trim();
-    const next = key === "" ? undefined : { propertyKey: key, propertyValue: filterValue };
+    const key = filterDefinition?.key ?? filterKey.trim();
+    const operand = fieldFilterOperand(filterField, filterValue);
+    if (operand === undefined) {
+      setFilterError(`Invalid value for field ${filterField?.label}`);
+      return;
+    }
+    setFilterError("");
+    const next = key === "" ? undefined : {
+      propertyKey: key, propertyValue: operand, exactKey: filterDefinition !== undefined,
+    };
     appliedRef.current = next;
     setApplied(next);
-  }, [filterKey, filterValue]);
+  }, [filterKey, filterValue, filterDefinition, filterField]);
 
   const handleClear = useCallback(() => {
     setFilterKey("");
     setFilterValue("");
+    setFilterError("");
     appliedRef.current = undefined;
     setApplied(undefined);
   }, []);
@@ -386,8 +487,8 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
   const handleExport = useCallback(() => {
     // Export the machines CURRENTLY SHOWN (honoring both the server-side property filter and the
     // client-side text search) as a CSV inventory the browser saves — a pure serialization, no extra fetch.
-    saveBytesAsFile("machines.csv", new TextEncoder().encode(machinesToCsv(filteredRows)));
-  }, [filteredRows]);
+    saveBytesAsFile("machines.csv", new TextEncoder().encode(machinesToCsv(filteredRows, visiblePropertyKeys, propertyLabels)));
+  }, [filteredRows, visiblePropertyKeys, propertyLabels]);
 
   const toggleOne = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -441,6 +542,36 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
       setBulkGroupPending(false);
     }
   }, [api, bulkGroupId, bulkGroupPending, relist, selectedIds]);
+
+  const handleBulkPropertyApply = async (event: FormEvent) => {
+    event.preventDefault();
+    if (selectedIds.size === 0 || bulkPropertyPending || !bulkPropertyAction || !bulkPropertyKey) return;
+    const remove = bulkPropertyAction === "remove";
+    setBulkPropertyError("");
+    setBulkPropertyResults(null);
+    if (!remove && bulkField && canonicalFieldValue(bulkField, bulkPropertyValue) === undefined) {
+      setBulkPropertyError(`Invalid value for field ${bulkField.label}`);
+      return;
+    }
+    setBulkPropertyPending(true);
+    setError(null);
+    try {
+      const results = await api.bulkSetMachineProperty(
+        [...selectedIds], bulkPropertyKey, remove ? "" : bulkPropertyValue, remove,
+      );
+      setBulkPropertyResults(results);
+      setBulkPropertyAction(null);
+      setBulkPropertyKey("");
+      setBulkPropertyValue("");
+      setSelectedIds(new Set());
+      await relist();
+    } catch (e) {
+      setBulkPropertyError(e instanceof ConsoleApiError && e.status === 400 && e.code.startsWith("invalid value for field ")
+        ? e.code : e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkPropertyPending(false);
+    }
+  };
 
   // AGENT VERSION SKEW (docs/21 §2). The question a rollout is judged by is "how many machines are
   // NOT on the newest build I can see" — and the honest answer has to separate machines that
@@ -508,6 +639,19 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
         >
           Export CSV
         </button>
+        <ToolbarMenu label="Columns" triggerClassName="panel__action">
+          {propertyKeys.length === 0 && <span>No custom properties in this list</span>}
+          {propertyKeys.map((key) => (
+            <label className="panel__toolbar-field" key={key}>
+              <input
+                type="checkbox"
+                checked={selectedPropertyKeys.includes(key)}
+                onChange={() => setSelectedPropertyKeys((current) => togglePropertyColumn(current, key))}
+              />
+              {propertyLabels.get(key) ?? key}
+            </label>
+          ))}
+        </ToolbarMenu>
         {versionSkew && (
           <span className="panel__toolbar-title" data-testid="machines-version-skew" title={versionSkew.detail}>
             {versionSkew.label}
@@ -536,20 +680,41 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
           Key
           <input
             value={filterKey}
-            onChange={(e) => setFilterKey(e.target.value)}
+            onChange={(e) => {
+              if (!rawFilter && fieldsByKey.get(e.target.value)?.id !== filterField?.id) setFilterValue("");
+              setFilterKey(e.target.value);
+              setFilterError("");
+            }}
+            list="machine-field-filter-keys"
             placeholder="site"
             data-testid="machine-filter-key"
           />
         </label>
+        <datalist id="machine-field-filter-keys">
+          {fields.map((field) => <option key={field.key} value={field.key}>{field.label}</option>)}
+        </datalist>
+        {filterDefinition && (
+          <label className="panel__toolbar-field">
+            <input type="checkbox" checked={rawFilter} onChange={(e) => {
+              setRawFilter(e.target.checked);
+              setFilterError("");
+            }} />
+            Raw value
+          </label>
+        )}
         <label className="panel__toolbar-field">
           Value
-          <input
-            value={filterValue}
-            onChange={(e) => setFilterValue(e.target.value)}
-            placeholder="(any)"
-            data-testid="machine-filter-value"
-          />
+          {filterField ? (
+            <MachineFieldInput field={filterField} value={filterValue} onChange={(value) => {
+              setFilterValue(value);
+              setFilterError("");
+            }} testId="machine-filter-value" emptyLabel="(any)" />
+          ) : (
+            <input value={filterValue} onChange={(e) => setFilterValue(e.target.value)}
+              placeholder="(any)" data-testid="machine-filter-value" />
+          )}
         </label>
+        {filterError && <span role="alert">{filterError}</span>}
         <button className="panel__action" type="submit" disabled={busy} data-testid="machine-filter-apply">
           Filter
         </button>
@@ -635,7 +800,49 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
             {bulkGroupResult}
           </span>
         )}
+        <button type="button" className="panel__action"
+          disabled={selectedIds.size === 0 || bulkPropertyPending || busy}
+          onClick={() => { setBulkPropertyError(""); setBulkPropertyAction("set"); }}>
+          Set property…
+        </button>
+        <button type="button" className="panel__action"
+          disabled={selectedIds.size === 0 || bulkPropertyPending || busy}
+          onClick={() => { setBulkPropertyError(""); setBulkPropertyAction("remove"); }}>
+          Remove property…
+        </button>
+        {bulkPropertyResults && <BulkPropertyResults results={bulkPropertyResults} />}
       </div>
+      {bulkPropertyAction && (
+        <form className="panel__toolbar" onSubmit={(event) => void handleBulkPropertyApply(event)}>
+          <label className="panel__toolbar-field">
+            Property key
+            <input className="panel__input" value={bulkPropertyKey} required maxLength={128}
+              list="machine-field-bulk-keys" disabled={bulkPropertyPending} onChange={(event) => {
+                if (fieldsByKey.get(event.target.value)?.id !== bulkField?.id) setBulkPropertyValue("");
+                setBulkPropertyKey(event.target.value);
+                setBulkPropertyError("");
+              }} />
+            <datalist id="machine-field-bulk-keys">
+              {fields.map((field) => <option key={field.key} value={field.key}>{field.label}</option>)}
+            </datalist>
+          </label>
+          {bulkPropertyAction === "set" && (
+            <label className="panel__toolbar-field">
+              Property value
+              <MachineFieldInput field={bulkField} value={bulkPropertyValue} disabled={bulkPropertyPending}
+                maxLength={4096} onChange={(value) => { setBulkPropertyValue(value); setBulkPropertyError(""); }} />
+            </label>
+          )}
+          {bulkPropertyError && <span role="alert">{bulkPropertyError}</span>}
+          <button type="submit" className="panel__action" disabled={selectedIds.size === 0 || bulkPropertyPending || busy}>
+            {bulkPropertyAction === "set" ? "Set on" : "Remove from"} {selectedIds.size} selected
+          </button>
+          <button type="button" className="panel__action" disabled={bulkPropertyPending}
+            onClick={() => setBulkPropertyAction(null)}>
+            Cancel
+          </button>
+        </form>
+      )}
       <table className="panel__table">
         <thead>
           <tr>
@@ -656,13 +863,24 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
             <th>Agent</th>
             <th>User</th>
             <th>Note</th>
+            {visiblePropertyKeys.map((key) => {
+              const field = fieldsByKey.get(key);
+              const direction = propertySort?.key === key ? (propertySort.descending ? "descending" : "ascending") : undefined;
+              return (
+                <th key={key} aria-sort={direction}>
+                  {field ? <button className="panel__action" onClick={() => setPropertySort({ key, descending: direction === "ascending" })}>
+                    {field.label}{direction === "ascending" ? " ↑" : direction === "descending" ? " ↓" : ""}
+                  </button> : key}
+                </th>
+              );
+            })}
             <th className="panel__col--action">Actions</th>
           </tr>
         </thead>
         <tbody>
           {filteredRows.length === 0 && (
             <tr>
-              <td className="panel__empty" colSpan={10} data-testid="machines-empty">
+              <td className="panel__empty" colSpan={10 + visiblePropertyKeys.length} data-testid="machines-empty">
                 {busy
                   ? "Loading…"
                   : textQuery.trim()
@@ -896,6 +1114,15 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
                   </span>
                 )}
               </td>
+              {visiblePropertyKeys.map((key) => {
+                const field = fieldsByKey.get(key);
+                const value = storedFieldValue(m, key);
+                return <td key={key}>{field
+                  ? value === undefined ? "Unset" : canonicalFieldValue(field, value) !== value
+                    ? <span title="Nonconforming value">{value || "Empty value"} ⚠</span>
+                    : value === "" ? "Empty text" : value
+                  : machinePropertyValue(m, key)}</td>;
+              })}
               <td className="panel__col--action">
                 {/* Menu redesign wave 8: Properties stays on the row; everything else is in its "⋯" menu, so a row
                     reads Connect … Properties ⋯ instead of up to six buttons. Same handlers and test ids. */}
@@ -945,6 +1172,22 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
                     </button>
                   );
                 })()}
+                {(() => {
+                  const wake = wakeMenuState(m, myCaps, presenceKnown);
+                  if (!wake.visible) return null;
+                  return (
+                    <button
+                      type="button"
+                      className="panel__action"
+                      data-testid={`machine-wake-${m.id}`}
+                      disabled={!wake.enabled || wakePending.has(m.id)}
+                      title={wake.reason}
+                      onClick={() => void handleWake(m.id)}
+                    >
+                      Wake
+                    </button>
+                  );
+                })()}
                 {canOfferReinstall(m, holdsRemoveAgentFor(m)) && (
                   <button
                     className="panel__action"
@@ -986,6 +1229,9 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
       {directiveNote && (
         <p role={directiveNote.kind === "error" ? "alert" : "status"} className={directiveNote.kind === "error" ? "panel__toolbar-error" : "panel__hint"} data-testid="directive-note">
           {directiveNote.text}
+          {directiveNote.guide && (
+            <> <a href={WAKE_GUIDE_PATH}>See which power states DeskRally has verified</a>.</>
+          )}
         </p>
       )}
       {holdsRemoveAgentAnywhere && (
@@ -1019,6 +1265,7 @@ export function MachinesPanel({ api, onConnect }: MachinesPanelProps) {
           api={api}
           machineId={selected.id}
           machineName={selected.name}
+          onPropertiesChanged={relist}
         />
       )}
     </div>

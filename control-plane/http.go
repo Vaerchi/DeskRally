@@ -154,7 +154,12 @@ type Server struct {
 	// session. Needs DirectiveIssuer (the DEDICATED directive signing key, D-C3) and Machines too; with any of
 	// them nil the directive routes, the internal signaling routes and the directive_v1 capability are not
 	// mounted.
-	Directives DirectiveStore
+	Directives     DirectiveStore
+	LAN            LanStore
+	WakeOnLAN      bool
+	WakeStore      WakeStore
+	WakeThrottle   WakeThrottle
+	WakeDispatcher WakeDispatcher
 	// DirectiveIssuer signs RMTDIRECTIVEv1 with the key derived from DIRECTIVE_SIGNING_SEED - never the grant
 	// issuer. Its public key is returned in the enroll-redeem response so agents pin it (docs/65 D-C3).
 	DirectiveIssuer *DirectiveIssuer
@@ -386,6 +391,9 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("PUT /toolbox/{id}", s.handleUpdateToolboxItem)
 	protected.HandleFunc("DELETE /toolbox/{id}", s.handleDeleteToolboxItem)
 	protected.HandleFunc("POST /toolbox/{id}/runs", s.handleRunToolboxItem)
+	protected.HandleFunc("GET /toolbox/{id}/runs", s.handleToolboxRunHistory)
+	protected.HandleFunc("GET /machines/{id}/runs", s.handleMachineRunHistory)
+	protected.HandleFunc("POST /runs/{request_id}/result", s.handleRunResult)
 	protected.HandleFunc("GET /platform/tenants", s.handlePlatformListTenants)
 	// docs/68: the operator's download reach report (gated like /platform/tenants, audited) and the tenant Owner's own adoption counts.
 	protected.HandleFunc("GET /platform/reach", s.handlePlatformReach)
@@ -452,6 +460,7 @@ func (s *Server) Handler() http.Handler {
 	// resolve on CapViewMachines. `/{id}/machines` resolves members live (the narrow-only intersect).
 	protected.HandleFunc("GET /dynamic-groups", s.handleListDynamicGroups)
 	protected.HandleFunc("POST /dynamic-groups", s.handleCreateDynamicGroup)
+	protected.HandleFunc("GET /dynamic-groups/{id}", s.handleGetDynamicGroup)
 	protected.HandleFunc("DELETE /dynamic-groups/{id}", s.handleDeleteDynamicGroup)
 	protected.HandleFunc("GET /dynamic-groups/{id}/machines", s.handleResolveDynamicGroup)
 
@@ -478,6 +487,9 @@ func (s *Server) Handler() http.Handler {
 	// Machines (the enrolled agent fleet).
 	protected.HandleFunc("GET /machines", s.handleListMachines)
 	protected.HandleFunc("GET /machines/{id}", s.handleGetMachine)
+	if s.WakeOnLAN {
+		protected.HandleFunc("POST /machines/{id}/wake", s.handleWake)
+	}
 	// Machine lifecycle status (docs/01 §4): quarantine / retire / reactivate a machine, gated on
 	// CapManageMachines for the machine's REAL group. A quarantined/retired machine is refused a new
 	// session by handleStartSession.
@@ -485,6 +497,7 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("POST /machines/bulk-status", s.handleBulkSetMachineStatus)
 	protected.HandleFunc("POST /machines/{id}/group", s.handleSetMachineGroup)
 	protected.HandleFunc("POST /machines/bulk-group", s.handleBulkSetMachineGroup)
+	protected.HandleFunc("POST /machines/bulk-property", s.handleBulkSetMachineProperty)
 	protected.HandleFunc("PATCH /machines/{id}/alias", s.handleSetMachineAlias)
 	protected.HandleFunc("PATCH /machines/{id}/note", s.handleSetMachineNote)
 
@@ -510,6 +523,12 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("GET /machines/{id}/properties", s.handleListMachineProperties)
 	protected.HandleFunc("PUT /machines/{id}/properties/{key}", s.handleSetMachineProperty)
 	protected.HandleFunc("DELETE /machines/{id}/properties/{key}", s.handleDeleteMachineProperty)
+	protected.HandleFunc("GET /machine-fields", s.handleListMachineFields)
+	protected.HandleFunc("POST /machine-fields", s.handleChangeMachineFields)
+	protected.HandleFunc("PUT /machine-fields/{key}", s.handleChangeMachineFields)
+	protected.HandleFunc("DELETE /machine-fields/{key}", s.handleChangeMachineFields)
+	protected.HandleFunc("PUT /machine-field-order", s.handleChangeMachineFields)
+	protected.HandleFunc("GET /machine-fields/{key}/nonconforming", s.handleMachineFieldReport)
 
 	// Enrollment — an installer redeems a token to join the fleet.
 	protected.HandleFunc("POST /enroll", s.handleEnroll)
@@ -741,6 +760,12 @@ func (s *Server) Handler() http.Handler {
 			root.HandleFunc("POST /internal/sessions/{id}/guest-ended", s.handleGuestEnded)
 			root.HandleFunc("POST /internal/sessions/{id}/ended", s.handleSessionEnded)
 		}
+		if s.LAN != nil {
+			root.HandleFunc("GET /internal/signaling/incarnation", s.handleGetSignalingIncarnation)
+			root.HandleFunc("POST /internal/signaling/incarnation", s.handleActivateSignalingIncarnation)
+			root.HandleFunc("POST /internal/devices/lan-epoch", s.handleAllocateLanEpoch)
+			root.HandleFunc("POST /internal/devices/lan", s.handleIngestLanReport)
+		}
 		if s.directiveInternalMounted() {
 			root.HandleFunc("GET /internal/devices/{device_id}/directives/pending", s.handleInternalDirectivesPending)
 			root.HandleFunc("POST /internal/directives/{id}/delivered", s.handleInternalDirectiveDelivered)
@@ -810,6 +835,9 @@ func (s *Server) Handler() http.Handler {
 	// the PROTECTED chain, behind CapViewRecordings / CapManageTenant.
 	s.mountRecordingConsole(protected)
 
+	if !s.WakeOnLAN {
+		root.HandleFunc("POST /machines/{id}/wake", http.NotFound)
+	}
 	root.Handle("/", protectedChain)
 
 	// The authority gate is OUTSIDE everything: a marked public-ingress request with a bad authority is refused

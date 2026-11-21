@@ -10,6 +10,7 @@ import { SessionLeaseRenewer } from "./session_lease";
 import { auditSessionIdFor, makeAuditForwarder } from "./session_audit";
 import type { AuditEvent, AuditForwarder } from "./audit_forward";
 import { iceServersFor } from "./ice_servers";
+import { RunReceiptSession } from "./run_receipt_relay";
 import { runToolboxScript } from "./toolbox_run";
 import { runAdhocCommand } from "./adhoc_run";
 import { composeRunLine, type BulkTask } from "./bulk_run";
@@ -31,9 +32,9 @@ export class CoreError extends Error {
   }
 }
 
-type CoreApi = Pick<ConsoleApi, "startBrokeredSession" | "endSession" | "setSessionNote" | "requestToolboxRun" | "requestCommandRun" | "renewSessionPolicy" | "ingestAudit"> & Partial<Pick<ConsoleApi, "reportSessionBindingFailed">>;
+type CoreApi = Pick<ConsoleApi, "startBrokeredSession" | "endSession" | "setSessionNote" | "requestToolboxRun" | "requestCommandRun" | "renewSessionPolicy" | "ingestAudit" | "postRunReceipt"> & Partial<Pick<ConsoleApi, "reportSessionBindingFailed">>;
 type ControlHandlers = NonNullable<ConstructorParameters<typeof ControlClient>[1]>;
-type CoreControl = Pick<ControlClient, "installSessionPolicy" | "runCommand" | "handleMessage" | "sendBindStart" | "sendBindConsoleProof">
+type CoreControl = Pick<ControlClient, "installSessionPolicy" | "requestBackstageFeatures" | "runCommand" | "handleMessage" | "sendBindStart" | "sendBindConsoleProof">
   // docs/69 6.2: binding v2 senders; optional, and v2 runs only when both exist and the server hints it.
   & Partial<Pick<ControlClient, "sendBindStartV2" | "sendBindConsoleProofV2">>;
 type CoreSignaling = Pick<SignalingClient, "open" | "send" | "close">;
@@ -94,6 +95,9 @@ export class BrokeredSessionCore {
   private signaling?: CoreSignaling;
   private transport?: Transport;
   private control?: CoreControl;
+  private readonly runReceipts = new RunReceiptSession((receipt, signal) => this.deps.api.postRunReceipt(receipt, signal));
+  private backstageFeaturesReady?: Promise<void>;
+  private resolveBackstageFeatures?: () => void;
   private renewer?: SessionLeaseRenewer;
   private audit: AuditForwarder | null = null;
   private backstage?: ChannelBackstageTransport;
@@ -295,6 +299,13 @@ export class BrokeredSessionCore {
         }
       },
       onSessionLeaseRequired: () => { if (this.live()) this.renewer!.start(this.id); },
+      // Every reply updates the negotiated features, including one that arrives after the 3 s wait
+      // released the first dispatch (a long push-and-run upload still dispatches with the request id).
+      onBackstageFeatures: (features) => {
+        this.runReceipts.setFeatures(features);
+        this.resolveBackstageFeatures?.();
+      },
+      onRunReceipt: (receipt) => this.runReceipts.receive(receipt),
       onCommandResult: (result) => { if (this.live() && this.dispatched) this.result(result); },
       onError: (message) => this.agentError(message),
       onElevationDenied: (reason) => this.agentError(reason),
@@ -364,7 +375,7 @@ export class BrokeredSessionCore {
     this.transport = this.deps.makeTransport?.(config, events) ?? new WebRTCTransport(config, events);
     // WebRTCTransport retains connectImpl's audio/video transceivers, with no media sink here.
     await this.wait((async () => {
-      await this.transport!.connect(asDeviceId(device), brokered.signaling.ticket);
+      await this.transport!.connect(asDeviceId(device), brokered.signaling.ticket, brokered.signaling.name_attestation);
       this.check();
       await this.channelReady;
     })(), "channel", 20000);
@@ -399,6 +410,16 @@ export class BrokeredSessionCore {
       throw new CoreError("binding", `This machine could not be verified (${status.reason}); nothing ran`);
     }
     if (this.policyRequired && !this.policyApplied) await this.wait(this.policyReady, "policy", 10000);
+    this.backstageFeaturesReady = new Promise<void>((resolve) => {
+      // The timer only releases the dispatch wait; it never decides the features (legacy until told).
+      const timeout = this.schedule(() => this.resolveBackstageFeatures?.(), 3000);
+      this.resolveBackstageFeatures = () => {
+        this.resolveBackstageFeatures = undefined;
+        this.unschedule(timeout);
+        resolve();
+      };
+    });
+    this.control!.requestBackstageFeatures();
   }
 
   private live(): boolean {
@@ -460,6 +481,10 @@ export class BrokeredSessionCore {
     try {
       this.check();
       if (!this.ready) throw new CoreError("authorization", "Session is not ready");
+      if (this.resolveBackstageFeatures && (task.kind !== "upload" || task.run)) {
+        await Promise.race([this.backstageFeaturesReady, this.stopped]);
+        this.check();
+      }
       // Wait (bounded) for an in-flight renewal to be acknowledged BEFORE asking for authorization, so
       // the common case dispatches; the residual race (a renewal starting during authorization) is
       // caught by `current()` at the dispatch boundary and settles not_run, never a blind dispatch.
@@ -473,13 +498,13 @@ export class BrokeredSessionCore {
         api: this.deps.api,
         currentSessionId: () => current() ? this.id : null,
         isCurrent: current,
-        sendRunCommand: (command: string, shell: CommandShell, asUser: boolean) => {
+        sendRunCommand: (command: string, shell: CommandShell, asUser: boolean, requestId: string) => {
           // No await may intervene between this guard and the synchronous dispatch boundary.
           this.check();
           if (!current()) throw new CoreError("authorization", this.refusal ?? "Cancelled before dispatch");
           this.dispatched = true;
           // A throwing send may already have handed bytes to the transport: classify conservatively.
-          this.control!.runCommand(command, shell, asUser);
+          this.runReceipts.dispatch(this.control!, command, shell, asUser, requestId);
         },
       };
       if (!current()) {

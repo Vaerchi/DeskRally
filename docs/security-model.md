@@ -64,6 +64,12 @@ now, not the target design.
 - **Windows privileges.** The SYSTEM service and the per-session helper are separate processes. The elevation
   pipe refuses remote clients and checks which process has connected.
 
+## Wake-on-LAN
+
+The control plane stores installed machines’ wired adapter MAC addresses, IPv4 networks, and default gateway MAC addresses. An hourly retention job deletes facts that have gone 30 days without a refresh. Forgetting or removing a machine deletes its LAN facts and report watermark. Raw LAN facts never appear in the console, audit trail, or logs.
+
+A Wake attempt can target any MAC address reported by a machine the requester manages. An eligible relay that the requester also manages broadcasts on its own LAN, so the attempt can power on an unmanaged host if the reported MAC belongs to it. DeskRally trusts signaling to attribute LAN reports to the authenticated machine that submitted them.
+
 ## Consent and visibility
 
 - **Attended support sessions** start only after the person at the computer accepts a consent prompt. An

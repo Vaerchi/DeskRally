@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use rmt_agent_core::guest_end::GuestEndReports;
 
-use rmt_protocol::signaling::{ClientToServer, IceServerSpec, ServerToClient, SESSION_ENDED_FEATURE};
+use rmt_protocol::signaling::{ClientToServer, IceServerSpec, ServerToClient, LAN_FEATURE, SESSION_ENDED_FEATURE, WAKE_FEATURE};
 use rmt_protocol::{DeviceId, SessionId};
 use tokio::sync::mpsc;
 
@@ -133,6 +133,8 @@ pub struct SignalingMux {
     heartbeat_abort: Option<tokio::task::AbortHandle>,
     /// Delivery belongs to this connection; the shared pending set survives its cancellation.
     guest_end_abort: Option<tokio::task::AbortHandle>,
+    lan_report_abort: Option<tokio::task::AbortHandle>,
+    wake_clock_abort: Option<tokio::task::AbortHandle>,
     /// Whether this connection's `Registered` advertised `session_ended_v1` (docs/49).
     session_ended_capable: bool,
     /// docs/65: the directive hub this connection feeds and acknowledges through (detached on drop).
@@ -156,6 +158,12 @@ impl Drop for SignalingMux {
         }
         if let Some(h) = self.guest_end_abort.take() {
             h.abort();
+        }
+        if let Some(task) = self.lan_report_abort.take() {
+            task.abort();
+        }
+        if let Some(task) = self.wake_clock_abort.take() {
+            task.abort();
         }
         if let Some(hub) = self.directive_hub.take() {
             hub.detach();
@@ -188,7 +196,7 @@ impl SignalingMux {
         device: Option<DeviceId>,
         heartbeat_interval: Duration,
     ) -> Self {
-        Self::new_internal(sig, sig_rx, device, heartbeat_interval, None, false, None, None, false)
+        Self::new_internal(sig, sig_rx, device, heartbeat_interval, None, false, None, None, false, false, None)
     }
 
     /// Attach the helper's retained reports only after registration and authentication complete.
@@ -205,7 +213,7 @@ impl SignalingMux {
         features: &[String],
     ) -> Self {
         let capable = features.iter().any(|f| f == SESSION_ENDED_FEATURE);
-        Self::new_internal(sig, sig_rx, device, HEARTBEAT_INTERVAL, reports, capable, None, None, false)
+        Self::new_internal(sig, sig_rx, device, HEARTBEAT_INTERVAL, reports, capable, None, None, false, false, None)
     }
 
     /// [`new_with_reports`](Self::new_with_reports) plus the docs/65 directive hub: relayed `Directive` messages and their
@@ -236,7 +244,36 @@ impl SignalingMux {
     ) -> Self {
         let capable = features.iter().any(|f| f == SESSION_ENDED_FEATURE);
         let help_advertised = crate::help_request::advertised(features);
-        Self::new_internal(sig, sig_rx, device, HEARTBEAT_INTERVAL, reports, capable, hub, help, help_advertised)
+        Self::new_internal(sig, sig_rx, device, HEARTBEAT_INTERVAL, reports, capable, hub, help, help_advertised, false, None)
+    }
+
+    pub(crate) fn new_with_wake(
+        sig: SignalingClient,
+        sig_rx: mpsc::UnboundedReceiver<ServerToClient>,
+        device: Option<DeviceId>,
+        reports: Option<GuestEndReports>,
+        features: &[String],
+        hub: Option<Arc<crate::directive_hub::DirectiveHub>>,
+        help: Option<Arc<crate::help_request::HelpHub>>,
+        lan_advertised: bool,
+        agent: Option<Arc<crate::wake_agent::WakeAgent>>,
+    ) -> Result<Self, String> {
+        let wake = if let Some(agent) = agent.filter(|_| features.iter().any(|f| f == WAKE_FEATURE)) {
+            match crate::wake_agent::Connection::begin(&sig, agent) {
+                Ok(connection) => Some(connection),
+                Err(_) => {
+                    sig.cancel();
+                    return Err("could not start wake signaling".into());
+                }
+            }
+        } else {
+            None
+        };
+        let capable = features.iter().any(|f| f == SESSION_ENDED_FEATURE);
+        let help_advertised = crate::help_request::advertised(features);
+        let lan_report = lan_advertised && features.iter().any(|f| f == LAN_FEATURE);
+        Ok(Self::new_internal(sig, sig_rx, device, HEARTBEAT_INTERVAL, reports, capable, hub, help,
+            help_advertised, lan_report, wake))
     }
 
     fn new_internal(
@@ -249,6 +286,8 @@ impl SignalingMux {
         directive_hub: Option<std::sync::Arc<crate::directive_hub::DirectiveHub>>,
         help: Option<std::sync::Arc<crate::help_request::HelpHub>>,
         help_advertised: bool,
+        lan_report: bool,
+        wake: Option<crate::wake_agent::Connection>,
     ) -> Self {
         let (new_session_tx, new_session_rx) = mpsc::channel::<BrokeredSession>(8);
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
@@ -272,10 +311,17 @@ impl SignalingMux {
             (hub, generation)
         });
 
+        let wake_clock_abort = wake.as_ref().map(|wake| wake.monitor_clock(sig.clone()));
+        let reporter = lan_report.then(|| Arc::new(Mutex::new(
+            crate::lan_reporter::Reporter::new(tokio::time::Instant::now()),
+        )));
+        let lan_report_abort = reporter.as_ref().map(|reporter| {
+            tokio::spawn(crate::lan_reporter::run(sig.clone(), reporter.clone())).abort_handle()
+        });
         let sessions_d = Arc::clone(&sessions);
         let dispatch_abort =
             tokio::spawn(dispatch_task_with_reports(
-                sig_rx, sig.clone(), new_session_tx, sessions_d, reports.clone(), hub_generation, help_hub.clone(),
+                sig_rx, sig.clone(), new_session_tx, sessions_d, reports.clone(), hub_generation, help_hub.clone(), reporter, wake,
             ))
                 .abort_handle();
 
@@ -288,7 +334,7 @@ impl SignalingMux {
         });
 
         Self {
-            new_session_rx, sessions, dispatch_abort, heartbeat_abort, guest_end_abort,
+            new_session_rx, sessions, dispatch_abort, heartbeat_abort, guest_end_abort, lan_report_abort, wake_clock_abort,
             session_ended_capable,
             directive_hub,
             help_hub,
@@ -586,7 +632,7 @@ async fn dispatch_task(
     new_session_tx: mpsc::Sender<BrokeredSession>,
     sessions: SessionMap,
 ) {
-    dispatch_task_with_reports(sig_rx, sig, new_session_tx, sessions, None, None, None).await;
+    dispatch_task_with_reports(sig_rx, sig, new_session_tx, sessions, None, None, None, None, None).await;
 }
 
 async fn dispatch_task_with_reports(
@@ -597,6 +643,8 @@ async fn dispatch_task_with_reports(
     reports: Option<GuestEndReports>,
     directive_hub: Option<(std::sync::Arc<crate::directive_hub::DirectiveHub>, u64)>,
     help_hub: Option<(std::sync::Arc<crate::help_request::HelpHub>, u64)>,
+    reporter: Option<Arc<Mutex<crate::lan_reporter::Reporter>>>,
+    wake: Option<crate::wake_agent::Connection>,
 ) {
     // Buffer for messages that arrive BEFORE their session's `Brokered` is processed.
     //
@@ -608,6 +656,18 @@ async fn dispatch_task_with_reports(
 
     while let Some(msg) = sig_rx.recv().await {
         match msg {
+            ServerToClient::LanReportAck { seq } => {
+                if let Some(reporter) = reporter.as_ref() {
+                    reporter.lock().unwrap().ack(seq);
+                }
+            }
+            ServerToClient::Wake { artifact } => {
+                if let Some(wake) = wake.as_ref() {
+                    wake.handle(&sig, artifact).await;
+                } else {
+                    crate::wake_agent::log(&artifact, "refused:key");
+                }
+            }
             // ── Connection-level ───────────────────────────────────────────────────────────────
             ServerToClient::Registered { .. } => {
                 tracing::debug!("signaling_mux: registered");

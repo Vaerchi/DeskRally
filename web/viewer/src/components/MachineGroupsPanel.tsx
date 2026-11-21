@@ -127,7 +127,7 @@ export function maxDurationDraftsFor(
   return Object.fromEntries(groups.map((g) => [g.id, String(byGroup.get(g.id) ?? 0)]));
 }
 
-/** Initial `maxIdleDraft` from the fetched policies (seconds → string; 0 = unlimited). */
+/** Initial `maxIdleDraft` from the fetched policies, in seconds. */
 export function maxIdleDraftsFor(
   groups: readonly MachineGroup[],
   policies: readonly GroupSessionCap[] | null,
@@ -282,7 +282,7 @@ export function groupPolicySubmission(
   const maxIdle = wholeNumberIn(d.maxIdle, GROUP_POLICY_LIMITS.maxIdleSeconds);
   if (maxIdle === null) {
     return refuse(
-      `max idle must be a whole number of seconds from 0 to ${GROUP_POLICY_LIMITS.maxIdleSeconds} (1 hour; 0 = unlimited)`,
+      `max idle must be a whole number of seconds from 0 to ${GROUP_POLICY_LIMITS.maxIdleSeconds} (1 hour, 0 = use the organization default)`,
     );
   }
   if (d.prohibitRecording && d.requireRecording) {
@@ -440,10 +440,13 @@ function PolicyEditor({ group: g, draft, dirty, saved, saving, locked, onChange,
           max={GROUP_POLICY_LIMITS.maxIdleSeconds}
           value={draft.maxIdle ?? "0"}
           onChange={(e) => onChange({ maxIdle: e.target.value })}
-          aria-label={`Max idle seconds for ${g.name} (0 = unlimited)`}
+          aria-label={`Max idle seconds for ${g.name}`}
           data-testid={`mgroup-maxidle-${g.id}`}
         />
-        <span className="panel__muted">{describeSeconds(draft.maxIdle)}</span>
+        <span className="panel__muted">
+          0 = use the organization default (Admin &gt; Security)
+          {Number(draft.maxIdle) > 0 && ` · ${describeSeconds(draft.maxIdle)}`}
+        </span>
       </label>
       <div className="mgroup-policy__actions">
         <button className="panel__action" type="button" onClick={onSave} disabled={!dirty || saving} data-testid={`mgroup-cap-save-${g.id}`}>

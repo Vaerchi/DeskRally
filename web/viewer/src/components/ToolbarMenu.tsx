@@ -37,10 +37,13 @@ export function menuPanelPosition(rect: { top: number; bottom: number; left: num
  * `ariaLabel` (its accessible name and the panel's; default `label`, so many rows can each name their machine),
  * `triggerTestId`, `triggerClassName`, and `closeOnAction` (choosing an item closes the menu).
  */
-export function ToolbarMenu({ label, children, inline = false, onOpenChange, badge, badgeNoun, trigger: triggerContent, ariaLabel, triggerTestId, triggerClassName, closeOnAction = false }: { label: string; children: ReactNode; inline?: boolean; onOpenChange?: (open: boolean) => void; badge?: string | null; badgeNoun?: string; trigger?: ReactNode; ariaLabel?: string; triggerTestId?: string; triggerClassName?: string; closeOnAction?: boolean }) {
+export function ToolbarMenu({ label, children, inline = false, onOpenChange, badge, badgeNoun, trigger: triggerContent, ariaLabel, triggerTestId, triggerClassName, closeOnAction = false, sectionTrigger }: { label: string; children: ReactNode; inline?: boolean; onOpenChange?: (open: boolean) => void; badge?: string | null; badgeNoun?: string; trigger?: ReactNode; ariaLabel?: string; triggerTestId?: string; triggerClassName?: string; closeOnAction?: boolean; sectionTrigger?: { content: ReactNode; sectionTestId: string; className?: string; title?: string; testId?: string } }) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLDivElement>(null);
+  const sectionButton = useRef<HTMLButtonElement>(null);
+  const openedBy = useRef<HTMLButtonElement | null>(null);
+  const [focusSection, setFocusSection] = useState(false);
   const [container] = useState(() => document.createElement("div"));
   const [position, setPosition] = useState<{ top?: number; bottom?: number; left: number }>({ top: 48, left: 8 });
   const name = ariaLabel ?? label;
@@ -56,32 +59,46 @@ export function ToolbarMenu({ label, children, inline = false, onOpenChange, bad
     if (!open || inline) return;
     const doc = trigger.current!.ownerDocument;
     const outside = (event: Event) => {
-      if (!trigger.current?.contains(event.target as Node) && !panel.current?.contains(event.target as Node)) setOpen(false);
+      if (!trigger.current?.contains(event.target as Node) && !sectionButton.current?.contains(event.target as Node) &&
+        !panel.current?.contains(event.target as Node)) setOpen(false);
     };
     const key = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { setOpen(false); trigger.current?.focus(); }
+      if (event.key === "Escape") { setOpen(false); (openedBy.current?.isConnected ? openedBy.current : trigger.current)?.focus(); }
     };
     doc.addEventListener("pointerdown", outside);
     doc.addEventListener("focusin", outside);
     doc.addEventListener("keydown", key);
-    panel.current?.focus();
+    const section = focusSection && sectionTrigger?.sectionTestId
+      ? panel.current?.querySelector<HTMLElement>(`[data-testid="${sectionTrigger.sectionTestId}"]`)
+      : null;
+    (section ?? panel.current)?.focus();
     return () => {
       doc.removeEventListener("pointerdown", outside);
       doc.removeEventListener("focusin", outside);
       doc.removeEventListener("keydown", key);
     };
-  }, [open, inline]);
+  }, [open, inline, focusSection, sectionTrigger?.sectionTestId]);
   useLayoutEffect(() => { onOpenChange?.(open && !inline); return () => onOpenChange?.(false); }, [open, inline, onOpenChange]);
   if (inline) return <MenuInline.Provider value={true}>{children}</MenuInline.Provider>;
+  const openFrom = (button: HTMLButtonElement, section: boolean) => {
+    const rect = button.getBoundingClientRect();
+    const win = button.ownerDocument.defaultView;
+    setPosition(menuPanelPosition(rect, { innerWidth: win?.innerWidth ?? 400, innerHeight: win?.innerHeight ?? 800 }));
+    openedBy.current = button;
+    setFocusSection(section);
+    if (section) setOpen(true);
+    else setOpen(value => !value);
+  };
   return <>
     <button type="button" className={triggerClassName ?? "toolbar-menu__trigger"} ref={trigger} data-menu-label={label}
       data-testid={triggerTestId}
-      aria-label={name} title={toolbarMenuTitle(name, badge, badgeNoun)} aria-expanded={open} aria-haspopup="dialog" onClick={() => {
-        const rect = trigger.current!.getBoundingClientRect();
-        const win = trigger.current!.ownerDocument.defaultView;
-        setPosition(menuPanelPosition(rect, { innerWidth: win?.innerWidth ?? 400, innerHeight: win?.innerHeight ?? 800 }));
-        setOpen(value => !value);
-      }}>{triggerContent ?? <>{label} ▾</>}<ToolbarMenuBadge badge={badge} /></button>
+      aria-label={name} title={toolbarMenuTitle(name, badge, badgeNoun)} aria-expanded={open} aria-haspopup="dialog"
+      onClick={event => openFrom(event.currentTarget, false)}>{triggerContent ?? <>{label} ▾</>}<ToolbarMenuBadge badge={badge} /></button>
+    {sectionTrigger && <button ref={sectionButton} type="button" className={sectionTrigger.className}
+      title={sectionTrigger.title} data-testid={sectionTrigger.testId}
+      aria-haspopup="dialog" aria-expanded={open} onClick={event => openFrom(event.currentTarget, true)}>
+      {sectionTrigger.content}
+    </button>}
     {createPortal(<MenuVisibility.Provider value={open}>
       <div ref={panel} className="toolbar-menu__panel" role="dialog" hidden={!open}
         aria-label={name} tabIndex={-1} style={position}
@@ -104,11 +121,11 @@ export function ToolbarMenu({ label, children, inline = false, onOpenChange, bad
  * empty group, so an observer never sees a heading over nothing. Children are never wrapped or re-keyed, so
  * their state and test ids are unchanged. In a menu drawn inline (a pop-out window's toolbar row) it adds nothing.
  */
-export function MenuSection({ title, testId, children }: { title: string; testId?: string; children: ReactNode }) {
+export function MenuSection({ title, testId, children, focusable }: { title: string; testId?: string; children: ReactNode; focusable?: boolean }) {
   const inline = useContext(MenuInline);
   if (inline) return <>{children}</>;
   return (
-    <div className="menu-section" role="group" aria-label={title} data-testid={testId}>
+    <div className="menu-section" role="group" aria-label={title} data-testid={testId} tabIndex={focusable ? -1 : undefined}>
       <span className="menu-section__title" aria-hidden="true">{title}</span>
       {children}
     </div>

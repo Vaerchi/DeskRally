@@ -136,6 +136,7 @@ func TestPresenceEndpointReturnsDeviceIdsOnly(t *testing.T) {
 	// forever in the console.
 	if !contains(body, `"device_id":"dev-a"`) ||
 		!contains(body, `"last_seen_unix_ms":`) ||
+		!contains(body, `"wake_capable":false`) ||
 		!contains(body, `"devices":[`) ||
 		!contains(body, `"as_of_unix_ms":`) ||
 		!contains(body, `"os":"Windows 11 Pro 25H2 (build 26200)"`) ||
@@ -145,7 +146,10 @@ func TestPresenceEndpointReturnsDeviceIdsOnly(t *testing.T) {
 	// The registry knows the agent's pubkey, tenant and NAT type. None of that may travel: the
 	// endpoint answers "which of these ids are up (and what they claim to run)", never "how do I
 	// get to them". The os travels DELIBERATELY — it is the refresh input for machine.os.
-	for _, secret := range []string{"cafebabe", "tenant-secret", "symmetric"} {
+	for _, secret := range []string{"cafebabe", "tenant-secret", "symmetric",
+		`"mac"`, `"ipv4_network"`, `"gateway_mac"`, `"entries"`, `"challenge"`,
+		`"conn_ref"`, `"epoch"`, `"device_key_sha256"`, "192.0.2.0/24", "aa:bb:cc:dd:ee:ff",
+	} {
 		if contains(body, secret) {
 			t.Fatalf("presence response leaked %q: %s", secret, body)
 		}
@@ -383,14 +387,14 @@ func TestSessionPolicyRequiredFromFeatures(t *testing.T) {
 }
 
 // Everything a current agent announces (directive + all posture features) must survive boundFeatures
-// with room to spare: max 8 entries, 32 bytes each.
+// within the bound: max 8 entries, 32 bytes each.
 func TestAgentFeatureListFitsTheBound(t *testing.T) {
-	all := []string{directiveFeature, postureFeature, grantKeyPinnedFeature, sessionPolicyReqFeature}
+	all := []string{directiveFeature, postureFeature, grantKeyPinnedFeature, sessionPolicyReqFeature, lanFeature, wakeFeature}
 	if got := boundFeatures(all); len(got) != len(all) {
 		t.Fatalf("bound dropped features: %v -> %v", all, got)
 	}
-	if len(all) > maxAgentFeatures-3 {
-		t.Fatalf("only %d spare feature slots left", maxAgentFeatures-len(all))
+	if len(all) > maxAgentFeatures {
+		t.Fatalf("%d features exceed the %d-entry limit", len(all), maxAgentFeatures)
 	}
 	for _, f := range all {
 		if len(f) > maxFeatureBytes-4 {

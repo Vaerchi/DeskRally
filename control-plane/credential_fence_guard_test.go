@@ -176,6 +176,9 @@ var credentialGuardDynamicSQLAllowed = map[string]string{
 	"pgstore_help_request.go:MarkDelivered":          "splices the fixed help_request column list (helpColsP) into an UPDATE/SELECT over help_request; never names user_credential",
 	"pgstore_help_request.go:expireDueTx":            "splices the fixed help_request column list (helpColsP) into SELECT/UPDATE over help_request; never names user_credential",
 	"pgstore_recording.go:loadRecording":             "appends only a fixed lock-strength clause (\"\", FOR SHARE, FOR UPDATE) to a SELECT on session_recording",
+	"pgstore_run_record.go:listRunHistory":           "splices one of two fixed column names (r.machine_id | r.item_id) into a read-only SELECT over run_record/machine/app_user/toolbox_item; never names user_credential",
+	"pgstore_wake.go:lockWakeAuthority":              "constant lockWakeAPIToken = SELECT + apiTokenColumns (defined in pgstore_apitoken.go, so not foldable here) ... FROM api_token FOR SHARE; read-only lock, never names user_credential",
+	"pgstore_wake.go:issueWake":                      "selectSignalingIncarnationForShare is a constant from pgstore_lan.go (SELECT ... FROM signaling_incarnation FOR SHARE); read-only lock, never names user_credential",
 }
 
 func credentialFenceViolations(filename string, source []byte) ([]string, error) {

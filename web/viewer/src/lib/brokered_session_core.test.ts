@@ -3,7 +3,7 @@ import { BrokeredSessionCore, CoreError } from "./brokered_session_core";
 import type { BrokeredSessionCoreDeps } from "./brokered_session_core";
 import type { StartedSession, ToolboxItem, ToolboxRunGrant } from "./console_api";
 import type { BulkTask } from "./bulk_run";
-import type { ControlClient, CommandResult } from "./control";
+import { ControlClient, encodeControl, type CommandResult } from "./control";
 import type { AuditEvent } from "./audit_forward";
 import type { TransportEvents } from "./transport";
 import { ChannelId } from "./protocol";
@@ -43,13 +43,17 @@ const EVENT: AuditEvent = {
   agent_pubkey: "key", agent_signature: "signature",
 };
 
-function fixture(policy = true) {
+function fixture(policy = true, features: string[] | null = []) {
   const order: string[] = [];
   const started: StartedSession = {
     // Session metadata is irrelevant to the core; ownership keys exclusively on this id.
     session: { id: "session-1" } as StartedSession["session"],
     signaling: {
       url: "wss://broker.example/", device_id: "device-1", session_id: "session-1",
+      name_attestation: {
+        claims: { v: 1, session_id: "session-1", technician_id: "tech", display_name: "Ada", exp_ms: 123 },
+        sig: "fixture",
+      },
       ticket: { payload: "ticket", signature: "signature" } as unknown as NonNullable<StartedSession["signaling"]>["ticket"],
     },
     ...(policy ? { session_policy: { access: "control", signed: SIGNED } } : {}),
@@ -63,6 +67,7 @@ function fixture(policy = true) {
       order.push("release"); return started.session;
     }),
     setSessionNote: vi.fn<BrokeredSessionCoreDeps["api"]["setSessionNote"]>().mockResolvedValue(started.session),
+    postRunReceipt: vi.fn<BrokeredSessionCoreDeps["api"]["postRunReceipt"]>().mockResolvedValue(200),
     requestToolboxRun: vi.fn<BrokeredSessionCoreDeps["api"]["requestToolboxRun"]>().mockResolvedValue(GRANT),
     requestCommandRun: vi.fn<BrokeredSessionCoreDeps["api"]["requestCommandRun"]>().mockResolvedValue(GRANT),
     renewSessionPolicy: vi.fn<BrokeredSessionCoreDeps["api"]["renewSessionPolicy"]>().mockResolvedValue({
@@ -78,6 +83,7 @@ function fixture(policy = true) {
     close: vi.fn(() => { order.push("signaling"); }),
   };
   const control = {
+    requestBackstageFeatures: vi.fn(() => { if (features) handlers.onBackstageFeatures?.(features); }),
     installSessionPolicy: vi.fn<(signed: string) => void>(),
     runCommand: vi.fn<ControlClient["runCommand"]>(), handleMessage: vi.fn(),
     sendBindStart: vi.fn(), sendBindConsoleProof: vi.fn(),
@@ -125,8 +131,8 @@ function fixture(policy = true) {
 
 type Fixture = ReturnType<typeof fixture>;
 let fixtures: Fixture[];
-function setup(policy = true) {
-  const value = fixture(policy);
+function setup(policy = true, features: string[] | null = []) {
+  const value = fixture(policy, features);
   fixtures.push(value);
   return value;
 }
@@ -152,7 +158,7 @@ describe("BrokeredSessionCore readiness and ownership", () => {
     expect(f.signaling.send).toHaveBeenCalledWith(expect.objectContaining({
       type: "register_agent", pubkey: "ed25519:browser-controller", nat: "unknown", enrollment_token: null,
     }));
-    expect(f.transport.connect).toHaveBeenCalledWith("device-1", f.started.signaling!.ticket);
+    expect(f.transport.connect).toHaveBeenCalledWith("device-1", f.started.signaling!.ticket, f.started.signaling!.name_attestation);
     expect(f.deps.makeTransport).toHaveBeenCalledWith(expect.objectContaining({ iceServers: [] }), expect.any(Object));
     f.events.onStateChange?.("connected");
     f.ack(); // An unsolicited acknowledgement cannot satisfy installation readiness.
@@ -334,8 +340,8 @@ describe("BrokeredSessionCore dispatch boundary and outcomes", () => {
     expect(f.control.runCommand).not.toHaveBeenCalled();
   });
 
-  it("an ad-hoc task authorizes via the command-run grant and dispatches the returned command", async () => {
-    const f = setup();
+  it.each([false, true])("ad-hoc dispatch uses the command-run grant (receipts=%s)", async (receipts) => {
+    const f = setup(true, receipts ? ["run_receipt_v1"] : []);
     const core = await f.ready();
     f.control.runCommand.mockImplementation(() => f.handlers.onCommandResult?.(RESULT));
     const task: BulkTask = { kind: "adhoc", name: "a command", shell: "cmd", runAs: "user", body: "ipconfig /all" };
@@ -344,7 +350,7 @@ describe("BrokeredSessionCore dispatch boundary and outcomes", () => {
     // composed shell/run_as/body, then sends exactly the authoritative command the grant returned.
     expect(f.api.requestToolboxRun).not.toHaveBeenCalled();
     expect(f.api.requestCommandRun).toHaveBeenCalledExactlyOnceWith("session-1", "cmd", "user", "ipconfig /all");
-    expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true);
+    expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true, ...(receipts ? [GRANT.request_id] : []));
   });
 
   it("does not dispatch when cancellation occurs during authorization", async () => {
@@ -723,5 +729,68 @@ describe("BrokeredSessionCore teardown and audit", () => {
     expect(f.api.ingestAudit).toHaveBeenCalledTimes(2);
     expect(f.api.endSession).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("run receipt negotiation and relay", () => {
+  it("waits three seconds from the feature request before dispatching a legacy run", async () => {
+    const f = setup(false, null);
+    const core = await f.ready();
+    expect(f.control.requestBackstageFeatures).toHaveBeenCalledOnce();
+    f.control.runCommand.mockImplementation(() => f.handlers.onCommandResult?.(RESULT));
+    const running = core.run(TOOLBOX_TASK, () => false);
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(f.control.runCommand).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true);
+    await expect(running).resolves.toMatchObject({ kind: "done" });
+  });
+
+  it("adopts a feature reply that arrives after the three-second wait but before dispatch", async () => {
+    const f = setup(false, null);
+    const core = await f.ready();
+    let authorize!: (grant: typeof GRANT) => void;
+    f.api.requestToolboxRun.mockImplementationOnce(() => new Promise((resolve) => { authorize = resolve; }));
+    f.control.runCommand.mockImplementation(() => f.handlers.onCommandResult?.(RESULT));
+    const running = core.run(TOOLBOX_TASK, () => false);
+    // The wait releases at 3 s; the run is still in progress (authorization here, an upload in push-and-run).
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(f.api.requestToolboxRun).toHaveBeenCalledOnce();
+    expect(f.control.runCommand).not.toHaveBeenCalled();
+    f.handlers.onBackstageFeatures?.(["run_receipt_v1"]);
+    authorize(GRANT);
+    await expect(running).resolves.toMatchObject({ kind: "done" });
+    expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true, GRANT.request_id);
+  });
+
+  it.each(["exited", "start_failed"])("relays a matched receipt through immediate bulk close (%s)", async (outcome) => {
+    const f = setup(false, null);
+    const core = await f.ready();
+    const running = core.run(TOOLBOX_TASK, () => false);
+    const closed = running.then(() => core.close());
+    await vi.advanceTimersByTimeAsync(2700);
+    expect(f.control.runCommand).not.toHaveBeenCalled();
+    f.handlers.onBackstageFeatures?.(["run_receipt_v1"]);
+    await drain();
+    expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true, GRANT.request_id);
+    const decoder = new ControlClient(() => {}, f.handlers);
+    f.control.handleMessage.mockImplementation((bytes) => decoder.handleMessage(bytes));
+    const frame = (requestId: string) => {
+      const receipt = { claims: { request_id: requestId, outcome, exit_code: outcome === "exited" ? 13 : null }, sig: "ab".repeat(64) };
+      return { t: "RunReceipt" as const, c: { requestId, receipt } };
+    };
+    const deliver = (msg: Parameters<typeof encodeControl>[0]) => f.events.onMessage?.(ChannelId.Control, encodeControl(msg));
+    deliver(frame("other"));
+    expect(f.api.postRunReceipt).not.toHaveBeenCalled();
+    f.api.postRunReceipt.mockResolvedValueOnce(503);
+    const matched = frame(GRANT.request_id);
+    deliver(matched);
+    expect(f.api.postRunReceipt).toHaveBeenCalledExactlyOnceWith(matched.c, expect.any(AbortSignal));
+    if (outcome === "exited") deliver({ t: "CommandResult", c: RESULT });
+    else deliver({ t: "Error", c: { message: "could not start" } });
+    await closed;
+    expect(f.transport.close).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.api.postRunReceipt).toHaveBeenCalledTimes(2);
   });
 });

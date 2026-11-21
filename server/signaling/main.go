@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,6 +26,8 @@ import (
 type Server struct {
 	// authLocks serializes each device's identity lookup THROUGH its publication (see deviceAuthLock).
 	authLocks deviceLocks
+	wakeCP    *wakeClient
+	wakeDrops atomic.Uint64
 
 	reg      *Registry
 	broker   *Broker
@@ -402,6 +405,14 @@ func (s *Server) dispatch(self *Peer, msg ClientToServer) {
 	// ends its mux on Rejected and reconnects, so a retired machine's periodic heartbeat turned into
 	// a reconnect loop every ~12 s (found in the 1.3.19 VM run). Ignoring keeps the connection open
 	// for directive delivery and still grants nothing.
+	switch p := msg.Payload.(type) {
+	case *LanReport:
+		s.handleLanReport(self, p)
+		return
+	case *WakeHello:
+		s.handleWakeHello(self, p)
+		return
+	}
 	if self.restricted {
 		if ack, ok := msg.Payload.(*DirectiveAck); ok {
 			s.handleDirectiveAck(self, ack)
@@ -455,12 +466,12 @@ func (s *Server) dispatch(self *Peer, msg ClientToServer) {
 			_ = self.Send(Rejected{Reason: "heartbeat device does not match this connection"})
 			break
 		}
-		if !s.reg.Heartbeat(self.DeviceId) {
+		if s.reg.heartbeat(self.DeviceId, self.conn) == heartbeatMissing {
 			_ = self.Send(Rejected{Reason: "heartbeat for unregistered device"})
 		}
 
 	case *ConnectRequest:
-		if _, err := s.broker.ConnectRequest(self, p.Target, p.Ticket); err != nil {
+		if _, err := s.broker.connectRequest(self, p.Target, p.Ticket, p.NameAttestation); err != nil {
 			self.logLimiter.logf("connect_request from %q: %q", self.DeviceId, err)
 		} else {
 			// A controller never issues register_agent; a successfully brokered connect_request
@@ -531,7 +542,12 @@ func (s *Server) handleRegisterAgent(self *Peer, p *RegisterAgent) {
 		self.GrantKeyPinned = grantKeyPinnedFrom(boundFeatures(p.Features))
 		self.SessionPolicyRequired = sessionPolicyRequiredFrom(boundFeatures(p.Features))
 		self.registered = true
-		s.reg.Register(self)
+		if s.reg.Register(self) == nil {
+			self.registered = false
+			_ = self.Send(Rejected{Reason: agentAuthRejectionReason})
+			_ = self.conn.Close()
+			return
+		}
 		s.markAuthenticated(self)
 		if err := self.Send(s.registeredMsg(self)); err != nil {
 			log.Printf("failed to ack registration for %q: %q", p.Device, err)
@@ -598,6 +614,10 @@ func (s *Server) handleAgentAuthResponse(self *Peer, p *AgentAuthResponse) {
 	self.DeviceId = pending.Device
 	self.Pubkey = identity.Pubkey
 	self.Tenant = identity.TenantID
+	self.wake.proved = true
+	self.wake.installedActive.Store(identity.installedActive())
+	self.wake.lanFeature = hasFeature(pending.Features, lanFeature)
+	self.wake.wakeFeature = hasFeature(pending.Features, wakeFeature)
 	self.Nat = pending.Nat
 	// The os is the agent's own assertion, carried through from register_agent (already bounded).
 	// Unlike tenant/pubkey there is no authoritative source to overwrite it with — the device that
@@ -628,10 +648,10 @@ func (s *Server) handleAgentAuthResponse(self *Peer, p *AgentAuthResponse) {
 		published = s.reg.Register(self) != nil
 	}
 	if !published {
-		// A newer identity lookup for this device published first: this answer is stale. Treat it like any
-		// other failed authentication (the agent reconnects and is resolved afresh).
+		// A newer lookup or a busy device gate refused publication. The agent can reconnect
+		// and resolve its identity afresh.
 		self.registered = false
-		log.Printf("agent auth for device %q: superseded by a newer identity lookup, rejecting", clipForLog(pending.Device))
+		log.Printf("agent auth for device %q: registry publication refused", clipForLog(pending.Device))
 		_ = self.Send(Rejected{Reason: agentAuthRejectionReason})
 		_ = self.conn.Close()
 		return
@@ -656,6 +676,7 @@ func (s *Server) handleAgentAuthResponse(self *Peer, p *AgentAuthResponse) {
 
 // cleanup evicts a dropped connection from the registry and tears down its sessions.
 func (s *Server) cleanup(self *Peer) {
+	self.wake.disconnected.Store(true)
 	// Flush any suppressed log lines before tearing down. All dispatch calls for this
 	// connection have completed at this point (the read loop has exited), so the full
 	// suppressed count is final.
@@ -663,12 +684,12 @@ func (s *Server) cleanup(self *Peer) {
 	if self.DeviceId != "" {
 		s.reg.Remove(self.DeviceId, self.conn)
 	}
+	s.broker.RemovePeerSessions(self)
 	// No more dispatch calls: let the ack worker drain what was already queued (in order) and exit.
 	if self.directiveAcks != nil {
 		close(self.directiveAcks)
 	}
-	s.broker.RemovePeerSessions(self)
-	_ = self.conn.Close()
+	self.closeTransport()
 	// Retain admission through socket close and session cleanup. Release is idempotent even when
 	// promotion or the pre-auth timer already ran.
 	if self.admission != nil {
@@ -881,6 +902,10 @@ func main() {
 		log.Fatalf("failed to initialize server: %v", err)
 	}
 	srv.guestEnd = guestEnd
+	if resolver, ok := identity.(*httpIdentityResolver); ok {
+		srv.wakeCP = newWakeClient(resolver.baseURL, resolver.token)
+		go srv.activateWake(context.Background())
+	}
 	// docs/49: advertise session_ended_v1 only while the control plane confirms its /ended route.
 	// A flip to supported reconnects agents that registered before it (they read features once).
 	go guestEnd.RunCapabilityProbe(context.Background(), func() { srv.bounceSessionEndedStale() })
@@ -1006,6 +1031,7 @@ func main() {
 	// docs/65: the control plane tells signaling a directive was issued. Same service token as the
 	// control plane's internal routes; not mounted without it.
 	srv.mountDirectiveNotify(mux, strings.TrimSpace(os.Getenv("SIGNALING_DEVICE_IDENTITY_TOKEN")))
+	srv.mountWake(mux, strings.TrimSpace(os.Getenv("SIGNALING_DEVICE_IDENTITY_TOKEN")))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

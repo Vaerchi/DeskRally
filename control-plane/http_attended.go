@@ -185,7 +185,16 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "grant issuer not configured")
 		return
 	}
-	// The gate: only transitions consented→active; a session still awaiting consent is refused.
+	var tenantPolicy SessionPolicy
+	if s.SessionPolicies != nil {
+		pol, err := s.SessionPolicies.Get(r.Context(), p.TenantID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not resolve session policy")
+			return
+		}
+		tenantPolicy = pol
+	}
+	// Only a guest who has consented can transition to active.
 	active, err := s.Attended.MarkActive(r.Context(), p.TenantID, sess.ID)
 	if err != nil {
 		switch {
@@ -235,11 +244,11 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 	// guest-initiated session, and without this the mandate was bypassed by taking the attended route —
 	// the console would show the group as view-only while an attended technician had full control.
 	//
-	// The unattended path mints ONLY for a group that actually enforces, so a policy's PRESENCE is the
-	// signal. On THIS path presence is no longer sufficient, and the ACCESS FIELD is load-bearing —
+	// On this path the ACCESS FIELD is load-bearing —
 	// loop 83, migration 0036. A guest that was told at redeem to open FLOORED is enforcing a floor
 	// right now, and the only thing that can lift it is a policy it can verify. So:
 	//
+	//   * idle timeout applies   → mint the effective timeout;
 	//   * group enforces          → mint view_only (as before);
 	//   * guest was told to floor → mint the group's CURRENT level, whatever it is.
 	//
@@ -250,6 +259,7 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 	// The outcome, for the audit record below: "" when no policy was minted.
 	policyAccess := ""
 	groupEnforces := false
+	groupPolicy := GroupSessionPolicy{GroupID: active.GroupID}
 	if s.GroupSessionPolicies != nil && active.GroupID != "" {
 		eff, gerr := s.EffectivePolicy(r.Context(), p.TenantID, active.GroupID)
 		if gerr != nil {
@@ -260,107 +270,94 @@ func (s *Server) handleConnectAttended(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, eff.Conflict)
 			return
 		}
-		groupPolicy := eff.GroupSessionPolicy
-		// Attended agents are ephemeral downloads with no recording_dir configured — they can
-		// never satisfy require_recording regardless of agent version. Reject before exposing
-		// the desktop so the policy is actually enforced.
-		if groupPolicy.RequireRecording {
-			writeError(w, http.StatusForbidden,
-				"this machine group requires session recording, which is not supported for attended (guest) sessions")
+		groupPolicy = eff.GroupSessionPolicy
+	}
+	groupPolicy.MaxIdleSeconds = effectiveSessionIdleSeconds(groupPolicy.MaxIdleSeconds, tenantPolicy)
+	// Attended agents are ephemeral downloads with no recording_dir configured — they can
+	// never satisfy require_recording regardless of agent version. Reject before exposing
+	// the desktop so the policy is actually enforced.
+	if groupPolicy.RequireRecording {
+		writeError(w, http.StatusForbidden,
+			"this machine group requires session recording, which is not supported for attended (guest) sessions")
+		return
+	}
+	// prohibit_recording is temporarily not supported for any session type pending agent
+	// capability negotiation. Reject rather than deliver an unenforceable policy.
+	if groupPolicy.ProhibitRecording {
+		writeError(w, http.StatusForbidden,
+			"this machine group prohibits session recording; this restriction is temporarily "+
+				"not supported and will be available once agent capability negotiation is complete")
+		return
+	}
+	// Session duration limits remain gated for attended guests.
+	if groupPolicy.MaxSessionDurationSeconds > 0 {
+		writeError(w, http.StatusForbidden,
+			"this machine group has a session duration limit that cannot be enforced for attended (guest) sessions")
+		return
+	}
+	if groupPolicy.EnforceViewOnly || (s.GroupSessionPolicies != nil && active.GroupID != "" && active.RequireSessionPolicy) || groupPolicy.MaxIdleSeconds > 0 {
+		access := SessionAccessControl
+		if groupPolicy.EnforceViewOnly {
+			access = SessionAccessViewOnly
+		}
+		// WHY MINTING `control` IS REPLAY-SAFE, and the invariant it rests on. A policy is a signed
+		// bearer artifact with a TTL, and the agent cannot judge freshness — so the design's safety
+		// comes from a policy only ever being able to RESTRICT. `control` is the one exception, and
+		// it is contained by the DEVICE BINDING: verification requires machine_id to equal the
+		// agent's own device id, and the id below is the session's EPHEMERAL machine, minted fresh
+		// by this one redemption and reaped when the session ends. So a captured `control` policy
+		// names a device that will never exist again — it cannot be replayed into a later session,
+		// and it certainly cannot be replayed at a PERMANENT machine. (Verified against promote too:
+		// promotion mints a FRESH device id at enrollment rather than reusing the ephemeral one.)
+		//
+		// That argument leans on one more fact, named here because it lives in another crate and a
+		// change there would silently invalidate this comment: **an attended guest serves exactly
+		// ONE session per process.** `run_attend` calls `serve_session_with_ice` once and then
+		// exits, so there is no second session on that ephemeral device to replay into. If the
+		// attended path ever gains a reconnect loop, revisit this.
+		//
+		// UPDATE (loop 86): that containment WAS spent, deliberately, and paid for. handleStartSession
+		// used to hard-code `const access = SessionAccessViewOnly` precisely to preserve it; it now
+		// mints `control` for a PERMANENT machine that reported `require_session_policy` (migration
+		// 0037), because withholding the mint stranded exactly that agent view-only forever. So the
+		// ephemeral-device argument above is no longer the ONLY thing standing between a captured
+		// `control` policy and a replay — SESSION BINDING is: the policy's session_id is checked in
+		// `SessionPolicy::verify` against the live session id the agent learns from the verified
+		// ticket, so a policy captured in one session is rejected, terminally, in any other. The
+		// ephemeral device id remains a second, independent containment for THIS path. If session
+		// binding is ever removed, this comment's original warning comes straight back.
+		attendedMaxIdle := uint32(groupPolicy.MaxIdleSeconds)
+		signedPolicy, perr := s.Grants.MintSessionPolicy(p.UserID, active.ID, active.DeviceID,
+			access, groupPolicy.AllowRecording(), groupPolicy.RequireRecording, 0, attendedMaxIdle, now, now+sessionPolicyTTL.Milliseconds())
+		if perr != nil {
+			// Fail CLOSED: handing back a connection with no floor for a group that requires one is
+			// the failure this whole feature exists to prevent. The session stays `active` (the
+			// transition happened above) — the operator can retry or end it, and an attended session
+			// that is active but never connected is inert, unlike an orphaned session_record it holds
+			// no concurrency seat. It fails closed in the DISCHARGE direction too: a guest that was
+			// told to floor and gets no policy stays view-only, which is safe but useless, so it is
+			// still an error and not a silently degraded session.
+			log.Printf("attended %s: group %s needs a %s access policy (group_enforces=%t guest_floored=%t) "+
+				"but it could not be minted: %v",
+				active.ID, active.GroupID, access, groupPolicy.EnforceViewOnly, active.RequireSessionPolicy, perr)
+			writeError(w, http.StatusInternalServerError,
+				"this session requires a signed access policy, but it could not be minted")
 			return
 		}
-		// prohibit_recording is temporarily not supported for any session type pending agent
-		// capability negotiation. Reject rather than deliver an unenforceable policy.
-		if groupPolicy.ProhibitRecording {
-			writeError(w, http.StatusForbidden,
-				"this machine group prohibits session recording; this restriction is temporarily "+
-					"not supported and will be available once agent capability negotiation is complete")
+		policyJSON, jerr := signedPolicy.JSON()
+		if jerr != nil {
+			writeError(w, http.StatusInternalServerError, "could not encode the session access policy")
 			return
 		}
-		// max_session_duration_seconds and max_idle_seconds cannot be enforced for attended
-		// sessions: attended agents use SessionLeaseMode::NotApplicable and have no lease renewal
-		// path to carry the limit. Old attended binaries ignore these fields entirely.
-		if groupPolicy.MaxSessionDurationSeconds > 0 {
-			writeError(w, http.StatusForbidden,
-				"this machine group has a session duration limit that cannot be enforced for attended (guest) sessions")
-			return
+		// `access` and not a literal: this used to be the only reachable value, and after 0036 it is
+		// not. A hardcoded "view_only" here would ship a body that CONTRADICTS the signed blob beside
+		// it — the viewer would show the session as floored while the agent, reading the signature,
+		// released control.
+		resp["session_policy"] = map[string]any{
+			"access": string(access),
+			"signed": policyJSON,
 		}
-		if groupPolicy.MaxIdleSeconds > 0 {
-			writeError(w, http.StatusForbidden,
-				"this machine group has an idle timeout that cannot be enforced for attended (guest) sessions")
-			return
-		}
-		if groupPolicy.EnforceViewOnly || active.RequireSessionPolicy || !groupPolicy.AllowRecording() || groupPolicy.RequireRecording || groupPolicy.MaxSessionDurationSeconds > 0 || groupPolicy.MaxIdleSeconds > 0 {
-			access := SessionAccessControl
-			if groupPolicy.EnforceViewOnly {
-				access = SessionAccessViewOnly
-			}
-			// WHY MINTING `control` IS REPLAY-SAFE, and the invariant it rests on. A policy is a signed
-			// bearer artifact with a TTL, and the agent cannot judge freshness — so the design's safety
-			// comes from a policy only ever being able to RESTRICT. `control` is the one exception, and
-			// it is contained by the DEVICE BINDING: verification requires machine_id to equal the
-			// agent's own device id, and the id below is the session's EPHEMERAL machine, minted fresh
-			// by this one redemption and reaped when the session ends. So a captured `control` policy
-			// names a device that will never exist again — it cannot be replayed into a later session,
-			// and it certainly cannot be replayed at a PERMANENT machine. (Verified against promote too:
-			// promotion mints a FRESH device id at enrollment rather than reusing the ephemeral one.)
-			//
-			// That argument leans on one more fact, named here because it lives in another crate and a
-			// change there would silently invalidate this comment: **an attended guest serves exactly
-			// ONE session per process.** `run_attend` calls `serve_session_with_ice` once and then
-			// exits, so there is no second session on that ephemeral device to replay into. If the
-			// attended path ever gains a reconnect loop, revisit this.
-			//
-			// UPDATE (loop 86): that containment WAS spent, deliberately, and paid for. handleStartSession
-			// used to hard-code `const access = SessionAccessViewOnly` precisely to preserve it; it now
-			// mints `control` for a PERMANENT machine that reported `require_session_policy` (migration
-			// 0037), because withholding the mint stranded exactly that agent view-only forever. So the
-			// ephemeral-device argument above is no longer the ONLY thing standing between a captured
-			// `control` policy and a replay — SESSION BINDING is: the policy's session_id is checked in
-			// `SessionPolicy::verify` against the live session id the agent learns from the verified
-			// ticket, so a policy captured in one session is rejected, terminally, in any other. The
-			// ephemeral device id remains a second, independent containment for THIS path. If session
-			// binding is ever removed, this comment's original warning comes straight back.
-			var attendedMaxDuration uint32
-			if groupPolicy.MaxSessionDurationSeconds > 0 {
-				attendedMaxDuration = uint32(groupPolicy.MaxSessionDurationSeconds)
-			}
-			var attendedMaxIdle uint32
-			if groupPolicy.MaxIdleSeconds > 0 {
-				attendedMaxIdle = uint32(groupPolicy.MaxIdleSeconds)
-			}
-			signedPolicy, perr := s.Grants.MintSessionPolicy(p.UserID, active.ID, active.DeviceID,
-				access, groupPolicy.AllowRecording(), groupPolicy.RequireRecording, attendedMaxDuration, attendedMaxIdle, now, now+sessionPolicyTTL.Milliseconds())
-			if perr != nil {
-				// Fail CLOSED: handing back a connection with no floor for a group that requires one is
-				// the failure this whole feature exists to prevent. The session stays `active` (the
-				// transition happened above) — the operator can retry or end it, and an attended session
-				// that is active but never connected is inert, unlike an orphaned session_record it holds
-				// no concurrency seat. It fails closed in the DISCHARGE direction too: a guest that was
-				// told to floor and gets no policy stays view-only, which is safe but useless, so it is
-				// still an error and not a silently degraded session.
-				log.Printf("attended %s: group %s needs a %s access policy (group_enforces=%t guest_floored=%t) "+
-					"but it could not be minted: %v",
-					active.ID, active.GroupID, access, groupPolicy.EnforceViewOnly, active.RequireSessionPolicy, perr)
-				writeError(w, http.StatusInternalServerError,
-					"this session requires a signed access policy, but it could not be minted")
-				return
-			}
-			policyJSON, jerr := signedPolicy.JSON()
-			if jerr != nil {
-				writeError(w, http.StatusInternalServerError, "could not encode the session access policy")
-				return
-			}
-			// `access` and not a literal: this used to be the only reachable value, and after 0036 it is
-			// not. A hardcoded "view_only" here would ship a body that CONTRADICTS the signed blob beside
-			// it — the viewer would show the session as floored while the agent, reading the signature,
-			// released control.
-			resp["session_policy"] = map[string]any{
-				"access": string(access),
-				"signed": policyJSON,
-			}
-			policyAccess, groupEnforces = string(access), groupPolicy.EnforceViewOnly
-		}
+		policyAccess, groupEnforces = string(access), groupPolicy.EnforceViewOnly
 	}
 	// docs/69: bind this session to the guest's key pinned at redemption. The grant's level is the
 	// policy's when one was minted, else control (what an unfloored attended session gets).

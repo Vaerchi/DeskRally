@@ -193,19 +193,47 @@ func TestAttendedConnectRejectsGroupsWithSessionDurationLimit(t *testing.T) {
 	}
 }
 
-// max_idle_seconds cannot be enforced for attended sessions for the same reason as duration limits.
-func TestAttendedConnectRejectsGroupsWithIdleTimeout(t *testing.T) {
-	srv, _ := newAttendedServer(t)
-	srv.GroupSessionPolicies = NewInMemoryGroupSessionPolicyStore()
-	if err := srv.GroupSessionPolicies.Set(t.Context(), attendTestTenant,
-		attendTestGroup, GroupSessionPolicy{MaxIdleSeconds: 300}); err != nil {
-		t.Fatalf("set group policy: %v", err)
-	}
-
-	code, _ := driveAttendedToConnect(t, srv)
-	if code != http.StatusForbidden {
-		t.Fatalf("connect to a max_idle_seconds group returned %d, want 403 — idle timeouts "+
-			"cannot be enforced on attended sessions (no lease renewal path)", code)
+func TestAttendedConnectSignsEffectiveIdle(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		group    int
+		want     uint32
+		readable bool
+	}{
+		{"tenant fallback without group store", 0, 300, true},
+		{"group override", 900, 900, true},
+		{"unreadable tenant policy", 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := newAttendedServer(t)
+			srv.GroupSessionPolicies = nil
+			srv.SessionPolicies = NewInMemoryTenantSessionPolicyStore()
+			idle := 300
+			if err := srv.SessionPolicies.Set(t.Context(), attendTestTenant, SessionPolicy{DefaultMaxIdleSeconds: &idle}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.group > 0 {
+				srv.GroupSessionPolicies = NewInMemoryGroupSessionPolicyStore()
+				if err := srv.GroupSessionPolicies.Set(t.Context(), attendTestTenant, attendTestGroup,
+					GroupSessionPolicy{MaxIdleSeconds: tc.group}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !tc.readable {
+				srv.SessionPolicies = unreadableTenantSessionPolicyStore{}
+			}
+			code, out := driveAttendedToConnect(t, srv)
+			if !tc.readable {
+				if code != http.StatusInternalServerError || out.SessionPolicy != nil {
+					t.Fatalf("connect with unreadable policy = %d, want 500 and no signed policy", code)
+				}
+				return
+			}
+			if code != http.StatusOK || out.SessionPolicy == nil {
+				t.Fatalf("connect = %d, want 200 and a signed policy", code)
+			}
+			assertSignedIdle(t, srv.Grants, out.SessionPolicy.Signed, tc.want)
+		})
 	}
 }
 

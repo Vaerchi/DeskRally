@@ -139,10 +139,7 @@ func TestObserverBrokeredAndParticipants(t *testing.T) {
 				if wire.Access != wantAccess || wire.Version != 1 {
 					t.Fatalf("invalid wire metadata: %s", raw)
 				}
-				participants, ok := findMsg[SessionParticipants](conn.messages())
-				if !ok || len(participants.Participants) != 1 {
-					t.Fatalf("%s participants = %+v", name, participants)
-				}
+				participants := waitRoster(t, conn, 1, 0)
 				entry := participants.Participants[0]
 				if entry.SessionID != sess.Id || entry.TechnicianID != wantTechnician || entry.Access != wantAccess {
 					t.Fatalf("%s participant = %+v", name, entry)

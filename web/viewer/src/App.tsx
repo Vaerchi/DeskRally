@@ -48,6 +48,7 @@ import { RecordingsPanel } from "./components/RecordingsPanel";
 import { PlatformPanel } from "./components/PlatformPanel";
 import { ToolboxPanel } from "./components/ToolboxPanel";
 import { BrokeredSessionCore } from "./lib/brokered_session_core";
+import { RunReceiptSession } from "./lib/run_receipt_relay";
 import { runToolboxScript } from "./lib/toolbox_run";
 import { TenantSecurityPanel } from "./components/TenantSecurityPanel";
 import { DynamicGroupsPanel } from "./components/DynamicGroupsPanel";
@@ -56,6 +57,8 @@ import { MachineGroupsPanel } from "./components/MachineGroupsPanel";
 import { APITokensPanel } from "./components/APITokensPanel";
 import { EnrollmentTokensPanel } from "./components/EnrollmentTokensPanel";
 import { WebhooksPanel } from "./components/WebhooksPanel";
+import { FieldsPanel } from "./components/FieldsPanel";
+import type { MeCapability } from "./lib/fleet_directives";
 import { AppearancePanel } from "./components/AppearancePanel";
 import { UsersPanel } from "./components/UsersPanel";
 import { RolesPanel } from "./components/RolesPanel";
@@ -97,6 +100,8 @@ import {
   type AdminRightsModel,
 } from "./lib/admin_rights";
 import { InputControlBadge, InputHandoffControl } from "./components/InputHandoffControl";
+import { SessionParticipants } from "./components/SessionParticipants";
+import { acceptParticipantSnapshot } from "./lib/participants";
 import {
   HAND_PENDING_TIMEOUT_MS,
   NO_INPUT_HANDOFF,
@@ -418,6 +423,7 @@ export default function App() {
   const [grantResumeNotice, setGrantResumeNotice] = useState<string | null>(null);
   // docs/58 §2: the Backstage features THIS session's agent reported (asked for after GrantInstalled).
   // Empty until it answers; an agent too old to know the question never does.
+  const runReceiptsRef = useRef<RunReceiptSession | null>(null);
   const [backstageFeatures, setBackstageFeatures] = useState<ReadonlySet<string>>(new Set());
   // docs/58 §3: the session client may send a confirmed retry only once this session's agent has
   // advertised `confirm`. A new session builds a new client, which starts without it.
@@ -830,7 +836,8 @@ export default function App() {
   const [recordingsAllowed, setRecordingsAllowed] = useState(false);
   // Menu redesign wave 5: the capabilities GET /me reported, or null while unknown (not answered yet, or an older server
   // without the list). Unknown hides nothing; see lib/area_visibility.ts.
-  const [heldCaps, setHeldCaps] = useState<ReadonlySet<string> | null>(null);
+  const [capabilityScopes, setCapabilityScopes] = useState<MeCapability[]>([]);
+  const heldCaps = useMemo(() => heldCapabilities(capabilityScopes), [capabilityScopes]);
   // A recording opened from a session-history row (the Recordings area plays it on arrival).
   const [openRecordingId, setOpenRecordingId] = useState<string | null>(null);
   useEffect(() => {
@@ -856,12 +863,12 @@ export default function App() {
   // An area the user's capabilities rule out (a deep link, or capabilities that changed) falls back to Live, like the
   // platform and recordings probes above.
   useEffect(() => {
-    if (!areaVisible(area, heldCaps)) setArea("live");
-  }, [heldCaps, area]);
+    if (!areaVisible(area, heldCaps, capabilityScopes)) setArea("live");
+  }, [heldCaps, area, capabilityScopes]);
   const visibleAreas = useMemo(
     () => CONSOLE_AREAS.filter((a) => (a.id !== "platform" || platformOperator) && (a.id !== "recordings" || recordingsAllowed)
-      && areaVisible(a.id, heldCaps)),
-    [platformOperator, recordingsAllowed, heldCaps],
+      && areaVisible(a.id, heldCaps, capabilityScopes)),
+    [platformOperator, recordingsAllowed, heldCaps, capabilityScopes],
   );
   // Menu redesign wave 10: the active page's siblings, drawn as tabs above it (History: Sessions | Audit ...).
   const areaSubtabsHere = useMemo(() => areaSubtabs(visibleAreas, area), [visibleAreas, area]);
@@ -881,12 +888,12 @@ export default function App() {
       (me) => {
         if (!cancelled && authSession.isCurrent(epoch)) {
           setSignedInAs(me.email);
-          setHeldCaps(heldCapabilities(me.capabilities));
+          setCapabilityScopes(me.capabilities ?? []);
           setAccessEnded(me.accessExpired ? { at: me.accessExpiresAt } : null);
           setOutsideHours(!me.accessExpired && me.accessOutsideWindow ? { window: me.accessWindow } : null);
         }
       },
-      () => { if (!cancelled) { setSignedInAs(null); setHeldCaps(null); setAccessEnded(null); setOutsideHours(null); } },
+      () => { if (!cancelled) { setSignedInAs(null); setCapabilityScopes([]); setAccessEnded(null); setOutsideHours(null); } },
     );
     return () => {
       cancelled = true;
@@ -1292,6 +1299,7 @@ export default function App() {
     setBrowseUploads([]);
     setPendingDownloads([]);
     setGrantInstalled(false);
+    runReceiptsRef.current = null;
     setBackstageFeatures(new Set());
     setGrantCapabilities(null);
     agentTransferDirRef.current = undefined;
@@ -1466,7 +1474,14 @@ export default function App() {
       // off the ref would leave the agent chaining a trail nothing ever forwards.
       openSessionAuditForwarder(auditSessionIdFor(brokered));
 
-      const signaling = new SignalingClient(brokered?.signaling.url ?? signalingUrl);
+      let participantRevision: number | undefined;
+      const signaling = new SignalingClient(brokered?.signaling.url ?? signalingUrl, () => {
+        if (!isCurrent() || participantRevision === undefined) return;
+        setParticipants([]);
+        setSessionParticipantCount(0);
+        setSessionObserverCount(0);
+        setOwnSignalingId(null);
+      });
       signalingRef.current = signaling;
       try {
         await signaling.open();
@@ -1509,7 +1524,8 @@ export default function App() {
           if (msg.type === "session_participants") {
             // Guard: only update for the machine we connected to. The signaling server may push
             // participant lists for multiple devices on the same connection (future multiplexing).
-            if (msg.device_id !== device) return;
+            if (msg.device_id !== device || !acceptParticipantSnapshot(msg, ownSignalingSessionId, participantRevision)) return;
+            participantRevision = msg.revision ?? participantRevision;
             // Filter ourselves out using the SIGNALING session id (not the CP record id). When
             // no signaling session id is known yet (direct-connect path or brokered arrives after
             // first push) include all participants — a transient over-count is safer than a
@@ -1615,6 +1631,9 @@ export default function App() {
 
       // Control client: monitor enumeration/selection over ChannelId.Control. Its `send` frames onto
       // the transport we are about to build (closure captures the ref).
+      const api = consoleApiRef.current;
+      const runReceipts = new RunReceiptSession((receipt, signal) => api.postRunReceipt(receipt, signal));
+      runReceiptsRef.current = runReceipts;
       const control = new ControlClient(
         (payload) => transportRef.current?.send(ChannelId.Control, payload),
         {
@@ -1722,7 +1741,11 @@ export default function App() {
             // docs/58 §2: ask what this agent's Backstage understands; offer nothing new until it says.
             controlRef.current?.requestBackstageFeatures();
           },
-          onBackstageFeatures: (features) => setBackstageFeatures(new Set(features)),
+          onBackstageFeatures: (features) => {
+            runReceipts.setFeatures(features);
+            setBackstageFeatures(new Set(features));
+          },
+          onRunReceipt: (receipt) => runReceipts.receive(receipt),
           // M11: the agent answered, so it speaks quality — cancel the probe timer and adopt the
           // settings it reports are in force (which may be a clamped or policy-capped version of
           // what was asked for; this reply is the only truth about that).
@@ -2088,7 +2111,7 @@ export default function App() {
       }
 
       try {
-        await transport.connect(device, brokered?.signaling.ticket);
+        await transport.connect(device, brokered?.signaling.ticket, brokered?.signaling.name_attestation);
         if (!isCurrent()) { transport.close(); signaling.close(); return; }
         // docs/69: bind this connection to the machine's key. BindStart goes FIRST: an enforcing agent
         // processes it at once and holds everything after it (the policy, the monitor list request...)
@@ -2765,7 +2788,10 @@ export default function App() {
     const outcome = await runToolboxScript(item, {
       api: consoleApiRef.current,
       currentSessionId: () => brokeredSessionRef.current,
-      sendRunCommand: (command, shell, asUser) => controlRef.current?.runCommand(command, shell, asUser),
+      sendRunCommand: (command, shell, asUser, requestId) => {
+        const control = controlRef.current;
+        if (control) runReceiptsRef.current?.dispatch(control, command, shell, asUser, requestId);
+      },
       isCurrent: () => commandOpSeq.current === op && brokeredSessionRef.current === sessionAtStart,
     });
     if (!outcome.sent && !outcome.stale) {
@@ -3176,9 +3202,18 @@ export default function App() {
             <option value="screen">Screen</option><option value="backstage">Under the Hood</option>
             <option value="files">Files</option><option value="chat">Chat</option>
           </select>
-          <ToolbarMenu label="Session" onOpenChange={setSessionMenuOpen}>
+          <ToolbarMenu label="Session" onOpenChange={setSessionMenuOpen} sectionTrigger={sessionParticipantCount > 0 ? {
+            sectionTestId: "session-menu-participants",
+            className: "app__participants",
+            title: "Other technicians connected to this machine",
+            testId: "session-participants",
+            content: <>{sessionParticipantCount} co-tech{sessionParticipantCount !== 1 ? "s" : ""}{sessionObserverCount > 0 && ` · ${sessionObserverCount} observing`}</>,
+          } : undefined}>
             {/* Menu redesign wave 7: the machine and connection state first, then labelled sections. */}
             <span className="menu-section__identity" data-testid="session-menu-identity">{session.name} · {state}</span>
+            <MenuSection title="Participants" testId="session-menu-participants" focusable>
+              <SessionParticipants participants={participants} ownSessionId={ownSignalingId} input={inputHandoff} />
+            </MenuSection>
             <MenuSection title="Clipboard" testId="session-menu-clipboard">
             {!viewerPoppedOut && <ClipboardControl client={observing ? undefined : clipboardClient ?? undefined} notice={clipboardNotice} />}
             </MenuSection>
@@ -3235,9 +3270,6 @@ export default function App() {
               )}
             </MenuSection>
           </ToolbarMenu>
-            {sessionParticipantCount > 0 && <span className="app__participants" title="Other technicians connected to this machine" data-testid="session-participants">
-              {sessionParticipantCount} co-tech{sessionParticipantCount !== 1 ? "s" : ""}{sessionObserverCount > 0 && ` · ${sessionObserverCount} observing`}
-            </span>}
             {observing && <span data-testid="observing-badge">Observing · view only</span>}
             <InputControlBadge model={inputHandoff} observing={observing} ownSessionId={ownSignalingId}
               participants={participants} />
@@ -3358,6 +3390,9 @@ export default function App() {
           {area === "apitokens" && <APITokensPanel api={consoleApiRef.current} />}
           {area === "enrollment" && <EnrollmentTokensPanel api={consoleApiRef.current} />}
           {area === "webhooks" && <WebhooksPanel api={consoleApiRef.current} />}
+          {area === "fields" && areaVisible(area, heldCaps, capabilityScopes) && (
+            <FieldsPanel api={consoleApiRef.current} canViewMachines={heldCaps?.has("view_machines") === true} />
+          )}
           {area === "appearance" && (
             <AppearancePanel api={consoleApiRef.current} onSaved={applyBranding} />
           )}

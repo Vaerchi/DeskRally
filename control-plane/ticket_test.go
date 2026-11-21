@@ -92,6 +92,9 @@ func TestStartSessionReturnsVerifiableTicket(t *testing.T) {
 	}
 	srv.Grants = iss
 	srv.SignalingURL = "ws://signal.example:8080/ws"
+	users := NewInMemoryUserStore()
+	users.AddUser(&AuthUser{ID: p.UserID, TenantID: p.TenantID, DisplayName: "Ada"}, p.Grant)
+	srv.AuthAPI = &AuthService{Users: users}
 
 	if code := apiJSON(t, srv, "POST", "/enroll", `{"machine_id":"dev-1","group_id":"g1"}`, nil); code != http.StatusCreated {
 		t.Fatalf("enroll = %d", code)
@@ -99,10 +102,11 @@ func TestStartSessionReturnsVerifiableTicket(t *testing.T) {
 	var started struct {
 		Session   SessionRecord `json:"session"`
 		Signaling struct {
-			URL       string              `json:"url"`
-			DeviceID  string              `json:"device_id"`
-			SessionID string              `json:"session_id"`
-			Ticket    SignedSessionTicket `json:"ticket"`
+			URL             string              `json:"url"`
+			DeviceID        string              `json:"device_id"`
+			SessionID       string              `json:"session_id"`
+			Ticket          SignedSessionTicket `json:"ticket"`
+			NameAttestation *nameAttestation    `json:"name_attestation"`
 		} `json:"signaling"`
 	}
 	if code := apiJSON(t, srv, "POST", "/sessions", `{"machine_id":"dev-1"}`, &started); code != http.StatusCreated {
@@ -118,6 +122,10 @@ func TestStartSessionReturnsVerifiableTicket(t *testing.T) {
 	}
 
 	c := sig.Ticket.Claims
+	if a := sig.NameAttestation; a == nil || a.Claims.DisplayName != "Ada" ||
+		a.Claims.SessionID != c.SessionID || a.Claims.TechnicianID != c.TechnicianID || a.Claims.ExpiresAtMs != c.ExpiresAtMs {
+		t.Fatal("managed control response lacks the matching name attestation")
+	}
 	if c.V != 1 || c.SessionID != started.Session.ID || c.TechnicianID != techUserUUID ||
 		c.TenantID != "tenant-123" || c.DeviceID != "dev-1" {
 		t.Fatalf("ticket claims = %+v", c)

@@ -17,7 +17,7 @@ import { AdoptionSection } from "./AdoptionSection";
 import { RecordingPolicySection } from "./RecordingPolicySection";
 import { allowlistEmptyStateText } from "../lib/console_panels";
 import { createLatestWins } from "../lib/latest_wins";
-import { parseSessionPolicyInput } from "../lib/session_policy_input";
+import { defaultIdleMinutes, MAX_DEFAULT_IDLE_MINUTES, parseDefaultIdleMinutes, parseSessionPolicyInput } from "../lib/session_policy_input";
 import { sessionLimitControlsDisabled, twoFactorControlState } from "../lib/tenant_security_view";
 
 export interface TenantSecurityPanelProps {
@@ -32,13 +32,14 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
   const [cidr, setCidr] = useState("");
   const [saving, setSaving] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
-  // Session policy (docs/01 §5 seat metering): a concurrency cap + a max session age, saved together.
+  // Session policy: the concurrency cap, max session age, and default idle timeout are saved together.
   // saved* are the stored values; *Input are the editable fields. limitError is separate from the
   // allow-list error so each section reports its own.
   const [savedLimit, setSavedLimit] = useState<number | null>(null);
   const [limitInput, setLimitInput] = useState("");
   const [savedMaxAge, setSavedMaxAge] = useState<number | null>(null);
   const [maxAgeInput, setMaxAgeInput] = useState("");
+  const [idleInput, setIdleInput] = useState("");
   const [savingLimit, setSavingLimit] = useState(false);
   const [limitError, setLimitError] = useState<string | null>(null);
   // Tri-state: null = not yet read (or the read failed); only a successful read/save makes it a boolean.
@@ -92,6 +93,7 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
           setLimitInput(String(policy.max_concurrent_sessions));
           setSavedMaxAge(policy.max_session_seconds);
           setMaxAgeInput(String(policy.max_session_seconds));
+          setIdleInput(defaultIdleMinutes(policy.default_max_idle_seconds ?? 0));
           setSessionBinding(policy.session_binding ?? "warn");
         }
       } catch (e) {
@@ -148,17 +150,23 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
         setLimitError(parsed.error);
         return;
       }
+      const idleSeconds = parseDefaultIdleMinutes(idleInput);
+      if (idleSeconds === null) {
+        setLimitError("Enter 0 to 60 minutes in increments of one second.");
+        return;
+      }
       setSavingLimit(true);
       setLimitError(null);
       policyWins.current.invalidate();
       try {
-        const saved = await api.setSessionPolicy(parsed.value);
+        const saved = await api.setSessionPolicy({ ...parsed.value, default_max_idle_seconds: idleSeconds });
         // Apply the confirmed echo under a fresh token: any read begun while the PUT was in flight is stale.
         policyWins.current.begin();
         setSavedLimit(saved.max_concurrent_sessions);
         setLimitInput(String(saved.max_concurrent_sessions));
         setSavedMaxAge(saved.max_session_seconds);
         setMaxAgeInput(String(saved.max_session_seconds));
+        setIdleInput(defaultIdleMinutes(saved.default_max_idle_seconds ?? 0));
         setSessionBinding(saved.session_binding ?? "warn");
       } catch (err) {
         setLimitError(err instanceof Error ? err.message : String(err));
@@ -166,7 +174,7 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
         setSavingLimit(false);
       }
     },
-    [api, limitInput, maxAgeInput],
+    [api, limitInput, maxAgeInput, idleInput],
   );
 
   // Sends the SAVED limits with the mode: the PUT replaces the whole policy, so the toggle must not reset them.
@@ -187,6 +195,7 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
         setLimitInput(String(saved.max_concurrent_sessions));
         setSavedMaxAge(saved.max_session_seconds);
         setMaxAgeInput(String(saved.max_session_seconds));
+        setIdleInput(defaultIdleMinutes(saved.default_max_idle_seconds ?? 0));
         setSessionBinding(saved.session_binding ?? "warn");
       } catch (err) {
         setLimitError(err instanceof Error ? err.message : String(err));
@@ -269,6 +278,24 @@ export function TenantSecurityPanel({ api }: TenantSecurityPanelProps) {
             data-testid="session-maxage-input"
           />
         </label>
+        <label className="panel__toolbar-field">
+          Default idle timeout (minutes, 0 = off)
+          <input
+            type="number"
+            min={0}
+            max={MAX_DEFAULT_IDLE_MINUTES}
+            step="any"
+            required
+            value={idleInput}
+            onChange={(e) => setIdleInput(e.target.value)}
+            disabled={limitControlsDisabled}
+            aria-describedby="session-default-idle-help"
+            data-testid="session-default-idle-input"
+          />
+        </label>
+        <span className="panel__toolbar-note" id="session-default-idle-help">
+          Ends a session after this many minutes with no keyboard or mouse input from the technician. Applies to every machine group that has no idle timeout of its own.
+        </span>
         <button className="panel__action" type="submit" disabled={limitControlsDisabled} data-testid="session-limit-save">
           {savingLimit ? "Saving…" : "Save"}
         </button>

@@ -32,6 +32,7 @@ func applyFleetDirectiveMigration(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatalf("read 0068: %v", err)
 	}
 	execScript(t, pool, string(b))
+	applyLatestIdentityFunction(t, pool)
 }
 
 // dirAuth resolves the grant from the user store on EVERY request (a role change mid-test is seen by the
@@ -136,9 +137,9 @@ type dirHarness struct {
 	// failAuditAction refuses only the audit rows of one action ("" clears it): the way to fail a LATER append of
 	// a multi-row transition, which failAudit (every append) cannot.
 	failAuditAction func(action string)
-	setCaps      func(uninstallPerHour, reinstallPerDay int)
-	rawSQL       func(sql string, args ...any) // pg only
-	su, app      *pgxpool.Pool                 // pg only
+	setCaps         func(uninstallPerHour, reinstallPerDay int)
+	rawSQL          func(sql string, args ...any) // pg only
+	su, app         *pgxpool.Pool                 // pg only
 
 	sess    map[string]*Session
 	srvs    map[string]*Server
@@ -259,7 +260,8 @@ func newPgDirHarness(t *testing.T) *dirHarness {
 	applyAttendedMigration(t, su)            // 0013 (+ later attended migrations)
 	applyEnrollmentMigration(t, su)          // 0007
 	applyEnrollmentTenantActiveMigration(t, su)
-	applyFleetDirectiveMigration(t, su) // 0068, last: it redefines the identity function
+	applyFleetDirectiveMigration(t, su) // 0068
+	applyMigrationFile(t, su, "migrations/0084_wake_on_lan.sql")
 	applyMigrationFile(t, su, "migrations/0070_directive_final_ack.sql")
 	applyMigrationFile(t, su, "migrations/0073_directive_forgotten.sql") // the 'forgotten' state (docs/65 sec. 8)
 	h := &dirHarness{t: t, pg: true, su: su}

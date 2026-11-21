@@ -110,19 +110,19 @@ func serve(srv *Server, method, path, body string) *httptest.ResponseRecorder {
 }
 
 // oversizedBody builds a syntactically valid JSON object whose named field carries the marker
-// followed by enough padding to exceed maxSmallJSONBodyBytes. The field name is the one the route's
+// followed by enough padding to exceed the route's limit. The field name is the one the route's
 // own request struct reads, so a handler that buffered the whole thing would have STORED the marker
 // rather than merely seen it — which is what the stored-state assertions below look for.
-func oversizedBody(field string) string {
-	return `{"` + field + `":"` + blMarker + strings.Repeat("A", maxSmallJSONBodyBytes+1024) + `"}`
+func oversizedBody(field string, limit int) string {
+	return `{"` + field + `":"` + blMarker + strings.Repeat("A", limit+1024) + `"}`
 }
 
-// atLimitBody builds a body of EXACTLY maxSmallJSONBodyBytes: the route's real fields, plus an
+// atLimitBody builds a body of exactly the route's limit: the route's real fields, plus an
 // ignored "_pad" string sized to hit the boundary from below. No handler in this package uses
 // DisallowUnknownFields, so the padding decodes away and only the real fields are seen. Exactly at
 // the limit must be ACCEPTED — http.MaxBytesReader fails on byte maxBytes+1 — so this is the
 // off-by-one test as well as the negative control.
-func atLimitBody(t *testing.T, fields string) string {
+func atLimitBody(t *testing.T, fields string, limit int) string {
 	t.Helper()
 	prefix := `{"_pad":"`
 	suffix := `"`
@@ -130,13 +130,13 @@ func atLimitBody(t *testing.T, fields string) string {
 		suffix += "," + fields
 	}
 	suffix += "}"
-	pad := maxSmallJSONBodyBytes - len(prefix) - len(suffix)
+	pad := limit - len(prefix) - len(suffix)
 	if pad < 0 {
 		t.Fatalf("fields %q do not fit the limit", fields)
 	}
 	body := prefix + strings.Repeat("a", pad) + suffix
-	if len(body) != maxSmallJSONBodyBytes {
-		t.Fatalf("padded body is %d bytes, want exactly %d", len(body), maxSmallJSONBodyBytes)
+	if len(body) != limit {
+		t.Fatalf("padded body is %d bytes, want exactly %d", len(body), limit)
 	}
 	return body
 }
@@ -152,6 +152,13 @@ type blRoute struct {
 	overField   string // the request struct's own string field, for the oversized payload
 	okFields    string // valid JSON members for the at-limit body
 	wantAtLimit int
+}
+
+func (rt blRoute) bodyLimit() int {
+	if rt.path == "/dynamic-groups" {
+		return maxDynamicGroupJSONBodyBytes
+	}
+	return maxSmallJSONBodyBytes
 }
 
 // blRoutes is the finding's full list. A new handler that decodes a body belongs here; one that is
@@ -196,7 +203,8 @@ func TestOverLimitBodyIsRejectedWithoutBuffering(t *testing.T) {
 	for _, rt := range blRoutes() {
 		t.Run(rt.name, func(t *testing.T) {
 			srv := newBodyLimitServer(t, RoleOwner)
-			body := oversizedBody(rt.overField)
+			limit := rt.bodyLimit()
+			body := oversizedBody(rt.overField, limit)
 			rec, read := serveCounted(srv, rt.method, rt.path, body)
 
 			if rec.Code != http.StatusRequestEntityTooLarge {
@@ -206,9 +214,9 @@ func TestOverLimitBodyIsRejectedWithoutBuffering(t *testing.T) {
 			// http.MaxBytesReader reads at most limit+1 bytes from the underlying reader: one byte
 			// past the limit is what proves the limit was passed. Anything beyond that means the
 			// handler buffered client-controlled data while holding the pinned tenant connection.
-			if read > int64(maxSmallJSONBodyBytes)+1 {
+			if read > int64(limit)+1 {
 				t.Fatalf("%s %s read %d bytes of a %d-byte body, want at most %d — the body was buffered",
-					rt.method, rt.path, read, len(body), maxSmallJSONBodyBytes+1)
+					rt.method, rt.path, read, len(body), limit+1)
 			}
 			if read >= int64(len(body)) {
 				t.Fatalf("%s %s consumed the entire %d-byte body", rt.method, rt.path, len(body))
@@ -231,7 +239,7 @@ func TestOverLimitBodyIsRejectedWithoutBuffering(t *testing.T) {
 func TestOverLimitBodyIsNeverStored(t *testing.T) {
 	srv := newBodyLimitServer(t, RoleOwner)
 
-	if rec := serve(srv, "PUT", "/machines/"+blMachineID+"/properties/site", oversizedBody("value")); rec.Code != http.StatusRequestEntityTooLarge {
+	if rec := serve(srv, "PUT", "/machines/"+blMachineID+"/properties/site", oversizedBody("value", maxSmallJSONBodyBytes)); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("PUT property = %d, want 413 (%s)", rec.Code, rec.Body.String())
 	}
 	props, err := srv.MachineProperties.ListProperties(context.Background(), blTenantID, blMachineID)
@@ -247,7 +255,7 @@ func TestOverLimitBodyIsNeverStored(t *testing.T) {
 		t.Fatalf("a refused request wrote %d properties, want 0", len(props))
 	}
 
-	if rec := serve(srv, "POST", "/platform/tenants", oversizedBody("name")); rec.Code != http.StatusRequestEntityTooLarge {
+	if rec := serve(srv, "POST", "/platform/tenants", oversizedBody("name", maxSmallJSONBodyBytes)); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("POST /platform/tenants = %d, want 413 (%s)", rec.Code, rec.Body.String())
 	}
 	tenants, err := srv.Tenants.ListTenants(context.Background(), blTenantID)
@@ -273,7 +281,7 @@ func TestOverLimitBodyIsNeverStored(t *testing.T) {
 // later) is an acceptable answer; buffering the whole body is not.
 func TestReadOnlyPrincipalCannotForceLargeBufferOnStartSession(t *testing.T) {
 	srv := newBodyLimitServer(t, RoleReadOnly)
-	body := oversizedBody("machine_id")
+	body := oversizedBody("machine_id", maxSmallJSONBodyBytes)
 	rec, read := serveCounted(srv, "POST", "/sessions", body)
 
 	if rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusForbidden {
@@ -293,14 +301,14 @@ func TestReadOnlyPrincipalCannotForceLargeBufferOnStartSession(t *testing.T) {
 }
 
 // TestAtLimitBodyStillAccepted is the NEGATIVE CONTROL, and the reason the rest of this file is
-// evidence rather than a constant. A body of exactly maxSmallJSONBodyBytes is legal and must still
+// evidence rather than a constant. A body of exactly the route's limit is legal and must still
 // reach the handler and succeed; a helper that refused everything, or one whose comparison was off
 // by one at the boundary, passes every other test here and fails this one.
 func TestAtLimitBodyStillAccepted(t *testing.T) {
 	for _, rt := range blRoutes() {
 		t.Run(rt.name, func(t *testing.T) {
 			srv := newBodyLimitServer(t, RoleOwner)
-			body := atLimitBody(t, rt.okFields)
+			body := atLimitBody(t, rt.okFields, rt.bodyLimit())
 			rec := serve(srv, rt.method, rt.path, body)
 			if rec.Code != rt.wantAtLimit {
 				t.Fatalf("%s %s with a body of exactly %d bytes = %d, want %d (%s)",

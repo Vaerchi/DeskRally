@@ -62,7 +62,8 @@ type DeviceIdentity struct {
 	// "quarantined" or "retired". Empty (an older control plane) is treated as active. A "retired"
 	// identity is only ever answered because signaling sends restricted=1; such a connection gets
 	// the RESTRICTED channel (docs/65 D-C1): directives only, never brokered, never present.
-	Status string `json:"status"`
+	Status    string `json:"status"`
+	Ephemeral *bool  `json:"ephemeral"`
 }
 
 // identityStatusRetired is the Status that selects restricted registration.

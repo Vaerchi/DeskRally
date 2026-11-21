@@ -81,6 +81,23 @@ test.afterAll(async () => {
   await stopProc(cpProc);
 });
 
+// First run (deployment feedback 11-20): a tenant with NO machine group gets a one-click "Default" group in the
+// Install panel, which then selects it. Runs FIRST in this file, while the dev control plane has no groups.
+test("a tenant with no machine groups can create a Default group from the Install panel", async () => {
+  test.skip(skipReason !== null, skipReason ?? "");
+  const page = await browser!.newPage();
+  await page.goto(APP_URL);
+  await (await consoleTab(page, { name: "Install DeskRally" })).click();
+  await expect(page.getByTestId("enrollment-tokens")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("enroll-no-groups")).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId("enroll-create-default-group").click();
+  await expect(page.getByTestId("enroll-no-groups")).toHaveCount(0, { timeout: 15_000 });
+  const picker = page.getByTestId("enroll-group");
+  await expect(picker).toBeEnabled();
+  await expect(picker.locator("option:checked")).toHaveText("Default");
+  await page.close();
+});
+
 test("operator mints, inspects, and revokes an enrollment token", async () => {
   test.skip(skipReason !== null, skipReason ?? "");
   const page = await browser!.newPage();

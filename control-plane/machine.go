@@ -88,6 +88,7 @@ var ErrMachineDeviceIDTaken = errors.New("device_id already enrolled")
 // finds no row, so a legitimately enrolled machine fails to mint. GetMachine therefore looks up
 // by DeviceID; GetMachineByID looks up by the PK for the REST read path.
 type Machine struct {
+	Wake     string `json:"wake,omitempty"`
 	ID       string `json:"id"` // database primary key (machine.id)
 	TenantID string `json:"tenant_id"`
 	DeviceID string `json:"device_id"` // stable agent identity (machine.device_id)
@@ -198,7 +199,8 @@ type DeviceIdentity struct {
 	Pubkey   string `json:"pubkey"` // lowercase hex, 64 chars
 	// Status is the machine's lifecycle state (docs/65 D-C1). 'retired' machines resolve only for a
 	// caller that asked for the RESTRICTED mode (GET .../identity?restricted=1); 'removed' never resolves.
-	Status string `json:"status"`
+	Status    string `json:"status"`
+	Ephemeral bool   `json:"ephemeral"`
 }
 
 // MachineStore is the persistence seam for machines. Production wires PgMachineStore (RLS-scoped
@@ -324,6 +326,11 @@ type InMemoryMachineStore struct {
 	mu       sync.Mutex
 	machines map[string]*Machine // key: tenantID + "\x00" + deviceID
 
+	// Serialized with machine status and identity changes by mu.
+	lanIncarnation string
+	lanRevision    int64
+	lanStates      map[string]memoryLanState
+
 	// permissive + defaultGroupID together implement the DEV-only unknown-machine fallback.
 	permissive     bool
 	defaultGroupID string
@@ -393,6 +400,10 @@ func (s *InMemoryMachineStore) GetMachine(_ context.Context, tenantID, deviceID 
 func (s *InMemoryMachineStore) GetMachineByID(_ context.Context, tenantID, id string) (*Machine, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.getMachineByIDLocked(tenantID, id)
+}
+
+func (s *InMemoryMachineStore) getMachineByIDLocked(tenantID, id string) (*Machine, error) {
 	for _, m := range s.machines {
 		if m.TenantID == tenantID && m.ID == id {
 			cp := *m
@@ -505,7 +516,7 @@ func (s *InMemoryMachineStore) LookupDeviceIdentity(_ context.Context, deviceID 
 		if status == "" {
 			status = MachineStatusActive
 		}
-		return &DeviceIdentity{DeviceID: m.DeviceID, TenantID: m.TenantID, Pubkey: m.Pubkey, Status: status}, nil
+		return &DeviceIdentity{DeviceID: m.DeviceID, TenantID: m.TenantID, Pubkey: m.Pubkey, Status: status, Ephemeral: m.Ephemeral}, nil
 	}
 	return nil, ErrMachineNotFound
 }
@@ -536,6 +547,7 @@ func (s *InMemoryMachineStore) tombstone(tenantID, machineID string) {
 	for _, m := range s.machines {
 		if m.TenantID == tenantID && m.ID == machineID {
 			m.Status = MachineStatusRemoved
+			delete(s.lanStates, machineID)
 		}
 	}
 }

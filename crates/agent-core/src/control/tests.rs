@@ -110,6 +110,7 @@ fn command_frames(command: &str) -> Vec<(&'static str, Vec<u8>)> {
                 command: command.into(),
                 shell: CommandShell::Cmd,
                 as_user: false,
+                request_id: None,
             }),
         ),
         (
@@ -963,6 +964,7 @@ fn run_command_round_trips() {
             command: "whoami".into(),
             shell: CommandShell::Cmd,
             as_user: false,
+            request_id: None,
         },
         r#"{"t":"RunCommand","c":{"command":"whoami","shell":"Cmd","as_user":false}}"#,
     );
@@ -971,6 +973,7 @@ fn run_command_round_trips() {
             command: "Get-Date".into(),
             shell: CommandShell::PowerShell,
             as_user: true,
+            request_id: None,
         },
         r#"{"t":"RunCommand","c":{"command":"Get-Date","shell":"PowerShell","as_user":true}}"#,
     );
@@ -1552,4 +1555,47 @@ fn binding_messages_observer_rules() {
     assert_eq!(observer_rule(&ControlMessage::BindConsoleProof { sig: sig.clone() }), ObserverRule::Allow);
     assert_eq!(observer_rule(&ControlMessage::BindAgentProof { agent_nonce: nonce, sig }), ObserverRule::Refuse);
     assert_eq!(observer_rule(&ControlMessage::BindResult { ok: true, reason: None }), ObserverRule::Refuse);
+}
+
+#[test]
+fn run_receipt_wire_keeps_legacy_dispatch_and_uses_flat_signed_claims() {
+    let request = "24242424-2424-4424-8424-242424242424";
+    let legacy = br#"{"t":"RunCommand","c":{"command":"echo hi","shell":"Cmd","as_user":false,"future":true}}"#;
+    assert!(matches!(decode(legacy).unwrap(), ControlMessage::RunCommand { request_id: None, .. }));
+    round_trip(
+        ControlMessage::RunCommand {
+            command: "echo hi".into(),
+            shell: CommandShell::Cmd,
+            as_user: false,
+            request_id: Some(request.into()),
+        },
+        r#"{"t":"RunCommand","c":{"command":"echo hi","shell":"Cmd","as_user":false,"request_id":"24242424-2424-4424-8424-242424242424"}}"#,
+    );
+
+    let signed = serde_json::json!({
+        "claims": {
+            "tenant_id": request,
+            "device_id": "device",
+            "session_id": request,
+            "request_id": request,
+            "shell": "cmd",
+            "run_as": "system",
+            "exec_sha256": "00".repeat(32),
+            "outcome": "start_failed",
+            "exit_code": null,
+            "truncated": false,
+            "finished_at_ms": 42
+        },
+        "sig": "ab".repeat(64)
+    });
+    let receipt = ControlMessage::RunReceipt {
+        receipt: serde_json::from_value(signed.clone()).unwrap(),
+    };
+    let encoded = encode(&receipt);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+        serde_json::json!({ "t": "RunReceipt", "c": signed }),
+    );
+    assert_eq!(decode(&encoded).unwrap(), receipt);
+    assert_eq!(observer_rule(&receipt), ObserverRule::Refuse);
 }

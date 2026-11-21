@@ -8,9 +8,8 @@ package controlplane
 //
 // AUTHORIZATION LIVES ABOVE THIS SEAM. A property store is a dumb, tenant-scoped key/value bag: it
 // does NOT resolve a machine's group or check capabilities, and — deliberately — does NOT itself
-// verify the machine exists. The HTTP handlers resolve the machine through MachineStore first (to
-// scope RBAC against the machine's REAL group, never a caller-supplied value), so by the time a
-// property method is called the machine is already known to exist in the tenant. The pg
+// verify the machine exists. The HTTP write paths instead use the transactional edit seam (to
+// scope RBAC against the machine's locked group and validate defined keys). The pg
 // implementation ADDITIONALLY rejects a property that names a machine outside the pinned tenant via
 // the composite FK (migrations/0024) — defense-in-depth for a path the handler already guards, and
 // what makes the direct-store RLS isolation test meaningful.
@@ -29,6 +28,16 @@ const (
 	maxMachinePropertyKeyLen   = 128
 	maxMachinePropertyValueLen = 4096
 )
+
+func validateMachinePropertyKey(key string) error {
+	switch {
+	case key == "":
+		return errors.New("key is required")
+	case len(key) > maxMachinePropertyKeyLen:
+		return errors.New("key is too long")
+	}
+	return nil
+}
 
 // ErrMachinePropertyNotFound is the sentinel returned when a delete names a key that is not present
 // (or a machine with no such property). Handlers translate it to a 404. A SET is an upsert and never
@@ -55,6 +64,8 @@ type MachinePropertyStore interface {
 	// an unknown machine here (the pg SELECT never consults the machine FK), so a handler wanting a
 	// 404 for a missing machine resolves it via GetMachineByID first.
 	ListProperties(ctx context.Context, tenantID, machineID string) ([]MachineProperty, error)
+	// ListPropertiesForMachines returns property bags for the requested machines with properties.
+	ListPropertiesForMachines(ctx context.Context, tenantID string, machineIDs []string) (map[string]map[string]string, error)
 	// SetProperty upserts one key/value on the machine within the tenant: a new key is inserted, an
 	// existing key's value replaced. It does not itself verify the machine exists (see the file doc);
 	// the pg implementation rejects a cross-tenant machine with ErrMachineNotFound via the composite
@@ -83,13 +94,15 @@ type MachinePropertyStore interface {
 // -------------------------------------------------------------------------------------
 
 type InMemoryMachinePropertyStore struct {
-	mu    sync.Mutex
-	props map[string]map[string]string // key: mpKey(tenantID, machineID) -> {propertyKey: value}
+	fieldsMu sync.RWMutex
+	fields   map[string]machineFieldList
+	mu       sync.Mutex
+	props    map[string]map[string]string // key: mpKey(tenantID, machineID) -> {propertyKey: value}
 }
 
 // NewInMemoryMachinePropertyStore constructs an empty in-memory property store.
 func NewInMemoryMachinePropertyStore() *InMemoryMachinePropertyStore {
-	return &InMemoryMachinePropertyStore{props: make(map[string]map[string]string)}
+	return &InMemoryMachinePropertyStore{props: make(map[string]map[string]string), fields: make(map[string]machineFieldList)}
 }
 
 var _ MachinePropertyStore = (*InMemoryMachinePropertyStore)(nil)
@@ -110,16 +123,37 @@ func (s *InMemoryMachinePropertyStore) ListProperties(_ context.Context, tenantI
 	return out, nil
 }
 
+func (s *InMemoryMachinePropertyStore) ListPropertiesForMachines(_ context.Context, tenantID string, machineIDs []string) (map[string]map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]map[string]string)
+	for _, id := range machineIDs {
+		bag := s.props[mpKey(tenantID, id)]
+		if len(bag) == 0 {
+			continue
+		}
+		copyBag := make(map[string]string, len(bag))
+		for key, value := range bag {
+			copyBag[key] = value
+		}
+		out[id] = copyBag
+	}
+	return out, nil
+}
+
 // SetProperty implements MachinePropertyStore: idempotent create-or-update of one key.
 func (s *InMemoryMachinePropertyStore) SetProperty(_ context.Context, tenantID, machineID, key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := mpKey(tenantID, machineID)
+	s.setPropertyLocked(mpKey(tenantID, machineID), key, value)
+	return nil
+}
+
+func (s *InMemoryMachinePropertyStore) setPropertyLocked(k, key, value string) {
 	if s.props[k] == nil {
 		s.props[k] = make(map[string]string)
 	}
 	s.props[k][key] = value
-	return nil
 }
 
 // DeleteProperty implements MachinePropertyStore: remove one key, ErrMachinePropertyNotFound when it

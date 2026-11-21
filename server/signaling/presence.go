@@ -23,6 +23,8 @@ package main
 //     reach an agent. Even with the token, the endpoint answers "which of these ids are up, what
 //     they claim to run and what build they claim to be", not "how do I get to them".
 //
+//     The feed also carries the wake_capable readiness flag.
+//
 //     THIS LIST IS AN ALLOWLIST, NOT A DESCRIPTION. Adding a field here is a deliberate amendment
 //     to the posture, and TestPresenceEndpointReturnsDeviceIdsOnly asserts the excluded values
 //     never appear in a response body. A build version is inventory a human reads, on exactly the
@@ -54,7 +56,9 @@ const presenceTokenMinLen = 32
 // PresenceEntry is one online agent: its device id, how long it has been continuously
 // registered, and its asserted os. Deliberately minimal — see the security note above.
 type PresenceEntry struct {
-	DeviceID string `json:"device_id"`
+	// WakeCapable reports relay readiness without exposing any connection or LAN data.
+	WakeCapable bool   `json:"wake_capable"`
+	DeviceID    string `json:"device_id"`
 	// LastSeenUnixMs is the registry's last heartbeat stamp for this agent.
 	LastSeenUnixMs int64 `json:"last_seen_unix_ms"`
 	// OS is the agent-asserted os description from register_agent (bounded at receipt; empty when
@@ -120,6 +124,7 @@ func (r *Registry) Snapshot() []PresenceEntry {
 		}
 		out = append(out, PresenceEntry{
 			DeviceID:              p.DeviceId,
+			WakeCapable:           r.wakeReadyLocked(p),
 			LastSeenUnixMs:        p.LastSeen.UnixMilli(),
 			OS:                    p.OS,
 			RequireSessionPolicy:  p.RequireSessionPolicy,

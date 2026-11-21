@@ -68,8 +68,8 @@ func TestDeviceIdentityLookup(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode raw: %v", err)
 	}
-	if len(raw) != 4 || raw["status"] != "active" { // docs/65: the status is the one new field
-		t.Fatalf("identity response has %d fields (%v), want exactly device_id/tenant_id/pubkey/status(active)", len(raw), raw)
+	if len(raw) != 5 || raw["status"] != "active" || raw["ephemeral"] != false {
+		t.Fatalf("identity response has %d fields (%v), want exactly device_id/tenant_id/pubkey/status(active)/ephemeral(false)", len(raw), raw)
 	}
 
 	// Auth failures — all the same opaque 401.

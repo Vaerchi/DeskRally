@@ -240,6 +240,9 @@ func (s *PgToolboxStore) RecordRun(ctx context.Context, tenantID, callerID, id s
 		}
 		run = &ToolboxRunRequest{RequestID: requestID, Item: *it, SessionID: sessionID, MachineID: machineID,
 			Command: ToolboxCommand(it.Shell, it.Body)}
+		if err := insertRunRecordTx(ctx, tx, tenantID, requestID, sessionID, machineID, it.Shell, it.RunAs, run.Command, it); err != nil {
+			return err
+		}
 		ev = &MgmtAuditEvent{ActorUserID: callerID, Action: "toolbox.run_requested", TargetKind: "session",
 			TargetID: sessionID, Metadata: toolboxAuditMeta(it, map[string]any{
 				"request_id": requestID, "session_id": sessionID, "machine_id": machineID,

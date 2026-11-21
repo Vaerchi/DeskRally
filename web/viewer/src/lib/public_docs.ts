@@ -7,6 +7,7 @@ import troubleshooting from "../../../../docs/connection-troubleshooting.md?raw"
 import configuration from "../../../../docs/guides/server-configuration.md?raw";
 import signing from "../../../../docs/guides/self-hosted-signing.md?raw";
 import environmentTemplate from "../../../../deploy/.env.example?raw";
+import wakeOnLan from "../../../../docs/guides/wake-on-lan.md?raw";
 
 export interface PublicDoc {
   id: string;
@@ -37,6 +38,8 @@ export const PUBLIC_DOCS: PublicDoc[] = [
     summary: "Encrypted database dumps, key and recording backups, restore commands, audit checks and recovery drills." },
   { id: "troubleshooting", title: "Connection troubleshooting", group: "Technical reference", source: "docs/connection-troubleshooting.md", text: troubleshooting,
     summary: "Interpret video counters, diagnose relay-credential limits and capture useful failure evidence." },
+  { id: "wake-on-lan", title: "Wake-on-LAN", group: "Technical reference", source: "docs/guides/wake-on-lan.md", text: wakeOnLan,
+    summary: "Check network requirements and verified power states for Wake-on-LAN." },
 ];
 
 export function findPublicDoc(id: string) {

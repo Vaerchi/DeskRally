@@ -16,6 +16,7 @@
 
 import type { APIToken, AuditActionCount, EnrollmentToken, MachineGroup, MachineRecord, MachineSessionCount, MgmtAuditEvent, SessionRecord, Tenant, TenantWebhook, UserSummary } from "./console_api";
 import type { SiteRow } from "./sites";
+import { machinePropertyValue } from "./machine_property_columns";
 
 import type { BulkRow } from "./bulk_types";
 
@@ -129,9 +130,13 @@ export function machineSessionsToCsv(rows: readonly MachineSessionCount[]): stri
  * that omits it, and `online` renders the tri-state `*bool` as online/offline/unknown (absent = unknown, NOT
  * offline — a presence-feed hiccup must not read as down). An empty fleet yields just the header row.
  */
-export function machinesToCsv(rows: readonly MachineRecord[]): string {
+export function machinesToCsv(
+  rows: readonly MachineRecord[],
+  propertyKeys: readonly string[] = [],
+  propertyLabels: ReadonlyMap<string, string> = new Map(),
+): string {
   const lines = [
-    "name,alias,device_id,group,status,os,online,last_seen,id",
+    ["name,alias,device_id,group,status,os,online,last_seen,id", ...propertyKeys.map((key) => csvTextField(propertyLabels.get(key) ?? key))].join(","),
     ...rows.map((m) =>
       [
         m.name,
@@ -143,6 +148,7 @@ export function machinesToCsv(rows: readonly MachineRecord[]): string {
         onlineLabel(m.online),
         m.last_seen ?? "",
         m.id,
+        ...propertyKeys.map((key) => machinePropertyValue(m, key)),
       ].map(csvTextField).join(","),
     ),
   ];

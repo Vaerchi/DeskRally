@@ -82,6 +82,7 @@ const (
 	// CapManageMachines, which an API token CAN hold, must never be enough to wipe a fleet. Group scope
 	// applies (AllowsInGroup on the machine's CURRENT group, docs/62 sec. 2a).
 	CapRemoveAgent Capability = "remove_agent"
+	CapWakeMachine Capability = "wake_machine"
 )
 
 // AllCapabilities is every capability the system defines, in a stable order. Used to expand
@@ -94,7 +95,7 @@ var AllCapabilities = []Capability{
 	CapViewAudit,
 	CapViewRecordings,
 	CapManageToolbox,
-	CapRemoveAgent,
+	CapRemoveAgent, CapWakeMachine,
 }
 
 // Role is a named capability preset. Keys match the preset `role.key` rows in
@@ -120,14 +121,14 @@ var rolePresets = map[Role][]Capability{
 		CapManageUsers, CapManageRoles, CapManageGroups,
 		CapViewMachines, CapManageMachines, CapDeployAgent, CapEnrollMachine, CapManageEnrollment,
 		CapStartSession, CapObserveSession, CapEndSession, CapBackstageShell, CapTransferFiles,
-		CapViewSessions, CapElevateSession, CapViewAudit, CapViewRecordings, CapManageToolbox,
+		CapViewSessions, CapElevateSession, CapViewAudit, CapViewRecordings, CapManageToolbox, CapWakeMachine,
 	},
 
 	// Technician does the actual remote-support work but administers nothing.
 	RoleTechnician: {
 		CapViewMachines, CapDeployAgent,
 		CapStartSession, CapObserveSession, CapEndSession, CapBackstageShell, CapTransferFiles,
-		CapViewSessions,
+		CapViewSessions, CapWakeMachine,
 	},
 
 	// ReadOnly can look but not act.

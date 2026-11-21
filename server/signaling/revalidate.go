@@ -82,6 +82,84 @@ func (r *Registry) registeredPeers() []*Peer {
 	return out
 }
 
+func (id *DeviceIdentity) installedActive() bool {
+	return id.Status == "active" && id.Ephemeral != nil && !*id.Ephemeral
+}
+
+// revalidateAgent uses the snapshot's device ID to look up identity. Registration and
+// revalidation hold the same identity gate from lookup through publication.
+func (s *Server) revalidateAgent(ctx context.Context, device string, timeout time.Duration,
+	resolve func(context.Context, string) (*DeviceIdentity, error),
+) (dropped, failed bool) {
+	unlock, ok := s.authLocks.acquire(device, timeout)
+	if !ok {
+		return false, true
+	}
+	defer unlock()
+	if ctx.Err() != nil {
+		return false, true
+	}
+	seq := s.reg.NextAuthSeq()
+	lctx, cancel := context.WithTimeout(ctx, timeout)
+	id, err := resolve(lctx, device)
+	cancel()
+	unknown := errors.Is(err, ErrDeviceUnknown)
+	if !unknown && (err != nil || id == nil) {
+		return false, true
+	}
+
+	// Let an in-flight write finish before publishing the verdict. The current peer
+	// may have replaced the one in the sweep snapshot before we took the identity gate.
+	r := s.reg
+	// Codex branch review r4: mark a negative verdict STICKY on the current peer BEFORE waiting on the delivery
+	// gate, so a forward that already holds the gate and waits for the WebSocket writer refuses at its final
+	// pre-write check. The identity gate held here serializes with registration, so the peer cannot change
+	// before the gated cleanup below.
+	negative := unknown || !id.installedActive()
+	r.mu.RLock()
+	cur := r.peers[device]
+	revoke := cur != nil && cur.authSeq < seq &&
+		(negative || id.TenantID != cur.Tenant || id.Pubkey != cur.Pubkey)
+	if revoke {
+		cur.wake.revoked.Store(true)
+	}
+	r.mu.RUnlock()
+	release, _ := r.gates.acquire(device, -1)
+	r.mu.Lock()
+	p := r.peers[device]
+	if p == nil {
+		p = r.restricted[device]
+	}
+	if p == nil || p.authSeq >= seq || p.Tenant == "" || p.Pubkey == "" {
+		r.mu.Unlock()
+		release()
+		return false, false
+	}
+	if unknown || id.TenantID != p.Tenant || id.Pubkey != p.Pubkey || !id.installedActive() {
+		p.wake.installedActive.Store(false)
+		p.wake.challenge.Store(nil)
+		p.wake.acknowledged.Store(false)
+	}
+	r.mu.Unlock()
+	release()
+
+	switch {
+	case unknown:
+		s.dropAgent(p, "device no longer authorized")
+	case id.TenantID != p.Tenant:
+		s.dropAgent(p, "device moved to another tenant")
+	case id.Pubkey != p.Pubkey:
+		s.dropAgent(p, "device key changed")
+	case p.restricted && id.Status != identityStatusRetired:
+		s.closeForReregistration(p, "device no longer retired; re-register")
+	case !p.restricted && id.Status == identityStatusRetired:
+		s.closeForReregistration(p, "device retired; re-register")
+	default:
+		return false, false
+	}
+	return true, false
+}
+
 // RevalidateAgents runs one sweep and returns how many agents were disconnected. Agents registered
 // without a control-plane identity (dev mode: no resolver) are never touched. When ctx ends, lookups not
 // yet started are skipped (they keep their connection until a later sweep).
@@ -112,44 +190,14 @@ func (s *Server) RevalidateAgents(ctx context.Context) int {
 		go func() {
 			defer wg.Done()
 			for p := range work {
-				lctx, cancel := context.WithTimeout(ctx, lookupTimeout)
-				id, err := resolve(lctx, p.DeviceId)
-				cancel()
-				var reason string
-				switch {
-				case errors.Is(err, ErrDeviceUnknown):
-					reason = "device no longer authorized"
-				case err != nil:
-					mu.Lock()
-					failed++ // outage, timeout or transport failure: not a verdict
-					mu.Unlock()
-					continue
-				case id.TenantID != p.Tenant:
-					reason = "device moved to another tenant"
-				case id.Pubkey != p.Pubkey:
-					reason = "device key changed"
-				case p.restricted && id.Status != identityStatusRetired:
-					// The machine is active (or quarantined) again: a CLEAN close, so the agent
-					// re-registers and gets the normal channel (docs/65 D-C1).
-					s.closeForReregistration(p, "device no longer retired; re-register")
-					mu.Lock()
-					dropped++
-					mu.Unlock()
-					continue
-				case !p.restricted && id.Status == identityStatusRetired:
-					// Retired while connected normally: reconnect so it lands in restricted mode
-					// instead of staying brokerable and visible as online.
-					s.closeForReregistration(p, "device retired; re-register")
-					mu.Lock()
-					dropped++
-					mu.Unlock()
-					continue
-				default:
-					continue
-				}
-				s.dropAgent(p, reason)
+				didDrop, didFail := s.revalidateAgent(ctx, p.DeviceId, lookupTimeout, resolve)
 				mu.Lock()
-				dropped++
+				if didDrop {
+					dropped++
+				}
+				if didFail {
+					failed++
+				}
 				mu.Unlock()
 			}
 		}()
@@ -182,6 +230,7 @@ func (s *Server) RevalidateAgents(ctx context.Context) int {
 // socket with a normal-closure frame, so the agent reconnects and re-registers through the full
 // identity check.
 func (s *Server) dropAgent(p *Peer, reason string) {
+	p.wake.disconnected.Store(true)
 	s.reg.Remove(p.DeviceId, p.conn)
 	if p.conn == nil {
 		return
@@ -198,6 +247,7 @@ func (s *Server) dropAgent(p *Peer, reason string) {
 // closes the socket with a NORMAL-closure frame, the signal every agent version handles by
 // reconnecting at once.
 func (s *Server) closeForReregistration(p *Peer, reason string) {
+	p.wake.disconnected.Store(true)
 	s.reg.Remove(p.DeviceId, p.conn)
 	if p.conn == nil {
 		return

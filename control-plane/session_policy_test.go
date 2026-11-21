@@ -592,7 +592,7 @@ func TestHandleSessionPolicy(t *testing.T) {
 		t.Fatalf("GET = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 	var pol SessionPolicy
-	if err := json.Unmarshal(rec.Body.Bytes(), &pol); err != nil || pol.MaxConcurrentSessions != 0 {
+	if err := json.Unmarshal(rec.Body.Bytes(), &pol); err != nil || pol.MaxConcurrentSessions != 0 || pol.DefaultMaxIdleSeconds == nil || *pol.DefaultMaxIdleSeconds != 0 {
 		t.Fatalf("GET default = (%+v, %v), want 0", pol, err)
 	}
 	// PUT 5 → 200, echoes the stored value; GET reflects it.
@@ -605,6 +605,30 @@ func TestHandleSessionPolicy(t *testing.T) {
 	// A negative value is a clean 400 (not silently stored).
 	if rec := do(h, "PUT", `{"max_concurrent_sessions":-1}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("PUT -1 = %d, want 400", rec.Code)
+	}
+
+	for _, tc := range []struct {
+		body string
+		code int
+		idle string
+	}{
+		{`{"default_max_idle_seconds":-1}`, http.StatusBadRequest, ""},
+		{`{"default_max_idle_seconds":3601}`, http.StatusBadRequest, ""},
+		{`{"default_max_idle_seconds":1.5}`, http.StatusBadRequest, ""},
+		{`{"default_max_idle_seconds":3600}`, http.StatusOK, `"default_max_idle_seconds":3600`},
+		{`{"session_binding":"require"}`, http.StatusOK, `"default_max_idle_seconds":3600`},
+		{`{"default_max_idle_seconds":0}`, http.StatusOK, `"default_max_idle_seconds":0`},
+	} {
+		rec := do(h, "PUT", tc.body)
+		if rec.Code != tc.code || !strings.Contains(rec.Body.String(), tc.idle) {
+			t.Fatalf("PUT %s = %d: %s, want %d and %q", tc.body, rec.Code, rec.Body.String(), tc.code, tc.idle)
+		}
+		if tc.code == http.StatusOK {
+			read := do(h, "GET", "")
+			if read.Code != http.StatusOK || !strings.Contains(read.Body.String(), tc.idle) {
+				t.Fatalf("GET after PUT %s = %d: %s, want 200 and %q", tc.body, read.Code, read.Body.String(), tc.idle)
+			}
+		}
 	}
 
 	// A technician (no CapManageTenant) is refused the PUT.

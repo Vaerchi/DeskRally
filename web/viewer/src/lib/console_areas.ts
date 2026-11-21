@@ -22,6 +22,7 @@ export type ConsoleArea =
   | "apitokens"
   | "enrollment"
   | "webhooks"
+  | "fields"
   | "appearance"
   | "users"
   | "roles"
@@ -62,6 +63,7 @@ export const CONSOLE_AREAS: ConsoleAreaDef[] = [
   { id: "security", label: "Security", group: "Admin" },
   { id: "apitokens", label: "API tokens", group: "Admin" },
   { id: "webhooks", label: "Webhooks", group: "Admin" },
+  { id: "fields", label: "Fields", group: "Admin" },
   { id: "appearance", label: "Appearance", group: "Admin" },
   { id: "account", label: "My account", group: "Account" },
   { id: "help", label: "Help", group: "Account" },

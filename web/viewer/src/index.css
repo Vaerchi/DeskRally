@@ -1,15 +1,17 @@
 /* ---- Type scale -------------------------------------------------------------------------------
    Font sizes come from this scale (theme-independent). It names the sizes the console already used,
    so introducing it changed no rendering; new rules should pick a step here rather than a new px.
-   Display headings (22px and up, clamp()) and relative em/rem sizes stay local to their rule. */
+   Display headings (22px and up, clamp()) and relative em/rem sizes stay local to their rule.
+   2026-11-20 (owner decision): the near-duplicate steps were merged UPWARD for readability: 3xs now
+   equals 2xs (10px, was 9) and lg equals xl (16px, was 15). The names stay so no rule had to move. */
 :root {
-  --fs-3xs: 9px;
+  --fs-3xs: 10px;
   --fs-2xs: 10px;
   --fs-xs: 11px;
   --fs-sm: 12px;
   --fs-md: 13px;
   --fs-base: 14px;
-  --fs-lg: 15px;
+  --fs-lg: 16px;
   --fs-xl: 16px;
   --fs-2xl: 18px;
   --fs-3xl: 20px;
@@ -2488,6 +2490,21 @@ select {
 .panel--machinegroups > .panel__note {
   padding: 6px 12px;
 }
+.dynamic-groups__conditions {
+  flex-basis: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.dynamic-groups__condition {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
 .sites__search {
   flex-wrap: wrap;
   padding: 6px 12px;
@@ -3256,6 +3273,23 @@ select {
 .app__toolbar-host .viewer__machine { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .app__toolbar-host .viewer__monitor select { max-width: 125px; }
 .app__toolbar-host .viewer__lastevent { display: none; }
+.app__participants {
+  background: transparent;
+  color: inherit;
+  border: 0;
+  padding: 0;
+  white-space: nowrap;
+}
+.session-participant-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+.session-participant-list li > span { font-weight: 600; }
+
 .toolbar-menu__trigger { white-space: nowrap; height: 32px; padding: 4px 8px; flex-shrink: 0; position: relative; }
 /* Count of waiting guest help requests on the trigger (visible while the menu is closed). An explicit
    font-size keeps it readable under the narrow-width rule that zeroes the trigger's own font-size. */
@@ -3383,7 +3417,24 @@ select {
 }
 .app[data-pane-mode="stacked"] .app__topbar { overflow: visible; }
 @media (max-width: 700px) {
-  .app__topbar > .toolbar-menu__trigger { font-size: 0; width: 32px; padding: 4px; }
+  .app__topbar > .app__participants {
+  background: transparent;
+  color: inherit;
+  border: 0;
+  padding: 0;
+  white-space: nowrap;
+}
+.session-participant-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+.session-participant-list li > span { font-weight: 600; }
+
+.toolbar-menu__trigger { font-size: 0; width: 32px; padding: 4px; }
   .app__topbar > .toolbar-menu__trigger::after { content: "⋯"; font-size: var(--fs-2xl); }
   .app__session-select { max-width: 90px; }
   .app__toolbar-host .viewer__status,

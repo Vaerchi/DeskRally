@@ -70,23 +70,22 @@ func applyDeviceIdentityMigration(t *testing.T, pool *pgxpool.Pool) {
 }
 
 // applyLatestIdentityFunction (re)creates cp_machine_identity_by_device_id from its LATEST definition, the one
-// inside migrations/0068_fleet_directives.sql (suspension, pubkey, ephemeral expiry, plus the status column and
-// the removed refusal), WITHOUT the rest of 0068 (which needs tables most tests do not build). Every helper that
+// inside migration 0084, without its LAN tables. Every helper that
 // applies an OLDER definition (0010, 0013, 0055) ends with this, so a test never runs against a stale function.
 func applyLatestIdentityFunction(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	b, err := os.ReadFile("migrations/0068_fleet_directives.sql")
+	b, err := os.ReadFile("migrations/0084_wake_on_lan.sql")
 	if err != nil {
-		t.Fatalf("read 0068: %v", err)
+		t.Fatalf("read 0084: %v", err)
 	}
 	src := string(b)
-	const start = "DROP FUNCTION IF EXISTS cp_machine_identity_by_device_id(text);"
+	const start = "DROP FUNCTION cp_machine_identity_by_device_id(text);"
 	const end = "GRANT EXECUTE ON FUNCTION cp_machine_identity_by_device_id(text) TO PUBLIC;"
 	i, j := strings.Index(src, start), strings.Index(src, end)
 	if i < 0 || j < i {
-		t.Fatal("0068 no longer contains the identity function block this helper extracts")
+		t.Fatal("0084 no longer contains the identity function block this helper extracts")
 	}
-	block := src[i : j+len(end)]
+	block := strings.Replace(src[i:j+len(end)], start, "DROP FUNCTION IF EXISTS cp_machine_identity_by_device_id(text);", 1)
 	// A test that applied only 0010 has no machine.ephemeral yet (0013 adds it); the predicate that reads it
 	// is dropped for that schema, exactly as the 0010 definition it stands in for never had it.
 	var hasEphemeral bool
@@ -95,6 +94,7 @@ func applyLatestIdentityFunction(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatalf("probe machine.ephemeral: %v", err)
 	}
 	if !hasEphemeral {
+		block = strings.Replace(block, "m.status, m.ephemeral", "m.status, false", 1)
 		var kept []string
 		for _, line := range strings.Split(block, "\n") {
 			if !strings.Contains(line, "m.ephemeral") {

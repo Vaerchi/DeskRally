@@ -248,6 +248,18 @@ describe("machinesToCsv", () => {
     expect(machinesToCsv([m()])).toBe(HEADER + "\r\nHOST-1,,dev-1,,active,,unknown,,pk-1\r\n");
   });
 
+  it("appends selected property columns in order and neutralizes risky headers and values", () => {
+    const rows = [
+      m({ properties: { site: "=1+1", "@rack": "Row, 7", unselected: "omitted" } }),
+      m({ id: "pk-2", properties: {} }),
+    ];
+    expect(machinesToCsv(rows, ["@rack", "site", "constructor"])).toBe(
+      HEADER + ',"[text] @rack",site,constructor\r\n' +
+        'HOST-1,,dev-1,,active,,unknown,,pk-1,"Row, 7","[text] =1+1",\r\n' +
+        "HOST-1,,dev-1,,active,,unknown,,pk-2,,,\r\n",
+    );
+  });
+
   it("renders present fields incl. the alias and the online tri-state (true→online, false→offline)", () => {
     expect(
       machinesToCsv([

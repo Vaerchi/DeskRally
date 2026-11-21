@@ -195,10 +195,25 @@ pub struct SignedSessionTicket {
     pub sig: String,
 }
 
+/// Full LAN snapshots and acknowledgements (docs/70).
+pub const LAN_FEATURE: &str = "lan_v1";
+/// Connection-bound signed Wake-on-LAN orders (docs/70).
+pub const WAKE_FEATURE: &str = "wake_v1";
+
+/// A reported prefix contains no host address or local interface index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanEntry {
+    pub mac: String,
+    pub ipv4_network: String,
+    pub gateway_mac: Option<String>,
+}
+
 /// Controller/agent -> signaling server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToServer {
+    LanReport { seq: u64, entries: Vec<LanEntry> },
+    WakeHello { challenge: String },
     /// Agent announces itself. `pubkey` is the long-term Ed25519 identity, **bare lowercase hex**
     /// (64 chars) — the same encoding `machine.pubkey` stores, because the server compares the two.
     ///
@@ -453,6 +468,11 @@ pub enum GuestEndOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToClient {
+    LanReportAck { seq: u64 },
+    Wake {
+        #[serde(deserialize_with = "crate::wake::deserialize_artifact")]
+        artifact: serde_json::Value,
+    },
     /// Acknowledges the control-plane result, so a successful socket send alone never loses
     /// an unprocessed guest-end report.
     GuestEndedResult {
@@ -854,6 +874,32 @@ mod tests {
         };
         assert!(!serde_json::to_string(&reg(vec![])).unwrap().contains("features"), "empty features stay off the wire");
         assert!(serde_json::to_string(&reg(vec!["directive_v1".into()])).unwrap().contains(r#""features":["directive_v1"]"#));
+    }
+
+    #[test]
+    fn wake_messages_have_the_exact_go_wire_shape() {
+        let report = ClientToServer::LanReport {
+            seq: 1,
+            entries: vec![LanEntry {
+                mac: "02:00:00:00:00:01".into(),
+                ipv4_network: "192.168.1.0/24".into(),
+                gateway_mac: None,
+            }],
+        };
+        assert_eq!(serde_json::to_string(&report).unwrap(),
+            r#"{"type":"lan_report","seq":1,"entries":[{"mac":"02:00:00:00:00:01","ipv4_network":"192.168.1.0/24","gateway_mac":null}]}"#);
+        assert_eq!(serde_json::to_string(&ClientToServer::WakeHello {
+            challenge: "0123456789abcdef0123456789abcdef".into(),
+        }).unwrap(), r#"{"type":"wake_hello","challenge":"0123456789abcdef0123456789abcdef"}"#);
+        let ack = r#"{"type":"lan_report_ack","seq":18446744073709551615}"#;
+        assert_eq!(serde_json::from_str::<ServerToClient>(ack).unwrap(),
+            ServerToClient::LanReportAck { seq: u64::MAX });
+        let wake = r#"{"type":"wake","artifact":{"claims":{},"sig":"ab"}}"#;
+        let msg: ServerToClient = serde_json::from_str(wake).unwrap();
+        assert_eq!(serde_json::to_value(&msg).unwrap(), serde_json::from_str::<serde_json::Value>(wake).unwrap());
+        let duplicate = r#"{"type":"wake","artifact":{"claims":{"issued_at_ms":1,"issued_at_ms":2},"sig":"ab"}}"#;
+        assert_eq!(serde_json::from_str::<ServerToClient>(duplicate).unwrap(),
+            ServerToClient::Wake { artifact: serde_json::Value::Null });
     }
 
     #[test]

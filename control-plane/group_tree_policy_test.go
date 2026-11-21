@@ -9,6 +9,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -64,6 +65,60 @@ func TestEffectivePolicyIsServedBesideTheGroupsOwnRow(t *testing.T) {
 	_, ref := x.f.srv.resolveSessionAdmission(context.Background(), treeTenant, treeUID("owner"), grant, m, "control")
 	if ref == nil || ref.Status != http.StatusForbidden || !strings.Contains(ref.Msg, "max_session_duration_seconds") {
 		t.Fatalf("admission refusal = %+v, want the PASS4 duration refusal driven by the INHERITED limit", ref)
+	}
+}
+
+type unreadableTenantSessionPolicyStore struct {
+	TenantSessionPolicyStore
+}
+
+func (unreadableTenantSessionPolicyStore) Get(context.Context, string) (SessionPolicy, error) {
+	return SessionPolicy{}, errors.New("tenant session policy unavailable")
+}
+
+func TestIdleTimeoutAtSessionAdmission(t *testing.T) {
+	x := newTreeHTTP(t, map[string]userSpec{"owner": {RoleOwner, nil}}, nameScope, nil)
+	ctx := t.Context()
+	srv := x.f.srv
+	srv.SessionPolicies = NewInMemoryTenantSessionPolicyStore()
+	issuer, err := GenerateGrantIssuer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Grants = issuer
+	uid := treeUID("owner")
+	grant, err := x.f.users.GrantFor(ctx, treeTenant, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := x.machineIn(x.tr.G)
+	for _, tc := range []struct {
+		name                        string
+		own, ancestor, tenant, want int
+	}{
+		{"both off", 0, 0, 0, 0},
+		{"tenant fallback", 0, 0, 300, 300},
+		{"group overrides tenant", 900, 0, 300, 900},
+		{"ancestor overrides tenant", 0, 600, 300, 600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x.setPolicy(x.tr.G, GroupSessionPolicy{MaxIdleSeconds: tc.own})
+			x.setPolicy(x.tr.P, GroupSessionPolicy{MaxIdleSeconds: tc.ancestor})
+			if err := srv.SessionPolicies.Set(ctx, treeTenant, SessionPolicy{DefaultMaxIdleSeconds: &tc.tenant}); err != nil {
+				t.Fatal(err)
+			}
+			adm, ref := srv.resolveSessionAdmission(ctx, treeTenant, uid, grant, m, "control")
+			if ref != nil {
+				t.Fatalf("admission refused: %+v", ref)
+			}
+			if adm.GroupPolicy.MaxIdleSeconds != tc.want {
+				t.Fatalf("admission idle = %d, want %d", adm.GroupPolicy.MaxIdleSeconds, tc.want)
+			}
+		})
+	}
+	srv.SessionPolicies = unreadableTenantSessionPolicyStore{}
+	if _, ref := srv.resolveSessionAdmission(ctx, treeTenant, uid, grant, m, "control"); ref == nil || ref.Status != http.StatusInternalServerError || ref.Msg != "could not resolve session policy" {
+		t.Fatalf("admission refusal = %+v, want tenant policy lookup failure", ref)
 	}
 }
 

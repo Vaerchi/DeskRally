@@ -111,10 +111,28 @@ pub struct CommandOutput {
     pub stdout: String,
     /// Captured standard error (UTF-8 lossy).
     pub stderr: String,
-    /// stdout and/or stderr hit [`MAX_OUTPUT_BYTES`] and were cut off.
+    /// A stream exceeded its retention cap or lacked a confirmed EOF by the drain deadline.
     pub truncated: bool,
-    /// The command exceeded [`DEFAULT_TIMEOUT`] and its process tree was killed.
+    /// The process wait exhausted its time budget and the runner attempted termination.
     pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attestation {
+    Exited(i32),
+    TimedOut(i32),
+    StartFailed,
+}
+
+pub(crate) struct CommandCompletion {
+    pub result: Result<CommandOutput, CommandError>,
+    pub attestation: Option<Attestation>,
+}
+
+impl CommandCompletion {
+    fn start_failed(error: CommandError) -> Self {
+        Self { result: Err(error), attestation: Some(Attestation::StartFailed) }
+    }
 }
 
 /// A reason the command could not be *started* (as opposed to running and failing — that is a
@@ -302,11 +320,33 @@ impl CommandRunner {
         command: &str,
         identity: RunIdentity,
     ) -> Result<CommandOutput, CommandError> {
+        self.run_attested(shell, command, identity).result
+    }
+
+    pub(crate) fn run_attested(
+        &self,
+        shell: CommandShell,
+        command: &str,
+        identity: RunIdentity,
+    ) -> CommandCompletion {
+        let mut completion = self.run_inner(shell, command, identity);
+        if !self.real || !self.can_elevate() || identity.needs_grant() {
+            completion.attestation = None;
+        }
+        completion
+    }
+
+    fn run_inner(
+        &self,
+        shell: CommandShell,
+        command: &str,
+        identity: RunIdentity,
+    ) -> CommandCompletion {
         // Refused BEFORE the mock check, deliberately: a mocked runner that cheerfully "elevated"
         // would make the attended refusal invisible to every headless test, which is exactly how
         // loop 84's token bug survived two VM verifications of the same feature.
         if identity.needs_grant() && !self.can_elevate() {
-            return Err(CommandError::NotElevatable(
+            return CommandCompletion::start_failed(CommandError::NotElevatable(
                 "this agent runs as the guest's own user and cannot create a higher-integrity \
                  process without a UAC prompt; elevation is available on unattended (SYSTEM \
                  helper) agents only"
@@ -320,13 +360,13 @@ impl CommandRunner {
                 cmd_len = command.len(),
                 "command: MOCK — would run a command (not executing; --log-input/--synthetic path)"
             );
-            return Ok(CommandOutput {
+            return CommandCompletion { attestation: None, result: Ok(CommandOutput {
                 exit_code: 0,
                 stdout: format!("<mock: {shell:?} command not executed on this build>\r\n"),
                 stderr: String::new(),
                 truncated: false,
                 timed_out: false,
-            });
+            }) };
         }
         let (program, command_line) = build_invocation(shell, command);
         // ALREADY THE USER ⇒ `User` is a no-op, not a token fetch. On the attended host both modes
@@ -337,17 +377,25 @@ impl CommandRunner {
             RunIdentity::User if !self.can_elevate() => RunIdentity::Host,
             other => other,
         };
-        let out =
-            spawn_and_capture(&program, &command_line, effective, DEFAULT_TIMEOUT, MAX_OUTPUT_BYTES)?;
-        tracing::info!(
-            ?identity,
-            ?shell,
-            exit_code = out.exit_code,
-            timed_out = out.timed_out,
-            truncated = out.truncated,
-            "command: ran and captured output"
+        let mut completion = spawn_and_capture_attested(
+            &program, &command_line, effective, DEFAULT_TIMEOUT, MAX_OUTPUT_BYTES, true,
         );
-        Ok(out)
+        // Win32 stops the command line at the first NUL. Keep the browser reply but suppress
+        // attestation when execution cannot correspond to the exact hashed command text.
+        if command.contains('\0') {
+            completion.attestation = None;
+        }
+        if let Ok(out) = &completion.result {
+            tracing::info!(
+                ?identity,
+                ?shell,
+                exit_code = out.exit_code,
+                timed_out = out.timed_out,
+                truncated = out.truncated,
+                "command: ran and captured output"
+            );
+        }
+        completion
     }
 }
 
@@ -376,7 +424,7 @@ fn wide(s: &str) -> Vec<u16> {
 /// The caller has already refused [`RunIdentity::UserElevated`] on a host that cannot elevate, and
 /// already collapsed [`RunIdentity::User`] to [`RunIdentity::Host`] where the two are the same
 /// person, so this function does no policy — only the Win32.
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn spawn_and_capture(
     program: &str,
     command_line: &str,
@@ -384,10 +432,22 @@ fn spawn_and_capture(
     timeout: Duration,
     cap: usize,
 ) -> Result<CommandOutput, CommandError> {
+    spawn_and_capture_attested(program, command_line, identity, timeout, cap, true).result
+}
+
+#[cfg(windows)]
+fn spawn_and_capture_attested(
+    program: &str,
+    command_line: &str,
+    identity: RunIdentity,
+    timeout: Duration,
+    cap: usize,
+    assign_job: bool,
+) -> CommandCompletion {
+    use capture::{Capture, OwnedHandle};
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, GENERIC_READ,
-        WAIT_TIMEOUT,
+        CloseHandle, HANDLE, GENERIC_READ,
     };
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::Storage::FileSystem::{
@@ -395,15 +455,14 @@ fn spawn_and_capture(
     };
     use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
         JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows::Win32::System::Pipes::CreatePipe;
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, CreateProcessW, GetExitCodeProcess, ResumeThread, WaitForSingleObject,
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
-        PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+        CreateProcessAsUserW, CreateProcessW,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+        PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
     let setup = |e: windows::core::Error| CommandError::Setup(e.to_string());
@@ -416,37 +475,17 @@ fn spawn_and_capture(
         bInheritHandle: true.into(),
     };
 
-    // SAFETY: every handle created below is closed on every return path; out-params are stack locals
-    // kept alive across their calls. Raw handle values are moved into reader threads as `isize` (Send)
-    // and rebuilt there.
-    unsafe {
-        // 1. Two output pipes (child writes, we read). Read ends are made NON-inheritable so the child
-        //    cannot hold them open and keep us blocked on read after it exits.
-        let mut out_r = HANDLE::default();
-        let mut out_w = HANDLE::default();
-        CreatePipe(&mut out_r, &mut out_w, Some(&sa), 0).map_err(setup)?;
-        let mut err_r = HANDLE::default();
-        let mut err_w = HANDLE::default();
-        if let Err(e) = CreatePipe(&mut err_r, &mut err_w, Some(&sa), 0) {
-            let _ = CloseHandle(out_r);
-            let _ = CloseHandle(out_w);
-            return Err(setup(e));
-        }
-        let _ = SetHandleInformation(out_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-        let _ = SetHandleInformation(err_r, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
-
-        // A guard that closes the handles we own on this side, so early returns cannot leak them.
-        let close_pipes = |out_r: HANDLE, out_w: HANDLE, err_r: HANDLE, err_w: HANDLE| {
-            let _ = CloseHandle(out_r);
-            let _ = CloseHandle(out_w);
-            let _ = CloseHandle(err_r);
-            let _ = CloseHandle(err_w);
-        };
-
+    let (mut capture, out_w, err_w) = match Capture::new(cap, &sa) {
+        Ok(pipes) => pipes,
+        Err(error) => return CommandCompletion::start_failed(error),
+    };
+    let mut job_guard = None;
+    // The child handles are closed when setup returns, including on every failure path.
+    let process = (move |capture: &mut Capture, job_guard: &mut Option<OwnedHandle>| unsafe {
         // 2. NUL for stdin (inheritable), so the command reads instant EOF rather than hanging on input
         //    and never inherits the (invalid) stdin of a SYSTEM service.
         let nul_w = wide(r"\\.\NUL");
-        let nul_in = match CreateFileW(
+        let nul_in = OwnedHandle::new(CreateFileW(
             PCWSTR(nul_w.as_ptr()),
             GENERIC_READ.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -454,24 +493,15 @@ fn spawn_and_capture(
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             HANDLE::default(),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                close_pipes(out_r, out_w, err_r, err_w);
-                return Err(setup(e));
-            }
-        };
+        ).map_err(setup)?);
 
-        // 3. Job object with KILL_ON_JOB_CLOSE, so a timeout (TerminateJobObject) — or simply dropping
-        //    the job handle — kills the command's WHOLE process tree, not just its top process.
-        let job = match CreateJobObjectW(None, PCWSTR::null()) {
-            Ok(j) => j,
-            Err(e) => {
-                close_pipes(out_r, out_w, err_r, err_w);
-                let _ = CloseHandle(nul_in);
-                return Err(setup(e));
-            }
-        };
+        // Explicit inheritance prevents concurrent command processes from holding each other's pipes.
+        let inherited = [nul_in.raw(), out_w.raw(), err_w.raw()];
+        let attributes = InheritedHandles::new(&inherited).map_err(setup)?;
+
+        // Closing the job after capture also cleans up any remaining descendants.
+        let job = CreateJobObjectW(None, PCWSTR::null()).map_err(setup)?;
+        *job_guard = Some(OwnedHandle::new(job));
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if let Err(e) = SetInformationJobObject(
@@ -480,9 +510,6 @@ fn spawn_and_capture(
             &limits as *const _ as *const core::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) {
-            close_pipes(out_r, out_w, err_r, err_w);
-            let _ = CloseHandle(nul_in);
-            let _ = CloseHandle(job);
             return Err(setup(e));
         }
 
@@ -503,9 +530,6 @@ fn spawn_and_capture(
             match interactive_user_token() {
                 Ok(t) => base_token = t,
                 Err(e) => {
-                    close_pipes(out_r, out_w, err_r, err_w);
-                    let _ = CloseHandle(nul_in);
-                    let _ = CloseHandle(job);
                     return Err(CommandError::NoUser(e.to_string()));
                 }
             }
@@ -517,18 +541,12 @@ fn spawn_and_capture(
                 )) {
                     Ok(elevated) => token = elevated,
                     Err(e) => {
-                        close_pipes(out_r, out_w, err_r, err_w);
-                        let _ = CloseHandle(nul_in);
-                        let _ = CloseHandle(job);
                         let _ = CloseHandle(base_token);
                         return Err(e);
                     }
                 }
             }
             if let Err(e) = CreateEnvironmentBlock(&mut env, token, false) {
-                close_pipes(out_r, out_w, err_r, err_w);
-                let _ = CloseHandle(nul_in);
-                let _ = CloseHandle(job);
                 if token != base_token {
                     let _ = CloseHandle(token);
                 }
@@ -539,24 +557,23 @@ fn spawn_and_capture(
 
         // 5. STARTUPINFO wiring our three handles, and the process SUSPENDED so we can put it in the job
         //    before it can spawn a child that would escape the tree-kill.
-        let mut si = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: nul_in,
-            hStdOutput: out_w,
-            hStdError: err_w,
-            ..Default::default()
-        };
+        let mut si = STARTUPINFOEXW::default();
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = nul_in.raw();
+        si.StartupInfo.hStdOutput = out_w.raw();
+        si.StartupInfo.hStdError = err_w.raw();
+        si.lpAttributeList = attributes.list;
         let mut desktop_w = wide(r"WinSta0\Default");
         if switch_identity {
             // The user session's interactive desktop, matching crate::launch (harmless for a hidden
             // process, but correct for a token bound to that session).
-            si.lpDesktop = PWSTR(desktop_w.as_mut_ptr());
+            si.StartupInfo.lpDesktop = PWSTR(desktop_w.as_mut_ptr());
         }
         let program_w = wide(program);
         let mut cmdline_w = wide(command_line);
         let mut pi = PROCESS_INFORMATION::default();
-        let base_flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+        let base_flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
 
         let created = if switch_identity {
             CreateProcessAsUserW(
@@ -569,7 +586,7 @@ fn spawn_and_capture(
                 PROCESS_CREATION_FLAGS(base_flags.0 | CREATE_UNICODE_ENVIRONMENT.0),
                 Some(env),
                 PCWSTR::null(),
-                &si,
+                &si.StartupInfo,
                 &mut pi,
             )
         } else {
@@ -582,7 +599,7 @@ fn spawn_and_capture(
                 base_flags,
                 None, // inherit the SYSTEM helper's environment
                 PCWSTR::null(),
-                &si,
+                &si.StartupInfo,
                 &mut pi,
             )
         };
@@ -599,98 +616,203 @@ fn spawn_and_capture(
             }
             let _ = CloseHandle(base_token);
         }
-        if let Err(e) = created {
-            close_pipes(out_r, out_w, err_r, err_w);
-            let _ = CloseHandle(nul_in);
-            let _ = CloseHandle(job);
-            return Err(spawn(e));
-        }
+        drop(attributes);
+        created.map_err(spawn)?;
 
-        // 6. Put the (still suspended) process in the job, then let it run. If Assign fails (rare on
-        //    Win8+), we proceed without tree-kill rather than fail the command — a top-level kill still
-        //    bounds it.
-        if let Err(e) = AssignProcessToJobObject(job, pi.hProcess) {
-            tracing::warn!(error = %e, "command: could not assign process to job (tree-kill degraded)");
-        }
-        ResumeThread(pi.hThread);
+        let _thread = OwnedHandle::new(pi.hThread);
+        let _process = OwnedHandle::new(pi.hProcess);
+        let assigned = assign_job && match AssignProcessToJobObject(job, pi.hProcess) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "command: could not assign process to job (tree-kill degraded)");
+                false
+            }
+        };
+        drop(out_w);
+        drop(err_w);
+        drop(nul_in);
 
-        // 7. The parent no longer needs the child's ends: close the pipe WRITE ends and the NUL handle
-        //    so that when the child exits, our reads hit EOF (a broken pipe). We keep the read ends.
-        let _ = CloseHandle(out_w);
-        let _ = CloseHandle(err_w);
-        let _ = CloseHandle(nul_in);
+        let mut process = WinProcess { capture, pi, job: assigned.then_some(job) };
+        supervise(&mut process, timeout)
+    })(&mut capture, &mut job_guard);
 
-        // 8. Drain both pipes on threads (so a full pipe never deadlocks against our wait), capped.
-        let out_raw = out_r.0 as isize;
-        let err_raw = err_r.0 as isize;
-        let out_reader = std::thread::spawn(move || read_all_capped(out_raw, cap));
-        let err_reader = std::thread::spawn(move || read_all_capped(err_raw, cap));
+    let completion = finish_capture(capture, process);
+    drop(job_guard);
+    completion
+}
 
-        // 9. Wait up to the budget; on timeout kill the whole tree, then wait for it to be gone.
-        let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-        let wait = WaitForSingleObject(pi.hProcess, ms);
-        let timed_out = wait == WAIT_TIMEOUT;
-        if timed_out {
-            let _ = TerminateJobObject(job, KILL_EXIT_CODE);
-            let _ = WaitForSingleObject(pi.hProcess, INFINITE);
-        }
+#[cfg(windows)]
+struct InheritedHandles<'a> {
+    list: windows::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+    _storage: Vec<usize>,
+    _handles: &'a [windows::Win32::Foundation::HANDLE],
+}
 
-        // 10. Exit code (after any kill this is KILL_EXIT_CODE), then join the readers (they end at EOF,
-        //     which the tree-kill guarantees even if the command spawned children).
-        let mut code: u32 = 0;
-        let _ = GetExitCodeProcess(pi.hProcess, &mut code);
-        let (out_bytes, out_trunc) = out_reader.join().unwrap_or_default();
-        let (err_bytes, err_trunc) = err_reader.join().unwrap_or_default();
+#[cfg(windows)]
+impl<'a> InheritedHandles<'a> {
+    fn new(handles: &'a [windows::Win32::Foundation::HANDLE]) -> windows::core::Result<Self> {
+        use windows::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, UpdateProcThreadAttribute, LPPROC_THREAD_ATTRIBUTE_LIST,
+        };
+        const HANDLE_LIST_ATTRIBUTE: usize = 0x0002_0002;
 
-        // 11. Clean up the remaining handles. Closing the job handle (KILL_ON_JOB_CLOSE) also reaps any
-        //     straggler the tree-kill missed.
-        let _ = CloseHandle(out_r);
-        let _ = CloseHandle(err_r);
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
-        let _ = CloseHandle(job);
-
-        Ok(CommandOutput {
-            exit_code: code as i32,
-            stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
-            truncated: out_trunc || err_trunc,
-            timed_out,
-        })
+        let mut size = 0usize;
+        let _ = unsafe {
+            InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()), 1, 0, &mut size,
+            )
+        };
+        let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
+        unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) }?;
+        let attributes = Self { list, _storage: storage, _handles: handles };
+        unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                HANDLE_LIST_ATTRIBUTE,
+                Some(handles.as_ptr().cast()),
+                std::mem::size_of_val(handles),
+                None,
+                None,
+            )
+        }?;
+        Ok(attributes)
     }
 }
 
-/// Read a pipe read-end (passed as a raw `isize` so it is `Send` into the reader thread) to EOF, keeping
-/// at most `cap` bytes but continuing to drain past it (so the child never blocks on a full pipe) and
-/// reporting whether anything was dropped.
 #[cfg(windows)]
-fn read_all_capped(read_handle_raw: isize, cap: usize) -> (Vec<u8>, bool) {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Storage::FileSystem::ReadFile;
+impl Drop for InheritedHandles<'_> {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Threading::DeleteProcThreadAttributeList(self.list) };
+    }
+}
 
-    let handle = HANDLE(read_handle_raw as *mut core::ffi::c_void);
-    let mut kept: Vec<u8> = Vec::new();
-    let mut truncated = false;
-    let mut buf = [0u8; 8192];
-    loop {
-        let mut read: u32 = 0;
-        // SAFETY: `handle` is a valid pipe read-end owned by the spawning function for this thread's
-        // lifetime; `buf`/`read` are stack locals kept alive across the call.
-        let ok = unsafe { ReadFile(handle, Some(&mut buf), Some(&mut read), None) };
-        if ok.is_err() || read == 0 {
-            // A closed write-end yields ERROR_BROKEN_PIPE (an Err) — normal EOF for an anonymous pipe.
-            break;
+#[cfg(windows)]
+fn finish_capture(
+    capture: capture::Capture,
+    process: Result<(i32, bool, Option<Attestation>), CommandError>,
+) -> CommandCompletion {
+    let (stdout, stderr, truncated) = capture.finish();
+    match process {
+        Ok((exit_code, timed_out, attestation)) => CommandCompletion {
+            result: Ok(CommandOutput { exit_code, stdout, stderr, truncated, timed_out }),
+            attestation,
+        },
+        Err(error) => CommandCompletion::start_failed(error),
+    }
+}
+
+#[cfg(windows)]
+#[path = "command_capture.rs"]
+mod capture;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessWait {
+    Exited,
+    TimedOut,
+    Failed,
+}
+
+#[cfg(windows)]
+trait CommandProcess {
+    fn resume(&mut self) -> Result<u32, CommandError>;
+    fn wait(&mut self, budget: Duration) -> ProcessWait;
+    fn kill_target(&mut self) -> bool;
+    fn kill_assigned_job(&mut self);
+    fn exit_code(&mut self) -> Option<i32>;
+}
+
+#[cfg(windows)]
+fn supervise(
+    process: &mut impl CommandProcess,
+    timeout: Duration,
+) -> Result<(i32, bool, Option<Attestation>), CommandError> {
+    let resumed = match process.resume() {
+        Ok(count) => count == 1,
+        Err(error) => {
+            process.kill_target();
+            process.kill_assigned_job();
+            return Err(error);
         }
-        let n = read as usize;
-        let (take, batch_truncated) = keep_count(kept.len(), n, cap);
-        if take > 0 {
-            kept.extend_from_slice(&buf[..take]);
+    };
+    let wait = process.wait(timeout);
+    let timed_out = wait == ProcessWait::TimedOut;
+    let confirmed = if timed_out {
+        let killed = process.kill_target();
+        process.kill_assigned_job();
+        killed && process.wait(Duration::from_secs(5)) == ProcessWait::Exited
+    } else {
+        wait == ProcessWait::Exited
+    };
+    let code = process.exit_code();
+    let attestation = if resumed && confirmed {
+        code.map(if timed_out { Attestation::TimedOut } else { Attestation::Exited })
+    } else {
+        None
+    };
+    Ok((code.unwrap_or_default(), timed_out, attestation))
+}
+
+#[cfg(windows)]
+struct WinProcess<'a> {
+    capture: &'a mut capture::Capture,
+    pi: windows::Win32::System::Threading::PROCESS_INFORMATION,
+    job: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl CommandProcess for WinProcess<'_> {
+    fn resume(&mut self) -> Result<u32, CommandError> {
+        use windows::Win32::System::Threading::ResumeThread;
+        let count = unsafe { ResumeThread(self.pi.hThread) };
+        if count == u32::MAX {
+            return Err(CommandError::Spawn(windows::core::Error::from_win32().to_string()));
         }
-        if batch_truncated {
-            truncated = true;
+        Ok(count)
+    }
+
+    fn wait(&mut self, budget: Duration) -> ProcessWait {
+        use std::time::Instant;
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        let deadline = Instant::now() + budget;
+        loop {
+            let progress = self.capture.pump(deadline);
+            let expired = Instant::now() >= deadline;
+            match self.capture.wait(Some(self.pi.hProcess), deadline, progress) {
+                WAIT_OBJECT_0 => return ProcessWait::Exited,
+                WAIT_TIMEOUT if Instant::now() < deadline => {}
+                WAIT_TIMEOUT => return ProcessWait::TimedOut,
+                event if event.0 == WAIT_OBJECT_0.0 + 1 || event.0 == WAIT_OBJECT_0.0 + 2 => {
+                    if expired {
+                        return ProcessWait::TimedOut;
+                    }
+                }
+                _ => return ProcessWait::Failed,
+            }
         }
     }
-    (kept, truncated)
+
+    fn kill_target(&mut self) -> bool {
+        use windows::Win32::System::Threading::TerminateProcess;
+        unsafe { TerminateProcess(self.pi.hProcess, KILL_EXIT_CODE).is_ok() }
+    }
+
+    fn kill_assigned_job(&mut self) {
+        use windows::Win32::System::JobObjects::TerminateJobObject;
+        if let Some(job) = self.job {
+            let _ = unsafe { TerminateJobObject(job, KILL_EXIT_CODE) };
+        }
+    }
+
+    fn exit_code(&mut self) -> Option<i32> {
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+        let mut code = 0;
+        unsafe { GetExitCodeProcess(self.pi.hProcess, &mut code) }.ok()?;
+        Some(code as i32)
+    }
 }
 
 /// Which token an ELEVATED run must use, given whatever [`crate::launch::linked_elevated_token`]
@@ -704,7 +826,7 @@ fn read_all_capped(read_handle_raw: isize, cap: usize) -> (Vec<u8>, bool) {
 ///
 /// **What the unit test does and does not close.** It pins THIS decision: given no linked token,
 /// refuse rather than hand one back. It does NOT pin the propagation — the call site in
-/// [`spawn_and_capture`] could still discard the `Err` and leave `token` as `base_token`, and no
+/// [`spawn_and_capture_attested`] could still discard the `Err` and leave `token` as `base_token`, and no
 /// suite would notice. That residual is VM-only (LAB-VM, `whoami /groups`: Medium vs High
 /// Mandatory Level). Say so rather than letting the extraction imply more coverage than it bought.
 #[cfg(windows)]
@@ -747,14 +869,148 @@ unsafe fn interactive_user_token() -> windows::core::Result<windows::Win32::Foun
 /// Non-Windows stub so the crate still type-checks off-Windows (it compiles to an empty shell — see the
 /// crate docs). Never called; the whole feature is Windows-only.
 #[cfg(not(windows))]
-fn spawn_and_capture(
+fn spawn_and_capture_attested(
     _program: &str,
     _command_line: &str,
     _identity: RunIdentity,
     _timeout: Duration,
     _cap: usize,
-) -> Result<CommandOutput, CommandError> {
-    Err(CommandError::Setup("command execution is Windows-only".to_string()))
+    _assign_job: bool,
+) -> CommandCompletion {
+    CommandCompletion::start_failed(CommandError::Setup("command execution is Windows-only".into()))
+}
+
+#[cfg(all(test, windows))]
+pub(crate) mod receipt_test_support {
+    use super::*;
+
+    pub(crate) fn descendant_holds_capture(timed_out: bool) -> CommandCompletion {
+        let (powershell, _) = build_invocation(CommandShell::PowerShell, "");
+        let mut command = format!(
+            r#"start "" /b "{powershell}" -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 10" & echo descendant-started"#
+        );
+        if timed_out {
+            command.push_str(" & for /l %i in (1,1,2147483647) do @rem keep-target-alive");
+        }
+        let (program, line) = build_invocation(CommandShell::Cmd, &command);
+        let timeout = Duration::from_secs(if timed_out { 1 } else { 3 });
+        spawn_and_capture_attested(&program, &line, RunIdentity::Host, timeout, MAX_OUTPUT_BYTES, false)
+    }
+
+    struct FakeProcess {
+        resume: u32,
+        waits: std::collections::VecDeque<(Duration, ProcessWait)>,
+        kill: Option<bool>,
+        code: Option<i32>,
+        job_kills: usize,
+    }
+
+    impl FakeProcess {
+        fn new(wait: ProcessWait) -> Self {
+            Self {
+                resume: 1,
+                waits: [(DEFAULT_TIMEOUT, wait)].into(),
+                kill: None,
+                code: Some(0),
+                job_kills: 0,
+            }
+        }
+    }
+
+    impl CommandProcess for FakeProcess {
+        fn resume(&mut self) -> Result<u32, CommandError> {
+            Ok(self.resume)
+        }
+
+        fn wait(&mut self, budget: Duration) -> ProcessWait {
+            let (expected, result) = self.waits.pop_front().expect("unexpected wait");
+            assert_eq!(budget, expected);
+            result
+        }
+
+        fn kill_target(&mut self) -> bool {
+            self.kill.take().expect("unexpected target termination")
+        }
+
+        fn kill_assigned_job(&mut self) {
+            self.job_kills += 1;
+        }
+
+        fn exit_code(&mut self) -> Option<i32> {
+            self.code
+        }
+    }
+
+    pub(crate) fn failed_process_with_open_writers(kill_fails: bool) -> CommandCompletion {
+        use windows::Win32::Security::SECURITY_ATTRIBUTES;
+        let (mut capture, _stdout, _stderr) =
+            capture::Capture::new(MAX_OUTPUT_BYTES, &SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                ..Default::default()
+            }).unwrap();
+        capture.pump(std::time::Instant::now() + DEFAULT_TIMEOUT);
+        let mut process = if kill_fails {
+            let mut process = FakeProcess::new(ProcessWait::TimedOut);
+            process.kill = Some(false);
+            process
+        } else {
+            FakeProcess::new(ProcessWait::Failed)
+        };
+        let result = supervise(&mut process, DEFAULT_TIMEOUT);
+        finish_capture(capture, result)
+    }
+
+    #[test]
+    fn attestation_requires_positive_process_evidence() {
+        let mut process = FakeProcess::new(ProcessWait::Exited);
+        assert_eq!(supervise(&mut process, DEFAULT_TIMEOUT).unwrap().2, Some(Attestation::Exited(0)));
+        for count in [0, 2] {
+            let mut process = FakeProcess::new(ProcessWait::Exited);
+            process.resume = count;
+            assert!(supervise(&mut process, DEFAULT_TIMEOUT).unwrap().2.is_none());
+        }
+
+        let mut process = FakeProcess::new(ProcessWait::Failed);
+        assert!(supervise(&mut process, DEFAULT_TIMEOUT).unwrap().2.is_none());
+
+        let mut process = FakeProcess::new(ProcessWait::Exited);
+        process.code = None;
+        assert!(supervise(&mut process, DEFAULT_TIMEOUT).unwrap().2.is_none());
+
+        let mut process = FakeProcess::new(ProcessWait::TimedOut);
+        process.kill = Some(false);
+        assert!(supervise(&mut process, DEFAULT_TIMEOUT).unwrap().2.is_none());
+
+        for (post_kill_wait, code, expected) in [
+            (ProcessWait::Failed, Some(-1), None),
+            (ProcessWait::TimedOut, Some(-1), None),
+            (ProcessWait::Exited, None, None),
+            (ProcessWait::Exited, Some(-1), Some(Attestation::TimedOut(-1))),
+        ] {
+            let mut process = FakeProcess::new(ProcessWait::TimedOut);
+            process.kill = Some(true);
+            process.waits.push_back((Duration::from_secs(5), post_kill_wait));
+            process.code = code;
+            assert_eq!(supervise(&mut process, DEFAULT_TIMEOUT).unwrap().2, expected);
+            assert_eq!(process.job_kills, 1);
+        }
+    }
+
+    #[test]
+    fn final_burst_is_drained_on_both_streams() {
+        let out_line = "o".repeat(200);
+        let err_line = "e".repeat(200);
+        let command = format!("for /l %i in (1,1,240) do @(echo {out_line}& echo {err_line}>&2)");
+        let (program, line) = build_invocation(CommandShell::Cmd, &command);
+        let completion = spawn_and_capture_attested(
+            &program, &line, RunIdentity::Host, Duration::from_secs(10), MAX_OUTPUT_BYTES, true,
+        );
+        assert_eq!(completion.attestation, Some(Attestation::Exited(0)));
+        let output = completion.result.unwrap();
+        assert_eq!(output.stdout, format!("{out_line}\r\n").repeat(240));
+        assert_eq!(output.stderr, format!("{err_line}\r\n").repeat(240));
+        assert!(!output.truncated);
+    }
 }
 
 #[cfg(test)]

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newGroupServer wires a test server whose principal has `role` scoped to `scope`, tenant "tenant-123",
@@ -63,9 +65,24 @@ func TestDynamicGroupRoundTrip(t *testing.T) {
 
 	id := createGroupID(t, srv, `{"name":"HQ machines","property_key":"site","property_value":"HQ"}`)
 
-	if rec := doReq(srv, "GET", "/dynamic-groups", "", "", ""); rec.Code != http.StatusOK ||
-		!strings.Contains(rec.Body.String(), "HQ machines") || !strings.Contains(rec.Body.String(), id) {
-		t.Fatalf("list = %d %s, want the created group", rec.Code, rec.Body.String())
+	for _, path := range []string{"/dynamic-groups", "/dynamic-groups/" + id} {
+		rec := doReq(srv, "GET", path, "", "", "")
+		var resp struct {
+			Groups []DynamicGroup `json:"groups"`
+			Group  *DynamicGroup  `json:"group"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil {
+			t.Fatalf("GET %s = %d %s", path, rec.Code, rec.Body.String())
+		}
+		groups := resp.Groups
+		if resp.Group != nil {
+			groups = []DynamicGroup{*resp.Group}
+		}
+		if len(groups) != 1 || groups[0].ID != id || groups[0].Name != "HQ machines" ||
+			groups[0].PropertyKey != "site" || groups[0].PropertyValue != "HQ" || groups[0].Match != "all" ||
+			!slices.Equal(groups[0].Conditions, []Condition{{Field: "property:site", Op: "equals", Value: "HQ"}}) {
+			t.Fatalf("GET %s returned unexpected group: %+v", path, groups)
+		}
 	}
 	// A duplicate name (case-insensitive) is a 409.
 	if rec := doReq(srv, "POST", "/dynamic-groups", `{"name":"hq machines","property_key":"x"}`, "", ""); rec.Code != http.StatusConflict {
@@ -139,7 +156,12 @@ func TestDynamicGroupResolveNarrowsToVisible(t *testing.T) {
 	_ = srv.MachineProperties.SetProperty(ctx, "tenant-123", visible.ID, "env", "prod")
 	_ = srv.MachineProperties.SetProperty(ctx, "tenant-123", hidden.ID, "env", "prod")
 
-	id := createGroupID(t, srv, `{"name":"prod","property_key":"env","property_value":"prod"}`)
+	batch := &dynamicGroupPropertyBatch{MachinePropertyStore: srv.MachineProperties}
+	srv.MachineProperties = batch
+	id := createGroupID(t, srv, `{"name":"prod","match":"any","conditions":[
+		{"field":"property:env","op":"equals","value":"prod"},
+		{"field":"hostname","op":"equals","value":"B"}
+	]}`)
 	rec := doReq(srv, "GET", "/dynamic-groups/"+id+"/machines", "", "", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve = %d (%s)", rec.Code, rec.Body.String())
@@ -150,6 +172,98 @@ func TestDynamicGroupResolveNarrowsToVisible(t *testing.T) {
 	if strings.Contains(rec.Body.String(), hidden.ID) {
 		t.Fatalf("resolve LEAKED a group-B machine the caller cannot see: %s", rec.Body.String())
 	}
+	if batch.calls != 1 || !slices.Equal(batch.ids, []string{visible.ID}) {
+		t.Fatalf("property batches = %d, ids = %v; want one call for the visible machine", batch.calls, batch.ids)
+	}
+}
+
+type dynamicGroupPropertyBatch struct {
+	MachinePropertyStore
+	calls int
+	ids   []string
+}
+
+func (s *dynamicGroupPropertyBatch) ListPropertiesForMachines(ctx context.Context, tenantID string, ids []string) (map[string]map[string]string, error) {
+	s.calls++
+	s.ids = slices.Clone(ids)
+	return s.MachinePropertyStore.ListPropertiesForMachines(ctx, tenantID, ids)
+}
+
+func TestDynamicGroupResolveMatchAndPresence(t *testing.T) {
+	srv := newGroupServer(RoleOwner, AllGroups())
+	ctx := context.Background()
+	a := &Machine{DeviceID: "dev-a", GroupID: DevDefaultMachineGroupID, Name: "A"}
+	b := &Machine{DeviceID: "dev-b", GroupID: DevDefaultMachineGroupID, Name: "B"}
+	for _, m := range []*Machine{a, b} {
+		if err := srv.Machines.EnrollMachine(ctx, "tenant-123", m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.Presence = fixedPresence{p: onlineAt(time.Now(), a.DeviceID)}
+	conditions := `[{"field":"hostname","op":"equals","value":"A"},{"field":"online","op":"equals","value":"false"}]`
+	all := createGroupID(t, srv, `{"name":"all","match":"all","conditions":`+conditions+`}`)
+	anyMember := createGroupID(t, srv, `{"name":"any","match":"any","conditions":`+conditions+`}`)
+	online := createGroupID(t, srv, `{"name":"online","match":"all","conditions":[{"field":"online","op":"equals","value":"true"}]}`)
+	assertIDs := func(id string, want ...string) {
+		t.Helper()
+		rec := doReq(srv, "GET", "/dynamic-groups/"+id+"/machines", "", "", "")
+		var resp struct {
+			Machines []Machine `json:"machines"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil {
+			t.Fatalf("resolve = %d %s", rec.Code, rec.Body.String())
+		}
+		ids := make([]string, 0, len(resp.Machines))
+		for _, m := range resp.Machines {
+			ids = append(ids, m.ID)
+		}
+		slices.Sort(ids)
+		slices.Sort(want)
+		if !slices.Equal(ids, want) {
+			t.Fatalf("members = %v, want %v", ids, want)
+		}
+	}
+	assertIDs(all)
+	assertIDs(anyMember, a.ID, b.ID)
+	assertIDs(online, a.ID)
+	srv.Presence = fixedPresence{err: ErrPresenceUnavailable}
+	assertIDs(anyMember, a.ID)
+	assertIDs(online)
+}
+
+func TestDynamicGroupConditionValidation(t *testing.T) {
+	srv := newGroupServer(RoleOwner, AllGroups())
+	condition := `{"field":"os","op":"equals","value":"Windows"}`
+	cases := []struct{ fields, want string }{
+		{`"match":"all","conditions":[` + strings.Repeat(condition+",", 10) + condition + `]`, "1 to 10"},
+		{`"match":"all","conditions":[]`, "1 to 10"},
+		{`"match":"some","conditions":[` + condition + `]`, "match must be all or any"},
+		{`"match":"all","conditions":[{"field":"model","op":"equals"}]`, "condition 1: unknown field"},
+		{`"match":"all","conditions":[` + condition + `,{"field":"os","op":"ends_with"}]`, "condition 2: unknown operator"},
+		{`"match":"all","conditions":[{"field":"property:site","op":"exists","value":"HQ"}]`, "condition 1: exists"},
+		{`"match":"all","conditions":[{"field":"hostname","op":"not_exists"}]`, "condition 1: exists"},
+		{`"match":"all","conditions":[{"field":"property:","op":"exists"}]`, "condition 1: property key"},
+		{`"match":"all","conditions":[{"field":"online","op":"contains","value":"true"}]`, "condition 1: online requires equals"},
+		{`"match":"all","conditions":[{"field":"online","op":"equals","value":"up"}]`, "condition 1: online requires equals"},
+		{`"match":"all","conditions":[{"field":"agent_version","op":"version_at_least","value":"latest"}]`, "condition 1: version_at_least"},
+		{`"match":"all","conditions":[{"field":"os","op":"version_at_least","value":"1.0"}]`, "condition 1: version_at_least"},
+		{`"match":"all","conditions":[{"field":"os","op":"equals","value":11}]`, "condition 1: field, op and value must be strings"},
+		{`"match":"all","conditions":[{"field":"os","op":"equals","value":"` + strings.Repeat("x", maxMachinePropertyValueLen+1) + `"}]`, "condition 1: value too long"},
+		{`"property_key":"site","match":"all","conditions":[` + condition + `]`, "either legacy property fields or match and conditions"},
+	}
+	for _, tc := range cases {
+		rec := doReq(srv, "POST", "/dynamic-groups", `{"name":"invalid",`+tc.fields+`}`, "", "")
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.want) {
+			t.Errorf("create = %d %s, want 400 containing %q", rec.Code, rec.Body.String(), tc.want)
+		}
+	}
+}
+
+func TestDynamicGroupAcceptsTenMaxLengthValues(t *testing.T) {
+	srv := newGroupServer(RoleOwner, AllGroups())
+	condition := `{"field":"os","op":"equals","value":"` + strings.Repeat(`\u003c`, maxMachinePropertyValueLen) + `"}`
+	createGroupID(t, srv, `{"name":"max","match":"all","conditions":[` +
+		strings.Repeat(condition+",", maxDynamicGroupConditions-1) + condition + `]}`)
 }
 
 // TestDynamicGroupStoreUnconfigured: the handlers fail CLOSED (500) when the store is not wired.

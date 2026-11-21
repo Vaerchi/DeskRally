@@ -794,6 +794,7 @@ fn stream_command(args: &[String]) -> i32 {
                 let pubkey = id.public_hex();
                 println!("stream: authenticated registration — agent pubkey {pubkey}");
                 Some(AgentIdentity {
+                    installed: false,
                     pubkey,
                     tenant_id: parse_str_arg(args, "--tenant").map(str::to_string),
                     signer: Arc::new(crate::enroll::IdentitySigner::new(id)),
@@ -1028,6 +1029,7 @@ fn multi_stream_command(args: &[String]) -> i32 {
                 let pubkey = id.public_hex();
                 println!("multi-stream: authenticated registration — agent pubkey {pubkey}");
                 Some(AgentIdentity {
+                    installed: false,
                     pubkey,
                     tenant_id: parse_str_arg(args, "--tenant").map(str::to_string),
                     signer: Arc::new(crate::enroll::IdentitySigner::new(id)),
@@ -1141,6 +1143,7 @@ fn multi_stream_command(args: &[String]) -> i32 {
         spent_elevations: Arc::new(SpentGrants::default()),
         uninstall_requested: Arc::new(AtomicBool::new(false)),
         directive_hub: None,
+        wake_agent: None,
         // The lab harness has no tray and never advertises help requests.
         help_hub: None,
         guest_banner_host: String::new(),
@@ -1764,6 +1767,7 @@ fn run_attend_after_redeem_inner(
     // 5. The streaming identity is the ephemeral key, so an ENFORCING signaling server authenticates
     // the guest exactly as it does an enrolled agent (RMTAGENTAUTHv1).
     let agent_identity = AgentIdentity {
+        installed: false,
         pubkey,
         tenant_id: Some(redeemed.tenant_id.clone()),
         signer: Arc::new(crate::enroll::IdentitySigner::new(identity)),
@@ -3405,7 +3409,7 @@ fn agent_role(
     // is logged in.
     let logged_in_user = query_logged_in_user();
     match identity {
-        Some(AgentIdentity { pubkey, tenant_id, signer }) => {
+        Some(AgentIdentity { pubkey, tenant_id, signer, .. }) => {
             tracing::info!(%device, tenant = tenant_id.as_deref().unwrap_or("<none>"), "registering with the enrolled agent identity");
             Role::Agent {
                 device,
@@ -3494,6 +3498,8 @@ fn query_logged_in_user() -> Option<String> {
 /// (the signer is behind an `Arc`), so the helper's reconnect loop reuses one per attempt.
 #[derive(Clone)]
 pub struct AgentIdentity {
+    // Only the installed helper loads the enrollment identity from its configuration.
+    installed: bool,
     /// Long-term Ed25519 public key, bare lowercase hex — the exact encoding `machine.pubkey`
     /// stores, because the signaling server compares the announced key against the pinned one.
     pub pubkey: String,
@@ -3501,6 +3507,205 @@ pub struct AgentIdentity {
     pub tenant_id: Option<String>,
     /// Signs the `RMTAGENTAUTHv1` preimage with the private half of `pubkey`.
     pub signer: Arc<dyn ChallengeSigner>,
+}
+
+const RUN_RECEIPT_FEATURE: &str = "run_receipt_v1";
+
+struct RunReceiptSession {
+    tenant: Uuid,
+    device: DeviceId,
+    session: Uuid,
+    signer: Arc<dyn ChallengeSigner>,
+}
+
+/// docs/72 4.2: request ids are spent per BROKER-VOUCHED session, not per transport. A replayed ticket
+/// (signaling fails open while its shared ledger is down) can hand the same control-plane session id to
+/// a second connection; keying by that id across every connection in this process keeps one execution
+/// per request id. Kept past the server's 24 h receipt window, then pruned.
+static SPENT_RUN_REQUESTS: std::sync::OnceLock<std::sync::Mutex<HashMap<(Uuid, Uuid), std::time::Instant>>> =
+    std::sync::OnceLock::new();
+const SPENT_RUN_REQUEST_RETENTION: Duration = Duration::from_secs(25 * 60 * 60);
+
+fn spend_run_request(session: Uuid, request: Uuid) -> bool {
+    let mut spent = SPENT_RUN_REQUESTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    spent.retain(|_, at| now.duration_since(*at) < SPENT_RUN_REQUEST_RETENTION);
+    spent.insert((session, request), now).is_none()
+}
+
+struct RunReceiptContext {
+    request: Uuid,
+    shell: control::CommandShell,
+    as_user: bool,
+    exec_sha256: [u8; 32],
+}
+
+struct PendingCommand {
+    task: tokio::task::JoinHandle<FinishedCommand>,
+    elevated: bool,
+    receipt: Option<RunReceiptContext>,
+}
+
+struct FinishedCommand {
+    completion: crate::command_run::CommandCompletion,
+    finished_at_ms: i64,
+}
+
+impl FinishedCommand {
+    fn new(completion: crate::command_run::CommandCompletion) -> Self {
+        Self { completion, finished_at_ms: now_unix_ms() }
+    }
+}
+
+impl RunReceiptSession {
+    fn new(
+        identity: Option<&AgentIdentity>,
+        device: DeviceId,
+        session: Option<Uuid>,
+        mock: bool,
+        attended: bool,
+    ) -> Option<Self> {
+        let identity = identity?;
+        if mock || attended || !identity.installed {
+            return None;
+        }
+        rmt_protocol::session_binding::decode_field_hex(&identity.pubkey)?;
+        Some(Self {
+            tenant: Uuid::parse_str(identity.tenant_id.as_deref()?).ok()?,
+            device,
+            session: session?,
+            signer: identity.signer.clone(),
+        })
+    }
+
+    fn spend(
+        &mut self,
+        request: &str,
+        shell: control::CommandShell,
+        as_user: bool,
+        command: &str,
+    ) -> Result<RunReceiptContext, &'static str> {
+        let request = Uuid::parse_str(request).map_err(|_| "invalid request id")?;
+        if !spend_run_request(self.session, request) {
+            return Err("request already used");
+        }
+        Ok(RunReceiptContext {
+            request,
+            shell,
+            as_user,
+            exec_sha256: Sha256::digest(command.as_bytes()).into(),
+        })
+    }
+
+    fn sign(
+        &self,
+        context: RunReceiptContext,
+        evidence: crate::command_run::Attestation,
+        truncated: bool,
+        finished_at_ms: i64,
+    ) -> Option<ControlMessage> {
+        use crate::command_run::Attestation;
+        use rmt_protocol::run_receipt::{sign_with, RunReceiptClaims};
+
+        let (outcome, exit_code, truncated) = match evidence {
+            Attestation::Exited(code) => ("exited", Some(code), truncated),
+            Attestation::TimedOut(code) => ("timed_out", Some(code), truncated),
+            Attestation::StartFailed => ("start_failed", None, false),
+        };
+        let claims = RunReceiptClaims {
+            tenant_id: self.tenant.to_string(),
+            device_id: self.device.0.to_string(),
+            session_id: self.session.to_string(),
+            request_id: context.request.to_string(),
+            shell: match context.shell {
+                control::CommandShell::PowerShell => "powershell",
+                control::CommandShell::Cmd => "cmd",
+            }.into(),
+            run_as: if context.as_user { "user" } else { "system" }.into(),
+            exec_sha256: hex::encode(context.exec_sha256),
+            outcome: outcome.into(),
+            exit_code,
+            truncated,
+            finished_at_ms,
+        };
+        match sign_with(&claims, |bytes| self.signer.sign(bytes)) {
+            Ok(receipt) => Some(ControlMessage::RunReceipt { receipt }),
+            Err(error) => {
+                tracing::warn!(%error, "run receipt signing failed");
+                None
+            }
+        }
+    }
+}
+
+fn queue_run_command(
+    session: Option<&mut RunReceiptSession>,
+    request: Option<&str>,
+    shell: control::CommandShell,
+    as_user: bool,
+    command: String,
+    run: impl FnOnce(control::CommandShell, &str, crate::command_run::RunIdentity)
+        -> crate::command_run::CommandCompletion + Send + 'static,
+) -> Result<PendingCommand, &'static str> {
+    let receipt = match (session, request) {
+        (Some(session), Some(request)) => Some(session.spend(request, shell, as_user, &command)?),
+        _ => None,
+    };
+    let identity = crate::command_run::RunIdentity::from_as_user(as_user);
+    Ok(PendingCommand {
+        task: tokio::task::spawn_blocking(move || FinishedCommand::new(run(shell, &command, identity))),
+        elevated: false,
+        receipt,
+    })
+}
+
+fn finish_pending_command(
+    slot: &mut Option<PendingCommand>,
+    receipt_session: Option<&RunReceiptSession>,
+    res: Result<FinishedCommand, tokio::task::JoinError>,
+) -> impl Iterator<Item = ControlMessage> {
+    let pending = slot.take().expect("command completion requires a pending command");
+    let was_elevated = pending.elevated;
+    let receipt = match (receipt_session, pending.receipt, &res) {
+        (Some(session), Some(context), Ok(finished)) => {
+            let completion = &finished.completion;
+            completion.attestation.and_then(|evidence| {
+                let truncated = completion.result.as_ref().is_ok_and(|out| out.truncated);
+                session.sign(context, evidence, truncated, finished.finished_at_ms)
+            })
+        }
+        _ => None,
+    };
+    let reply = match res.map(|finished| finished.completion.result) {
+        Ok(Ok(out)) => ControlMessage::CommandResult {
+            exit_code: out.exit_code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            truncated: out.truncated,
+            timed_out: out.timed_out,
+        },
+        // The request determines which reply carries the start failure.
+        Ok(Err(e)) if was_elevated => {
+            let reason = e.to_string();
+            tracing::warn!(
+                %reason,
+                "elevated command could not start — the grant is spent"
+            );
+            ControlMessage::ElevationDenied { reason }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "command could not be started");
+            ControlMessage::Error { message: format!("command failed: {e}") }
+        }
+        Err(join_err) => {
+            tracing::warn!(error = %join_err, "command task panicked");
+            ControlMessage::Error { message: "command task failed".to_string() }
+        }
+    };
+    receipt.into_iter().chain(std::iter::once(reply))
 }
 
 /// How a session decides whether a backstage request is authorized (H1).
@@ -4283,6 +4488,7 @@ pub async fn serve_session_with_ice(
     let binding_signer = identity.as_ref().map(|id| id.signer.clone());
     // Binding v2 names this agent's own key in the transcript (docs/69 6.2); the same key `binding_signer` signs with.
     let binding_pubkey = identity.as_ref().and_then(|id| rmt_protocol::session_binding::decode_field_hex(&id.pubkey));
+    let receipt_identity = identity.clone();
     let role = agent_role(device, identity, require_session_policy);
 
     // Multi-session path: transport already connected by `run_multi_session_stream`. Single-session
@@ -4306,6 +4512,13 @@ pub async fn serve_session_with_ice(
     // must come from ONE read of the transport — deriving the sidecar's copy separately would let a
     // future change give the policy and the artifact different answers about which session this is.
     let control_plane_session = transport.control_plane_session();
+    let mut receipt_session = RunReceiptSession::new(
+        receipt_identity.as_ref(),
+        device,
+        control_plane_session,
+        mock_command,
+        host_runs_as_interactive_user,
+    );
     let session_binding = match control_plane_session {
         Some(id) => SessionBinding::Session(id),
         None => SessionBinding::Unknown,
@@ -5272,17 +5485,7 @@ pub async fn serve_session_with_ice(
     // command may run for its full timeout, and awaiting it inline would freeze the whole `select!`
     // loop (video, input, telemetry) for that long. Its own arm below sends the result when it lands;
     // a second `RunCommand` while one is pending is refused, like `reboot_armed`.
-    let mut pending_command: Option<
-        tokio::task::JoinHandle<Result<crate::command_run::CommandOutput, crate::command_run::CommandError>>,
-    > = None;
-    // Was the command in `pending_command` an `ElevatedRun`? The completion arm needs to know,
-    // because the two requests want DIFFERENT answers to the same failure: a `RunCommand` that could
-    // not start is an `Error` ("that command did not run"), while an `ElevatedRun` that could not
-    // start is an `ElevationDenied` ("nothing ran AND the elevation did not happen") — a distinct
-    // fact about whether a privileged action occurred, which is the whole reason that channel
-    // exists. Carried beside the handle rather than inside the task's result because the identity is
-    // a property of the REQUEST, not of the outcome. Cleared with the slot.
-    let mut pending_command_elevated = false;
+    let mut pending_command: Option<PendingCommand> = None;
     // Screenshot (remote support): the newest raw BGRA frame the stream produced, kept so a
     // `RequestScreenshot` can encode a full-resolution lossless PNG of it without a second capturer
     // fighting the DXGI duplication. Updated (moved, not cloned) in the video arm. The PNG encode runs
@@ -6498,6 +6701,7 @@ pub async fn serve_session_with_ice(
                                 features: backstage_features(
                                     dispatcher.as_ref().is_some_and(|d| d.allows_file_management()),
                                     can_place_uploads,
+                                    receipt_session.is_some(),
                                 ),
                             });
                             if let Err(e) = transport.send_frame(Frame::new(ChannelId::Control, payload)).await {
@@ -7477,7 +7681,7 @@ pub async fn serve_session_with_ice(
                                 tracing::debug!(error = %e, "tool-launch reply send failed");
                             }
                         }
-                        Ok(ControlMessage::RunCommand { command, shell, as_user }) => {
+                        Ok(ControlMessage::RunCommand { command, shell, as_user, request_id }) => {
                             // One-line command bar: run a single command, capture its output, and ack a
                             // `CommandResult`. Runs on a BLOCKING task (a command can take its whole
                             // timeout) held in `pending_command`, whose own `select!` arm sends the
@@ -7514,10 +7718,21 @@ pub async fn serve_session_with_ice(
                                 }
                             } else {
                                 let runner = command_runner;
-                                let identity = crate::command_run::RunIdentity::from_as_user(as_user);
-                                pending_command = Some(tokio::task::spawn_blocking(move || {
-                                    runner.run(shell, &command, identity)
-                                }));
+                                match queue_run_command(
+                                    receipt_session.as_mut(), request_id.as_deref(), shell, as_user, command,
+                                    move |shell, command, identity| runner.run_attested(shell, command, identity),
+                                ) {
+                                    Ok(pending) => pending_command = Some(pending),
+                                    Err(message) => {
+                                        let reply = ControlMessage::Error { message: message.into() };
+                                        if let Err(e) = transport
+                                            .send_frame(Frame::new(ChannelId::Control, control::encode(&reply)))
+                                            .await
+                                        {
+                                            tracing::debug!(error = %e, "command request refusal send failed");
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(ControlMessage::ElevatedRun { signed_elevation, command, shell }) => {
@@ -7643,14 +7858,17 @@ pub async fn serve_session_with_ice(
                                     // `mock_command` gate, which is what keeps a gate run from
                                     // actually elevating on the CI box.
                                     let runner = command_runner;
-                                    pending_command_elevated = true;
-                                    pending_command = Some(tokio::task::spawn_blocking(move || {
-                                        runner.run(
-                                            shell,
-                                            &command,
-                                            crate::command_run::RunIdentity::UserElevated,
-                                        )
-                                    }));
+                                    pending_command = Some(PendingCommand {
+                                        task: tokio::task::spawn_blocking(move || {
+                                            FinishedCommand::new(runner.run_attested(
+                                                shell,
+                                                &command,
+                                                crate::command_run::RunIdentity::UserElevated,
+                                            ))
+                                        }),
+                                        elevated: true,
+                                        receipt: None,
+                                    });
                                 }
                             }
                         }
@@ -8077,6 +8295,7 @@ pub async fn serve_session_with_ice(
                         | Ok(ControlMessage::WorkstationLocked)
                         | Ok(ControlMessage::LogOffScheduled)
                         | Ok(ControlMessage::CommandResult { .. })
+                        | Ok(ControlMessage::RunReceipt { .. })
                         | Ok(ControlMessage::ElevationDenied { .. })
                         | Ok(ControlMessage::DirectoryListing { .. })
                         | Ok(ControlMessage::DirectoryListingRefused { .. })
@@ -8168,69 +8387,16 @@ pub async fn serve_session_with_ice(
             // actually in flight; the `&mut` join borrow ends (the future is dropped) before the body
             // clears the slot and touches `transport`. Sends the captured result, or an `Error` if the
             // process could not be started (`Ok(Err)`) or the blocking task panicked (`Err`).
-            res = async { pending_command.as_mut().expect("guarded by is_some").await },
+            res = async { (&mut pending_command.as_mut().expect("guarded by is_some").task).await },
                 if pending_command.is_some() =>
             {
-                pending_command = None;
-                // Read the request's identity, then clear it WITH the slot — the two are one piece
-                // of state and a stale `true` would report the NEXT ordinary command's start failure
-                // as an elevation refusal.
-                let was_elevated = pending_command_elevated;
-                pending_command_elevated = false;
-                let reply = match res {
-                    Ok(Ok(out)) => ControlMessage::CommandResult {
-                        exit_code: out.exit_code,
-                        stdout: out.stdout,
-                        stderr: out.stderr,
-                        truncated: out.truncated,
-                        timed_out: out.timed_out,
-                    },
-                    // A command that could not START. WHICH channel that travels on depends on what
-                    // was asked for, not on which error came back.
-                    //
-                    // For an `ElevatedRun`, every start failure means the same two things: nothing
-                    // executed, and the elevation did not happen. That is precisely the fact
-                    // `ElevationDenied` exists to carry, and reporting it as a generic `Error` tells
-                    // the viewer a command FAILED — a different claim, and the one that matters
-                    // least here. The reachable causes are `NotElevatable` (the interactive user has
-                    // no linked elevated token at all — a standard user, or any account on a UAC-off
-                    // box, refused rather than silently downgraded), `NoUser` (nobody is signed in,
-                    // so there is no token to take) and `Setup`/`Spawn` (a Win32 fault building the
-                    // environment or creating the process). Matching on the REQUEST rather than
-                    // enumerating variants is deliberate: a new `CommandError` should not silently
-                    // start reporting an elevated refusal as an ordinary command failure.
-                    //
-                    // Note what this does NOT fix, deliberately: the single-use grant is already
-                    // burned by this point. The pre-burn `can_elevate()` gate covers the HOST axis
-                    // ("am I the SYSTEM helper"), which is decidable without a syscall; the USER
-                    // axis could be probed with the same two calls the run itself makes, but doing
-                    // it before the claim would fetch the token twice and would still be a TOCTOU —
-                    // so the grant is spent and the technician re-mints. Un-burning instead would
-                    // make the ledger non-monotonic to save a re-mint of a 2-minute artifact, which
-                    // is a bad trade for the one property of this design simple enough to be
-                    // obviously correct. The refusal now at least tells them why.
-                    Ok(Err(e)) if was_elevated => {
-                        let reason = e.to_string();
-                        tracing::warn!(
-                            %reason,
-                            "elevated command could not start — the grant is spent"
-                        );
-                        ControlMessage::ElevationDenied { reason }
+                for message in finish_pending_command(&mut pending_command, receipt_session.as_ref(), res) {
+                    if let Err(e) = transport
+                        .send_frame(Frame::new(ChannelId::Control, control::encode(&message)))
+                        .await
+                    {
+                        tracing::debug!(error = %e, "command reply send failed");
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "command could not be started");
-                        ControlMessage::Error { message: format!("command failed: {e}") }
-                    }
-                    Err(join_err) => {
-                        tracing::warn!(error = %join_err, "command task panicked");
-                        ControlMessage::Error { message: "command task failed".to_string() }
-                    }
-                };
-                if let Err(e) = transport
-                    .send_frame(Frame::new(ChannelId::Control, control::encode(&reply)))
-                    .await
-                {
-                    tracing::debug!(error = %e, "command-result reply send failed");
                 }
             },
             // Screenshot: the blocking PNG encode finished. On success, PUSH the PNG over FileTransfer
@@ -9052,13 +9218,16 @@ pub(crate) fn posture_features(grant_key_pinned: bool, session_policy_required: 
 /// the grant this agent verified (the console never sees a self-issued dev grant at all).
 /// `file_place` (docs/58 §12) additionally needs a session whose uploads land in the agent's own
 /// anchored folder, which is the only root placement works from.
-pub(crate) fn backstage_features(grant_allows_file_management: bool, can_place_uploads: bool) -> Vec<String> {
+pub(crate) fn backstage_features(grant_allows_file_management: bool, can_place_uploads: bool, can_sign_receipts: bool) -> Vec<String> {
     let mut f = vec!["confirm".to_string()];
     if grant_allows_file_management {
         f.push("file_manage".to_string());
         if can_place_uploads {
             f.push("file_place".to_string());
         }
+    }
+    if can_sign_receipts {
+        f.push(RUN_RECEIPT_FEATURE.to_string());
     }
     f
 }
@@ -10151,6 +10320,7 @@ struct MultiSessionOpts {
     /// docs/65: the directive hub, present only when a directive key is pinned (it is what makes this agent advertise
     /// `directive_v1` and accept relayed directives). `None` ⇒ every directive is ignored and the feature is not advertised.
     directive_hub: Option<std::sync::Arc<crate::directive_hub::DirectiveHub>>,
+    wake_agent: Option<Arc<crate::wake_agent::WakeAgent>>,
     /// docs/64: the help-request hub (the tray's "Request help..."). Installed helper only; `None` in the lab harness.
     help_hub: Option<std::sync::Arc<crate::help_request::HelpHub>>,
     guest_banner_host: String,
@@ -10210,6 +10380,9 @@ async fn run_multi_session_stream(
     // Updater evidence is written only on the installed path with a real enrolled identity
     // (recording_dir + identity); dev/LAN, test harness and CLI paths are excluded.
     let installed = opts.recording_dir.is_some() && opts.identity.is_some();
+    if let Role::Agent { ref mut features, .. } = role {
+        features.extend(crate::wake_agent::features(installed, opts.wake_agent.as_deref()));
+    }
     let (sig, sig_rx, features) = match WebRtcTransport::register_for_mux_with_features(signaling_url, &role).await {
         Ok(registered) => registered,
         Err(e) => {
@@ -10221,10 +10394,10 @@ async fn run_multi_session_stream(
             return Err(e);
         }
     };
-    let mut mux = crate::signaling_mux::SignalingMux::new_with_help(
+    let mut mux = crate::signaling_mux::SignalingMux::new_with_wake(
         sig, sig_rx, Some(opts.device), opts.guest_end_reports.clone(), &features, opts.directive_hub.clone(),
-        opts.help_hub.clone(),
-    );
+        opts.help_hub.clone(), installed, opts.wake_agent.clone(),
+    )?;
 
     // Registration heartbeat + attempt ack (design v5 R3, v9 R2). The ack carries the
     // compile-time AGENT_VERSION, never a value from the request.
@@ -10748,6 +10921,7 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
             let pubkey = id.public_hex();
             log_line(false, &format!("helper: agent identity loaded ({pubkey})"));
             Some(AgentIdentity {
+                installed: true,
                 pubkey,
                 tenant_id: cfg.tenant_id.clone().filter(|s| !s.is_empty()),
                 signer: Arc::new(crate::enroll::IdentitySigner::new(id)),
@@ -10963,6 +11137,9 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
         spent_elevations: spent_elevations.clone(),
         uninstall_requested: uninstall_flag.clone(),
         directive_hub: directive_hub.clone(),
+        wake_agent: agent_identity.as_ref().and_then(|identity| {
+            crate::wake_agent::WakeAgent::new(cfg, device, identity.tenant_id.as_deref()?, &identity.pubkey)
+        }).map(Arc::new),
         help_hub: Some(help_hub.clone()),
         guest_banner_host: guest_banner_host.clone(),
         // ONE report set for the helper's lifetime — created outside the reconnect loop below, so a
@@ -12344,6 +12521,7 @@ mod tests {
         }
 
         let ident = AgentIdentity {
+            installed: false,
             pubkey: "aa".repeat(32),
             tenant_id: Some("t-1".into()),
             signer: Arc::new(NullSigner),
@@ -12402,6 +12580,7 @@ mod tests {
             _ => panic!("agent_role must build an Agent role"),
         }
         match agent_role(device, Some(AgentIdentity {
+            installed: false,
             pubkey: "aa".repeat(32),
             tenant_id: Some("t-1".into()),
             signer: Arc::new(NullSigner),
@@ -12888,13 +13067,13 @@ mod indicator_lost_file_transfer_tests {
     /// only with a grant that holds `file_delete`.
     #[test]
     fn file_manage_is_advertised_only_with_the_capability() {
-        assert_eq!(backstage_features(true, false), vec!["confirm".to_string(), "file_manage".to_string()]);
-        assert_eq!(backstage_features(false, false), vec!["confirm".to_string()]);
+        assert_eq!(backstage_features(true, false, false), vec!["confirm".to_string(), "file_manage".to_string()]);
+        assert_eq!(backstage_features(false, false, false), vec!["confirm".to_string()]);
         assert_eq!(
-            backstage_features(true, true),
+            backstage_features(true, true, false),
             vec!["confirm".to_string(), "file_manage".to_string(), "file_place".to_string()]
         );
-        assert_eq!(backstage_features(false, true), vec!["confirm".to_string()], "placement needs file_delete too");
+        assert_eq!(backstage_features(false, true, false), vec!["confirm".to_string()], "placement needs file_delete too");
     }
 }
 
@@ -12979,5 +13158,207 @@ mod input_handoff_tests {
         assert!(hand_outcome_message(&Err(HandError::Refused(HandRefusal::TargetNotEligible)))
             .unwrap()
             .contains("observing"));
+    }
+}
+
+#[cfg(test)]
+mod run_receipt_tests {
+    use super::*;
+    use crate::command_run::{Attestation, CommandCompletion, CommandError, CommandOutput};
+    use control::CommandShell;
+    use std::time::Duration;
+
+    fn enrolled_identity() -> AgentIdentity {
+        let key = rmt_crypto::Identity::from_seed(&[0x73; 32]);
+        AgentIdentity {
+            installed: true,
+            pubkey: key.public_hex(),
+            tenant_id: Some(Uuid::new_v4().to_string()),
+            signer: Arc::new(crate::enroll::IdentitySigner::new(key)),
+        }
+    }
+
+    fn receipt_session(identity: &AgentIdentity) -> RunReceiptSession {
+        RunReceiptSession::new(
+            Some(identity), DeviceId(Uuid::new_v4()), Some(Uuid::new_v4()), false, false,
+        ).unwrap()
+    }
+
+    #[test]
+    fn only_a_brokered_installed_enrollment_with_a_real_runner_advertises_receipts() {
+        let mut identity = enrolled_identity();
+        let device = DeviceId(Uuid::new_v4());
+        let session = Some(Uuid::new_v4());
+        let advertises = |id: Option<&AgentIdentity>, broker, mock, attended| {
+            let capability = RunReceiptSession::new(id, device, broker, mock, attended).is_some();
+            backstage_features(false, false, capability).iter().any(|f| f == RUN_RECEIPT_FEATURE)
+        };
+
+        assert!(advertises(Some(&identity), session, false, false));
+        assert!(!advertises(None, session, false, false));
+        assert!(!advertises(Some(&identity), None, false, false));
+        assert!(!advertises(Some(&identity), session, true, false));
+        assert!(!advertises(Some(&identity), session, false, true));
+
+        let mut dev = identity.clone();
+        dev.installed = false;
+        assert!(!advertises(Some(&dev), session, false, false));
+        let mut unpinned = identity.clone();
+        unpinned.pubkey.clear();
+        assert!(!advertises(Some(&unpinned), session, false, false));
+        let mut unenrolled = identity.clone();
+        unenrolled.tenant_id = None;
+        assert!(!advertises(Some(&unenrolled), session, false, false));
+        identity.tenant_id = Some("invalid".into());
+        assert!(!advertises(Some(&identity), session, false, false));
+    }
+
+    async fn replies(
+        slot: &mut Option<PendingCommand>,
+        session: &RunReceiptSession,
+    ) -> Vec<ControlMessage> {
+        replies_within(slot, session, Duration::from_secs(7)).await
+    }
+
+    /// docs/72 4.3: the slot is released within the 2 s drain bound of the runner's terminal point.
+    /// `bound` is measured from queueing, so callers add the time the process itself takes to end.
+    async fn replies_within(
+        slot: &mut Option<PendingCommand>,
+        session: &RunReceiptSession,
+        bound: Duration,
+    ) -> Vec<ControlMessage> {
+        let started = std::time::Instant::now();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(15), &mut slot.as_mut().unwrap().task,
+        ).await.expect("command slot stayed busy");
+        let elapsed = started.elapsed();
+        assert!(elapsed < bound, "command slot released after {elapsed:?}, bound {bound:?}");
+        let frames = finish_pending_command(slot, Some(session), completion).collect();
+        assert!(slot.is_none());
+        frames
+    }
+
+    fn output() -> CommandOutput {
+        CommandOutput {
+            exit_code: 7,
+            stdout: "local output".into(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn spends_before_queueing_and_sends_receipt_before_result() {
+        let identity = enrolled_identity();
+        let mut session = receipt_session(&identity);
+        let request = Uuid::new_v4().to_string();
+        let command = " echo café  ";
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = runs.clone();
+        let mut slot = Some(queue_run_command(
+            Some(&mut session), Some(&request), CommandShell::Cmd, true, command.into(),
+            move |_, _, _| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                CommandCompletion { result: Ok(output()), attestation: Some(Attestation::Exited(7)) }
+            },
+        ).unwrap());
+
+        let frames = replies(&mut slot, &session).await;
+        let [ControlMessage::RunReceipt { receipt }, ControlMessage::CommandResult { exit_code: 7, .. }] =
+            frames.as_slice() else { panic!("receipt must precede the command result"); };
+        let key = rmt_protocol::session_binding::decode_field_hex(&identity.pubkey).unwrap();
+        let signed = serde_json::to_vec(receipt).unwrap();
+        let claims = rmt_protocol::run_receipt::verify(&key, &signed).unwrap();
+        assert_eq!(claims.exec_sha256, hex::encode(Sha256::digest(command.as_bytes())));
+        assert_eq!(claims.request_id, request);
+        assert_eq!(claims.session_id, session.session.to_string());
+        assert_eq!(claims.tenant_id, session.tenant.to_string());
+        assert_eq!(claims.device_id, session.device.0.to_string());
+        assert_eq!(claims.shell, "cmd");
+        assert_eq!(claims.run_as, "user");
+        assert_eq!(claims.exit_code, Some(7));
+
+        let duplicate = queue_run_command(
+            Some(&mut session), Some(&request.to_uppercase()), CommandShell::PowerShell,
+            false, "echo duplicate".into(), |_, _, _| panic!("duplicate was queued"),
+        );
+        assert_eq!(duplicate.err(), Some("request already used"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A second connection vouched for the SAME control-plane session (a replayed ticket) shares
+        // the spent set; a different session does not.
+        let mut replayed = receipt_session(&identity);
+        replayed.session = session.session;
+        assert_eq!(
+            replayed.spend(&request, CommandShell::Cmd, false, command).err(),
+            Some("request already used"),
+        );
+        let mut other = receipt_session(&identity);
+        assert_ne!(other.session, session.session);
+        assert!(other.spend(&request, CommandShell::Cmd, false, command).is_ok());
+    }
+
+    #[tokio::test]
+    async fn start_failure_receipt_precedes_error() {
+        let mut session = receipt_session(&enrolled_identity());
+        let request = Uuid::new_v4().to_string();
+        let mut slot = Some(queue_run_command(
+            Some(&mut session), Some(&request), CommandShell::PowerShell, false, "echo hi".into(),
+            |_, _, _| CommandCompletion {
+                result: Err(CommandError::Spawn("test failure".into())),
+                attestation: Some(Attestation::StartFailed),
+            },
+        ).unwrap());
+        let frames = replies(&mut slot, &session).await;
+        let [ControlMessage::RunReceipt { receipt }, ControlMessage::Error { .. }] = frames.as_slice()
+        else { panic!("receipt must precede the start failure"); };
+        assert_eq!(receipt.claims.outcome, "start_failed");
+        assert_eq!(receipt.claims.exit_code, None);
+        assert!(!receipt.claims.truncated);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn descendants_cannot_hold_the_slot_after_exit_or_timeout() {
+        use crate::command_run::receipt_test_support::descendant_holds_capture;
+        let mut session = receipt_session(&enrolled_identity());
+        for (timed_out, outcome) in [(false, "exited"), (true, "timed_out")] {
+            let request = Uuid::new_v4().to_string();
+            let mut slot = Some(queue_run_command(
+                Some(&mut session), Some(&request), CommandShell::Cmd, false, "fixture".into(),
+                move |_, _, _| descendant_holds_capture(timed_out),
+            ).unwrap());
+            // Exit: cmd ends at once, then the 2 s drain. Timeout: the 1 s budget, the kill, then the
+            // drain. A 1.25 s allowance covers process start-up, not a longer drain.
+            let bound = if timed_out { Duration::from_millis(4250) } else { Duration::from_millis(3250) };
+            let frames = replies_within(&mut slot, &session, bound).await;
+            let [ControlMessage::RunReceipt { receipt }, ControlMessage::CommandResult {
+                truncated: true, timed_out: reported_timeout, stdout, ..
+            }] = frames.as_slice() else { panic!("expected a truncated receipt and result"); };
+            assert_eq!(*reported_timeout, timed_out);
+            assert!(stdout.contains("descendant-started"));
+            assert_eq!(receipt.claims.outcome, outcome);
+            assert!(receipt.claims.truncated);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_wait_and_failed_kill_release_slot_without_receipt() {
+        use crate::command_run::receipt_test_support::failed_process_with_open_writers;
+        let mut session = receipt_session(&enrolled_identity());
+        for kill_fails in [false, true] {
+            let request = Uuid::new_v4().to_string();
+            let mut slot = Some(queue_run_command(
+                Some(&mut session), Some(&request), CommandShell::Cmd, false, "fixture".into(),
+                move |_, _, _| failed_process_with_open_writers(kill_fails),
+            ).unwrap());
+            // The fake process fails at once, so release is the 2 s drain plus scheduling.
+            let frames = replies_within(&mut slot, &session, Duration::from_millis(2750)).await;
+            assert!(matches!(frames.as_slice(), [ControlMessage::CommandResult {
+                truncated: true, timed_out, ..
+            }] if *timed_out == kill_fails));
+        }
     }
 }

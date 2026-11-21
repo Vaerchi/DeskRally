@@ -27,6 +27,54 @@ import {
   type TenantWebhook,
 } from "./console_api";
 
+describe("machine field routes", () => {
+  const input = { key: "site/score", label: "Score", type: "number" as const, choices: null };
+  const field = { ...input, id: "field-id", version: 1, position: 0 };
+
+  it("uses field identity, order revision, and opaque cursor on their respective routes", async () => {
+    const { fn, calls } = fakeFetch(({ url, init }) => {
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      if (url.includes("/nonconforming")) return jsonResponse({ machines: [], total: 0 });
+      if (url.endsWith("/machine-field-order")) return jsonResponse({ order_revision: 8 });
+      if (init?.method === "POST") return jsonResponse({ field }, 201);
+      if (init?.method === "PUT") return jsonResponse({ field: { ...field, version: 2 } });
+      return jsonResponse({ fields: [field], order_revision: 7 });
+    });
+    const api = new ConsoleApiClient({ baseUrl: "/cp", fetch: fn });
+    expect(await api.listMachineFields()).toEqual({ fields: [field], order_revision: 7 });
+    expect(await api.createMachineField(input)).toEqual(field);
+    expect(await api.updateMachineField({ ...input, id: field.id, version: 1 })).toMatchObject({ version: 2 });
+    expect(await api.reorderMachineFields([field.key], 7)).toBe(8);
+    expect(await api.reportMachineField(field.key, "cursor+/")).toMatchObject({ total: 0 });
+    await expect(api.deleteMachineField(field.key, { id: field.id, version: 2 })).resolves.toBeUndefined();
+    expect(calls.map(({ url, init }) => [init?.method, url, init?.body && JSON.parse(String(init.body))])).toEqual([
+      ["GET", "/cp/machine-fields", undefined],
+      ["POST", "/cp/machine-fields", input],
+      ["PUT", "/cp/machine-fields/site%2Fscore", { ...input, id: field.id, version: 1 }],
+      ["PUT", "/cp/machine-field-order", { keys: [field.key], order_revision: 7 }],
+      ["GET", "/cp/machine-fields/site%2Fscore/nonconforming?cursor=cursor%2B%2F", undefined],
+      ["DELETE", "/cp/machine-fields/site%2Fscore?id=field-id&version=2", undefined],
+    ]);
+  });
+
+  it.each([
+    [400, "bad_request", "invalid machine field definition"],
+    [404, "not_found", "unknown machine field"],
+    [409, "conflict", "machine field changed, retry"],
+  ])("surfaces HTTP %d and its server message", async (status, kind, error) => {
+    const { fn } = fakeFetch(() => jsonResponse({ error }, status));
+    const api = new ConsoleApiClient({ baseUrl: "/cp", fetch: fn });
+    await expect(api.updateMachineField({ ...input, id: field.id, version: 1 }))
+      .rejects.toMatchObject({ status, kind, code: error });
+  });
+
+  it("returns the stored canonical value from property PUT", async () => {
+    const { fn } = fakeFetch(() => jsonResponse({ property: { key: input.key, value: "7.05" } }));
+    const api = new ConsoleApiClient({ baseUrl: "/cp", fetch: fn });
+    await expect(api.setMachineProperty("m1", input.key, " 007.050 ")).resolves.toEqual({ key: input.key, value: "7.05" });
+  });
+});
+
 interface RecordedCall {
   url: string;
   init?: RequestInit;
@@ -748,6 +796,12 @@ describe("machinesListPath (fleet property filter)", () => {
   it("adds property_key alone (any value) and trims the key", () => {
     expect(machinesListPath({ propertyKey: " site " })).toBe("/machines?property_key=site");
     expect(machinesListPath({ propertyKey: "site", propertyValue: "" })).toBe("/machines?property_key=site");
+  });
+
+  it("preserves a leading U+FEFF for defined keys and trims free-form keys", () => {
+    expect(machinesListPath({ propertyKey: "\uFEFFscore", exactKey: true }))
+      .toBe("/machines?property_key=%EF%BB%BFscore");
+    expect(machinesListPath({ propertyKey: "\uFEFFscore" })).toBe("/machines?property_key=score");
   });
 
   it("adds property_value only when non-empty, and URI-encodes both segments", () => {
@@ -2253,7 +2307,7 @@ describe("ConsoleApiClient session policy (docs/01 §5 seat metering)", () => {
     expect(calls[0].url).toBe("/cp/tenant/session-policy");
     expect(calls[0].init?.method).toBe("GET");
     // An older server sends no session_binding: that is warn (docs/69 step 4).
-    expect(p).toEqual({ max_concurrent_sessions: 5, max_session_seconds: 3600, session_binding: "warn" });
+    expect(p).toEqual({ max_concurrent_sessions: 5, max_session_seconds: 3600, session_binding: "warn", default_max_idle_seconds: 0 });
   });
 
   it("getSessionPolicy parses session_binding require, and refuses an unknown mode", async () => {
@@ -2294,7 +2348,7 @@ describe("ConsoleApiClient session policy (docs/01 §5 seat metering)", () => {
   it("getSessionPolicy accepts an explicit zero (unlimited) as a real value", async () => {
     const { fn } = fakeFetch(() => jsonResponse({ max_concurrent_sessions: 0, max_session_seconds: 0 }));
     const client = new ConsoleApiClient({ baseUrl: "/cp", fetch: fn });
-    expect(await client.getSessionPolicy()).toEqual({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "warn" });
+    expect(await client.getSessionPolicy()).toEqual({ max_concurrent_sessions: 0, max_session_seconds: 0, session_binding: "warn", default_max_idle_seconds: 0 });
   });
 
   it("setSessionPolicy PUTs both fields and returns the echoed value", async () => {
@@ -2304,7 +2358,7 @@ describe("ConsoleApiClient session policy (docs/01 §5 seat metering)", () => {
     expect(calls[0].url).toBe("/cp/tenant/session-policy");
     expect(calls[0].init?.method).toBe("PUT");
     expect(JSON.parse(calls[0].init?.body as string)).toEqual({ max_concurrent_sessions: 3, max_session_seconds: 7200 });
-    expect(out).toEqual({ max_concurrent_sessions: 3, max_session_seconds: 7200, session_binding: "warn" });
+    expect(out).toEqual({ max_concurrent_sessions: 3, max_session_seconds: 7200, session_binding: "warn", default_max_idle_seconds: 0 });
   });
 
   it("setSessionPolicy sends session_binding only when given (omitted, the server keeps the stored mode)", async () => {

@@ -10,7 +10,11 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import type { ConsoleApi, MachineProperty } from "../lib/console_api";
+import { RunHistory } from "./RunHistory";
+import { MachineFieldInput } from "./MachineFieldInput";
+import { canonicalFieldValue } from "../lib/machine_fields";
+import { useMachineFields } from "../lib/use_machine_fields";
+import type { ConsoleApi, MachineField, MachineProperty } from "../lib/console_api";
 import { createLatestWins, type LatestWins } from "../lib/latest_wins";
 import {
   deletePropertyAndRefresh,
@@ -24,9 +28,11 @@ export interface MachinePropertiesPanelProps {
   /** Machine PRIMARY KEY (`MachineRecord.id`), not the device id. */
   machineId: string;
   machineName?: string;
+  onPropertiesChanged?: () => void;
 }
 
-export function MachinePropertiesPanel({ api, machineId, machineName }: MachinePropertiesPanelProps) {
+export function MachinePropertiesPanel({ api, machineId, machineName, onPropertiesChanged }: MachinePropertiesPanelProps) {
+  const { fields, unavailable } = useMachineFields(api);
   const [rows, setRows] = useState<readonly MachineProperty[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,11 +76,16 @@ export function MachinePropertiesPanel({ api, machineId, machineName }: MachineP
         setError(v.message);
         return;
       }
+      if (fields.some((field) => field.key === v.key)) {
+        setError("Use the defined field editor for this key.");
+        return;
+      }
       const token = latest.current.begin();
       setSaving(true);
       setError(null);
       try {
         const list = await setPropertyAndRefresh(api, machineId, v.key, v.value);
+        onPropertiesChanged?.();
         if (latest.current.isCurrent(token)) {
           setRows(list);
           setKey("");
@@ -89,7 +100,7 @@ export function MachinePropertiesPanel({ api, machineId, machineName }: MachineP
         }
       }
     },
-    [api, machineId, key, value],
+    [api, machineId, key, value, onPropertiesChanged, fields],
   );
 
   const handleRemove = useCallback(
@@ -99,6 +110,7 @@ export function MachinePropertiesPanel({ api, machineId, machineName }: MachineP
       setError(null);
       try {
         const list = await deletePropertyAndRefresh(api, machineId, k);
+        onPropertiesChanged?.();
         if (latest.current.isCurrent(token)) setRows(list);
       } catch (err) {
         if (latest.current.isCurrent(token)) setError(err instanceof Error ? err.message : String(err));
@@ -109,11 +121,51 @@ export function MachinePropertiesPanel({ api, machineId, machineName }: MachineP
         }
       }
     },
-    [api, machineId],
+    [api, machineId, onPropertiesChanged],
   );
+
+  const saveField = async (field: MachineField, input: string) => {
+    const token = latest.current.begin();
+    setSaving(true);
+    setError(null);
+    try {
+      const stored = await api.setMachineProperty(machineId, field.key, input);
+      if (latest.current.isCurrent(token)) {
+        setRows((current) => sortPropertiesByKey([...current.filter((p) => p.key !== field.key), stored]));
+      }
+      onPropertiesChanged?.();
+      return true;
+    } catch (err) {
+      if (latest.current.isCurrent(token)) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (latest.current.isCurrent(token)) setSaving(false);
+    }
+    return false;
+  };
+
+  const freeFormRows = rows.filter((p) => !fields.some((field) => field.key === p.key));
 
   return (
     <section className="panel panel--properties" data-testid="machine-properties">
+      {unavailable && <p role="status">Field definitions could not be loaded. You can still edit free-form properties.</p>}
+      {fields.length > 0 && (
+        <section aria-label="Defined fields">
+          <h3>Defined fields</h3>
+          {fields.map((field) => {
+            const stored = rows.find((row) => row.key === field.key)?.value;
+            return (
+              <DefinedProperty
+                key={JSON.stringify([field.id, field.version, stored])}
+                field={field}
+                stored={stored}
+                disabled={busy || saving || removing !== null}
+                onSave={(input) => saveField(field, input)}
+                onClear={() => void handleRemove(field.key)}
+              />
+            );
+          })}
+        </section>
+      )}
       <form className="panel__form" onSubmit={(e) => void handleAdd(e)}>
         <span className="panel__toolbar-title">
           Properties{machineName ? ` — ${machineName}` : ""}
@@ -155,14 +207,14 @@ export function MachinePropertiesPanel({ api, machineId, machineName }: MachineP
           </tr>
         </thead>
         <tbody>
-          {rows.length === 0 && (
+          {freeFormRows.length === 0 && (
             <tr>
               <td className="panel__empty" colSpan={3} data-testid="properties-empty">
                 {busy ? "Loading…" : "No properties set."}
               </td>
             </tr>
           )}
-          {rows.map((p) => (
+          {freeFormRows.map((p) => (
             <tr key={p.key} data-testid={`property-row-${p.key}`}>
               <td className="panel__name">{p.key}</td>
               <td className="panel__mono">{p.value || "—"}</td>
@@ -180,6 +232,43 @@ export function MachinePropertiesPanel({ api, machineId, machineName }: MachineP
           ))}
         </tbody>
       </table>
+      <RunHistory key={machineId} api={api} scope="machines" id={machineId} />
     </section>
+  );
+}
+
+export function DefinedProperty({ field, stored, disabled, onSave, onClear }: {
+  field: MachineField;
+  stored: string | undefined;
+  disabled: boolean;
+  onSave: (input: string) => Promise<boolean>;
+  onClear: () => void;
+}) {
+  const conforms = stored !== undefined && canonicalFieldValue(field, stored) === stored;
+  const [draft, setDraft] = useState<string | undefined>();
+  const input = draft ?? (conforms ? stored : "");
+  const candidate = draft ?? (stored === undefined && field.type === "text" ? "" : undefined);
+  const invalid = candidate !== undefined && canonicalFieldValue(field, candidate) === undefined;
+
+  return (
+    <form className="panel__form" onSubmit={(e) => {
+      e.preventDefault();
+      if (candidate !== undefined && !invalid) void onSave(candidate).then((saved) => { if (saved) setDraft(undefined); });
+    }}>
+      <label className="panel__toolbar-field">
+        {field.label}
+        {field.type === "boolean" ? (
+          <input type="checkbox" checked={input === "true"} aria-checked={input === "" ? "mixed" : input === "true"}
+            ref={(checkbox) => { if (checkbox) checkbox.indeterminate = input === ""; }}
+            disabled={disabled} onChange={(e) => setDraft(String(e.target.checked))} />
+        ) : <MachineFieldInput field={field} value={input} disabled={disabled} onChange={setDraft} maxLength={4096} />}
+      </label>
+      {stored === undefined ? <span>Unset</span> : conforms
+        ? <span>{stored === "" ? "Empty text" : stored}</span>
+        : <span>Nonconforming value <code>{JSON.stringify(stored)}</code></span>}
+      {invalid && <span role="alert">Invalid value for field {field.label}</span>}
+      <button className="panel__action" type="submit" disabled={disabled || invalid || candidate === undefined}>Save</button>
+      <button className="panel__action" type="button" disabled={disabled || stored === undefined} onClick={onClear}>Clear</button>
+    </form>
   );
 }

@@ -130,15 +130,11 @@ func (s *Server) handleRenewSessionPolicy(w http.ResponseWriter, r *http.Request
 		}
 		access = SessionAccessViewOnly
 	}
-	// Pass4: the four group restrictions (prohibit_recording, require_recording,
-	// max_session_duration_seconds, max_idle_seconds) are not applied at renewal. Session starts are
-	// refused when any of these are set (handleStartSession), so no live session should carry them;
-	// and an operator adding them to a group mid-session must not silently acquire unenforceable
-	// policy on an already-running old agent. They stay at their zero-value defaults.
+	// Recording and duration restrictions remain gated at admission. Idle is resolved on each lease.
 	allowRecording := true
 	requireRecording := false
 	var maxSessionDurationSeconds uint32
-	var maxIdleSeconds uint32
+	maxIdleSeconds := uint32(held.MaxIdleSeconds)
 	release, gerr := s.holdIssuance(r.Context(), p.TenantID)
 	if gerr != nil {
 		writeIssuanceRefused(w, gerr)

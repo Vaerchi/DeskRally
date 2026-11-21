@@ -8,8 +8,10 @@
  * for itself; this only decides what the menu offers.
  *
  * Unknown means visible: until GET /me has answered, or when it carries no capability list (an older server), nothing is hidden.
- * A page must never vanish because the console does not know yet.
+ * Fields requires an explicit tenant-wide grant.
  */
+
+import type { MeCapability } from "./fleet_directives";
 
 export const AREA_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
   machines: ["view_machines"],
@@ -30,7 +32,8 @@ export const AREA_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
 };
 
 /** `held`: the capabilities from GET /me, or null when unknown (not answered yet, or an older server without the list). */
-export function areaVisible(area: string, held: ReadonlySet<string> | null): boolean {
+export function areaVisible(area: string, held: ReadonlySet<string> | null, scopes: readonly MeCapability[] = []): boolean {
+  if (area === "fields") return scopes.some((scope) => scope.capability === "manage_tenant" && scope.all_groups);
   if (held === null) return true;
   const needs = AREA_CAPABILITIES[area];
   if (!needs) return true; // live, account, help: always; recordings and platform have their own probes

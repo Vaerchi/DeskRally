@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -134,6 +135,24 @@ func TestPgMachineIDsWithPropertyIsolation(t *testing.T) {
 			t.Fatalf("set site on %s: %v", sp.mid, err)
 		}
 	}
+
+	t.Run("ListPropertiesForMachines", func(t *testing.T) {
+		for _, tc := range []struct {
+			tenant string
+			ids    []string
+			want   map[string]map[string]string
+		}{
+			{tidA, []string{a1, a2, a3, b1}, map[string]map[string]string{a1: {"site": "HQ"}, a2: {"site": "DR"}}},
+			{tidB, []string{a1, a2, a3, b1}, map[string]map[string]string{b1: {"site": "HQ"}}},
+			{tidA, []string{a2}, map[string]map[string]string{a2: {"site": "DR"}}},
+			{tidA, nil, map[string]map[string]string{}},
+		} {
+			got, err := store.ListPropertiesForMachines(ctx, tc.tenant, tc.ids)
+			if err != nil || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("list properties for %v in %s = %v, %v, want %v", tc.ids, tc.tenant, got, err, tc.want)
+			}
+		}
+	})
 
 	want := func(name string, got map[string]struct{}, ids ...string) {
 		t.Helper()

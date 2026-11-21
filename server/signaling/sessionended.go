@@ -232,6 +232,16 @@ func (s *Server) registeredMsg(self *Peer) Registered {
 	if directiveAdvertised {
 		msg.Features = append(msg.Features, directiveFeature)
 	}
+	// docs/70: lan_v1 / wake_v1 only to an installed, ACTIVE machine whose key was proved in enforced mode and
+	// that asked for the feature. Incarnation activation is NOT required here: until it activates, reports are
+	// dropped and the agent keeps retrying them, so the agent need not reconnect to learn the feature.
+	wakeQualifies := activeQualifies && self.wake.proved && self.wake.installedActive.Load()
+	if wakeQualifies && self.wake.lanFeature {
+		msg.Features = append(msg.Features, lanFeature)
+	}
+	if wakeQualifies && self.wake.wakeFeature {
+		msg.Features = append(msg.Features, wakeFeature)
+	}
 	// Stale = told less than the control plane may later confirm. The agent re-reads features only from
 	// its first Registered, so a flip reconnects it (bounce).
 	s.recordSessionEndedStale(self, activeQualifies && (!endedOn || !helpOn))
@@ -425,6 +435,9 @@ func (s *Server) handleSessionEnded(self *Peer, p *SessionEnded) {
 			defer func() { <-guestEndSlots }()
 			return r.reportEnded(context.Background(), id, deviceID, tenantID, reason, age)
 		}()
+		if s.broker != nil && (outcome == "ended" || outcome == "already_ended") {
+			s.broker.endTargetSession(self, id)
+		}
 		reply(outcome)
 	}()
 }

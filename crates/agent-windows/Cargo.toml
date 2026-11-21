@@ -88,6 +88,10 @@ features = [
     # InitCommonControlsEx to opt into the v6 comctl32 (theming). docs/27 step 10.
     "Win32_UI_Controls",
     "Win32_Foundation",
+    # Wake-on-LAN adapter and neighbor tables, interface notifications, and interface-bound UDP.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     # GUI-subsystem stdio sinks (crate::stdio): GetStdHandle/SetStdHandle bind NUL to the missing
     # standard handles of a windows-subsystem process so println! does not panic. docs/27 step 8.
     "Win32_System_Console",
@@ -108,10 +112,11 @@ features = [
     # System tool launchers (crate::launch): CreateEnvironmentBlock so a tool launched AS THE
     # INTERACTIVE USER (WTSQueryUserToken) gets that user's environment, not the SYSTEM helper's.
     "Win32_System_Environment",
-    # One-line command bar (crate::command_run): CreatePipe for stdout/stderr capture, ReadFile +
+    # One-line command bar (crate::command_run): overlapped stdout/stderr capture, ReadFile +
     # CreateFileW (NUL stdin) to drain them, and a Job Object so a timed-out command's whole process
     # tree is killed (KILL_ON_JOB_CLOSE), not just its top process.
     "Win32_System_Pipes",
+    "Win32_System_IO",
     "Win32_Storage_FileSystem",
     # docs/25 F04: GetDriveTypeW lives in Win32_Storage_FileSystem but the DRIVE_* results it
     # returns are filed under WindowsProgramming. The file browser needs DRIVE_REMOTE to refuse a

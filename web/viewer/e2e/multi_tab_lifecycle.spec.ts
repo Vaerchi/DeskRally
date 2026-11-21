@@ -495,18 +495,11 @@ test("session_participants message from signaling server triggers co-tech badge"
   await page.goto(autoConnectUrl(DEVICE_A, "Machine-A"));
   await expect(page.getByTestId("viewer-machine-label")).toBeVisible({ timeout: 15_000 });
 
-  // Push a session_participants message for this device from the "server".
-  await page.evaluate(([wsUrl, deviceId]) => {
-    // The app's signaling subscription is on the real in-page SignalingClient. We push the
-    // participant message via the Playwright WebSocket mock by evaluating in the page context.
-    // Playwright's routeWebSocket intercept lets us send from the test process via `ws.send()`,
-    // but we need to trigger it from the test side. Use the externally-stored mockWs reference.
-    // Since we cannot call mockWs.send() from inside page.evaluate, we expose a helper on window.
-    void wsUrl; void deviceId;
-  }, [SIGNALING_WS, DEVICE_A]);
+  const topBar = page.locator("header.app__topbar");
+  const otherTopBarButtons = topBar.locator("button:not([data-testid='session-participants'])");
+  const originalButtons = await otherTopBarButtons.count();
 
-  // Push the participant message from the test process (outside the page).
-  // mockWs.send() sends FROM the "server" TO the page's SignalingClient.
+  // Push the participant message from the test process (outside the page).  // mockWs.send() sends FROM the "server" TO the page's SignalingClient.
   await expect.poll(() => mockWs !== null, { timeout: 5_000 }).toBe(true);
   mockWs!.send(JSON.stringify({
     type: "session_participants",
@@ -519,6 +512,18 @@ test("session_participants message from signaling server triggers co-tech badge"
   // Badge should appear showing 1 co-tech.
   await expect(page.getByTestId("session-participants")).toBeVisible({ timeout: 5_000 });
   await expect(page.getByTestId("session-participants")).toContainText("1 co-tech");
+
+  const badge = topBar.getByTestId("session-participants");
+  const menu = page.getByRole("dialog", { name: "Session", exact: true });
+  await expect(menu).toBeHidden();
+  await badge.click();
+  const participants = menu.getByRole("group", { name: "Participants", exact: true });
+  await expect(participants).toBeVisible();
+  await expect(participants).toBeFocused();
+  await expect(participants.getByRole("listitem")).toHaveCount(1);
+  await expect(participants.getByRole("listitem")).toContainText("Technician tech-ali");
+  await expect(topBar.getByText("Technician tech-ali", { exact: false })).toHaveCount(0);
+  await expect(otherTopBarButtons).toHaveCount(originalButtons);
 
   // Updating the participant list to two peers updates the badge.
   mockWs!.send(JSON.stringify({

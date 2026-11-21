@@ -8,10 +8,10 @@
 //!
 //! Architecture
 //! -----------
-//! A dedicated OS thread owns the Win32 message loop and the hidden message-only window
-//! that anchors the tray icon (`HWND_MESSAGE` parent — no taskbar entry, not enumerable
-//! by `FindWindow`). `TrayIcon::spawn()` starts this thread and returns a handle; dropping
-//! the handle posts `WM_CLOSE` to the message-only window, which tears down the window and
+//! A dedicated OS thread owns the Win32 message loop and the hidden top-level window
+//! that anchors the tray icon and receives system clock change broadcasts.
+//! `TrayIcon::spawn()` starts this thread and returns a handle. Dropping
+//! the handle posts `WM_CLOSE` to the hidden window, which tears down the window and
 //! causes the message loop to exit cleanly.
 //!
 //! ## Shutdown sequencing
@@ -64,14 +64,14 @@ use windows::{
                 GetMessageW, IsWindow, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
                 TrackPopupMenu, HICON, IDI_APPLICATION, HMENU, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
                 TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WNDCLASSEXW, WM_APP, WM_CLOSE,
-                WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, HWND_MESSAGE,
+                WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMECHANGE,
                 MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
             },
         },
     },
 };
 
-/// Window class name for the hidden message-only window that anchors the tray icon.
+/// Window class name for the hidden window that anchors the tray icon.
 const CLASS_NAME: PCWSTR = windows::core::w!("DeskRallyTray");
 
 /// Tray icon UID — arbitrary; must be unique within this process.
@@ -109,7 +109,7 @@ const TOOLTIP_LABEL: &str = "DeskRally \u{2014} Ready for support";
 /// If spawning failed (no interactive session, shell not running, etc.) the handle is
 /// absent and the session continues without a tray icon.
 pub struct TrayIcon {
-    /// Raw `HWND` inner pointer for the message-only window.  `HWND` wraps `*mut c_void`
+    /// Raw `HWND` inner pointer for the hidden window.  `HWND` wraps `*mut c_void`
     /// which is `!Send`; storing the value as `usize` makes `TrayIcon` unconditionally
     /// `Send` without an unsafe impl.  Reconstructed via `HWND(hwnd_raw as *mut c_void)`
     /// only on the tray thread (in `Drop`, which `PostMessageW` handles cross-thread safely).
@@ -152,7 +152,7 @@ impl TrayIcon {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
-        // Post WM_CLOSE to the message-only window. DefWindowProcW handles WM_CLOSE by
+        // Post WM_CLOSE to the hidden window. DefWindowProcW handles WM_CLOSE by
         // calling DestroyWindow, which synchronously delivers WM_DESTROY to wndproc, which
         // calls PostQuitMessage(0) — causing GetMessageW to return 0 and the loop to exit.
         // This is safe to post as soon as the HWND is valid (window exists from spawn).
@@ -195,8 +195,7 @@ fn tray_thread(hwnd_tx: mpsc::Sender<usize>, help: Option<Arc<HelpHub>>) {
         };
         let _ = RegisterClassExW(&wc);
 
-        // Message-only window (HWND_MESSAGE parent): invisible, not in the taskbar,
-        // not found by FindWindow/EnumWindows. Sole purpose is to receive tray messages.
+        // A hidden top-level window receives WM_TIMECHANGE broadcasts.
         // Pattern mirrors guest_window.rs: raw HWND/HINSTANCE values, HMENU(null) for no menu.
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -207,7 +206,7 @@ fn tray_thread(hwnd_tx: mpsc::Sender<usize>, help: Option<Arc<HelpHub>>) {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            HWND::default(),
             HMENU(std::ptr::null_mut()),
             hinstance,
             None,
@@ -294,12 +293,16 @@ pub(crate) fn encode_tooltip(label: &str) -> [u16; 128] {
     buf
 }
 
-/// Minimal window procedure for the hidden message-only window.
+/// Minimal window procedure for the hidden window.
 ///
 /// `WM_DESTROY` posts `WM_QUIT` to cause the `GetMessageW` loop in `tray_thread` to exit.
 /// `WM_CLOSE` is handled by `DefWindowProcW`, which calls `DestroyWindow`; all other
 /// messages including `WM_TRAY_ICON` (shell callbacks) are also dispatched there.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_TIMECHANGE {
+        crate::wake_agent::on_time_change();
+        return LRESULT(0);
+    }
     if msg == WM_DESTROY {
         PostQuitMessage(0);
         return LRESULT(0);

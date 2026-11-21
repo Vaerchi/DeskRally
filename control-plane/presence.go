@@ -50,6 +50,8 @@ var ErrPresenceUnavailable = errors.New("presence feed unavailable")
 // Presence is the parsed feed: the set of device ids currently connected, with each one's last
 // heartbeat. Keyed by device id for the O(1) intersection the listing does.
 type Presence struct {
+	// WakeCapableByDevice tracks live relay readiness. An absent entry is false.
+	WakeCapableByDevice map[string]bool
 	// Online maps device id → the moment signaling last heard from it.
 	Online map[string]time.Time
 	// OSByDevice maps device id → the agent-asserted os description, for devices that announced
@@ -175,6 +177,7 @@ type PresenceSource interface {
 
 // presenceEntry / presenceResponse mirror server/signaling/presence.go's wire types exactly.
 type presenceEntry struct {
+	WakeCapable    bool   `json:"wake_capable"`
 	DeviceID       string `json:"device_id"`
 	LastSeenUnixMs int64  `json:"last_seen_unix_ms"`
 	// OS is omitted by signaling when the agent announced none; absent decodes as "".
@@ -402,6 +405,7 @@ func (s *SignalingPresenceSource) fetch(ctx context.Context) (*Presence, error) 
 		return nil, fmt.Errorf("%w: %v", ErrPresenceUnavailable, err)
 	}
 	out := &Presence{
+		WakeCapableByDevice:    make(map[string]bool),
 		Online:                 make(map[string]time.Time, len(body.Devices)),
 		OSByDevice:             make(map[string]string),
 		RequireByDevice:        make(map[string]bool),
@@ -416,6 +420,7 @@ func (s *SignalingPresenceSource) fetch(ctx context.Context) (*Presence, error) 
 			continue
 		}
 		out.Online[d.DeviceID] = time.UnixMilli(d.LastSeenUnixMs).UTC()
+		out.WakeCapableByDevice[d.DeviceID] = d.WakeCapable
 		if d.OS != "" {
 			out.OSByDevice[d.DeviceID] = d.OS
 		}

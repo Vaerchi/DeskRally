@@ -62,6 +62,12 @@ export type ColorMode = "Full" | "Gray";
  */
 export type CommandShell = "Cmd" | "PowerShell";
 
+/** A signed receipt kept opaque for HTTP relay, with its dispatch ID for correlation. */
+export interface RunReceipt {
+  requestId: string;
+  receipt: Record<string, unknown>;
+}
+
 /** The content of an agent → controller `CommandResult`: a finished (or killed) command's capture. */
 export interface CommandResult {
   /** The process exit code (`-1` when `timed_out` — the kill code). */
@@ -394,7 +400,8 @@ export type ControlMessage =
   | { t: "ToolLaunched"; c: { tool: string } }
   // Remote support: controller → agent "run this one-line command, capture output" (`as_user` picks
   // SYSTEM vs the interactive user). Answered with `CommandResult`, or `Error` if it could not start.
-  | { t: "RunCommand"; c: { command: string; shell: CommandShell; as_user: boolean } }
+  | { t: "RunCommand"; c: { command: string; shell: CommandShell; as_user: boolean; request_id?: string } }
+  | { t: "RunReceipt"; c: RunReceipt }
   // Remote support: agent → controller, the captured result of a `RunCommand` OR an `ElevatedRun`.
   | { t: "CommandResult"; c: CommandResult }
   // Remote support (loop 87, docs/01 §3): controller → agent "run this ONE command with the guest's
@@ -678,11 +685,14 @@ export function encodeControl(msg: ControlMessage): Uint8Array {
       obj = { t: msg.t, c: { tool: msg.c.tool } };
       break;
     case "RunCommand":
-      // serde field order: command, shell, as_user.
+      // serde field order: command, shell, as_user, optional request_id.
       obj = {
         t: msg.t,
-        c: { command: msg.c.command, shell: msg.c.shell, as_user: msg.c.as_user },
+        c: { command: msg.c.command, shell: msg.c.shell, as_user: msg.c.as_user, request_id: msg.c.request_id },
       };
+      break;
+    case "RunReceipt":
+      obj = { t: msg.t, c: msg.c.receipt };
       break;
     case "ElevatedRun":
       // serde field order: signed_elevation, command, shell.
@@ -1093,7 +1103,7 @@ export function decodeControl(bytes: Uint8Array): ControlMessage {
       return { t: "ToolLaunched", c: { tool: c.tool } };
     }
     case "RunCommand": {
-      const c = obj.c as { command?: unknown; shell?: unknown; as_user?: unknown } | undefined;
+      const c = obj.c as { command?: unknown; shell?: unknown; as_user?: unknown; request_id?: unknown } | undefined;
       // Strict: every field required, and `shell` must be one of the two known values — an unknown
       // shell is rejected, not defaulted to Cmd (which would run a PS line through the wrong interpreter).
       if (
@@ -1104,7 +1114,11 @@ export function decodeControl(bytes: Uint8Array): ControlMessage {
       ) {
         throw new Error("malformed RunCommand");
       }
-      return { t: "RunCommand", c: { command: c.command, shell: c.shell, as_user: c.as_user } };
+      if (c.request_id != null && typeof c.request_id !== "string") throw new Error("malformed RunCommand");
+      return { t: "RunCommand", c: {
+        command: c.command, shell: c.shell, as_user: c.as_user,
+        ...(typeof c.request_id === "string" ? { request_id: c.request_id } : {}),
+      } };
     }
     case "ElevatedRun": {
       const c = obj.c as
@@ -1130,6 +1144,16 @@ export function decodeControl(bytes: Uint8Array): ControlMessage {
       const c = obj.c as { reason?: unknown } | undefined;
       if (!c || typeof c.reason !== "string") throw new Error("malformed ElevationDenied");
       return { t: "ElevationDenied", c: { reason: c.reason } };
+    }
+    case "RunReceipt": {
+      const receipt = obj.c as Record<string, unknown> | undefined;
+      const claims = receipt?.claims as Record<string, unknown> | undefined;
+      const requestId = claims?.request_id;
+      if (!receipt || Array.isArray(receipt) || typeof receipt.sig !== "string" ||
+          !claims || Array.isArray(claims) || typeof requestId !== "string" || !requestId) {
+        throw new Error("malformed RunReceipt");
+      }
+      return { t: "RunReceipt", c: { requestId, receipt } };
     }
     case "CommandResult": {
       const c = obj.c as Partial<CommandResult> | undefined;
@@ -1449,7 +1473,8 @@ export const runCommand = (
   command: string,
   shell: CommandShell,
   asUser: boolean,
-): ControlMessage => ({ t: "RunCommand", c: { command, shell, as_user: asUser } });
+  requestId?: string,
+): ControlMessage => ({ t: "RunCommand", c: { command, shell, as_user: asUser, ...(requestId !== undefined ? { request_id: requestId } : {}) } });
 
 /**
  * Run ONE command on the guest with the interactive user's LINKED ELEVATED token (loop 87, docs/01
@@ -1622,6 +1647,7 @@ export class ControlClient {
   private readonly onShutDownScheduled?: () => void;
   /** Optional callback fired when the agent acks a `LaunchTool` (`tool` = the whitelist key). */
   private readonly onToolLaunched?: (tool: string) => void;
+  private readonly onRunReceipt?: (receipt: RunReceipt) => void;
   /** Optional callback fired when the agent returns a `CommandResult` (one-line command bar, or an
    *  `elevatedRun`). */
   private readonly onCommandResult?: (result: CommandResult) => void;
@@ -1717,6 +1743,7 @@ export class ControlClient {
       onLogOffScheduled?: () => void;
       onShutDownScheduled?: () => void;
       onToolLaunched?: (tool: string) => void;
+      onRunReceipt?: (receipt: RunReceipt) => void;
       onCommandResult?: (result: CommandResult) => void;
       onElevationDenied?: (reason: string) => void;
       onDirectoryListing?: (listing: DirectoryListing) => void;
@@ -1761,6 +1788,7 @@ export class ControlClient {
     this.onLogOffScheduled = handlers.onLogOffScheduled;
     this.onShutDownScheduled = handlers.onShutDownScheduled;
     this.onToolLaunched = handlers.onToolLaunched;
+    this.onRunReceipt = handlers.onRunReceipt;
     this.onCommandResult = handlers.onCommandResult;
     this.onElevationDenied = handlers.onElevationDenied;
     this.onDirectoryListing = handlers.onDirectoryListing;
@@ -1930,8 +1958,8 @@ export class ControlClient {
    * (→ `onError`) if the process could not be started. One command at a time — a second sent while one
    * is still running is refused by the agent with an `Error`.
    */
-  runCommand(command: string, shell: CommandShell, asUser: boolean): void {
-    this.send(encodeControl(runCommand(command, shell, asUser)));
+  runCommand(command: string, shell: CommandShell, asUser: boolean, requestId?: string): void {
+    this.send(encodeControl(runCommand(command, shell, asUser, requestId)));
   }
 
   /**
@@ -2117,6 +2145,9 @@ export class ControlClient {
       case "ToolLaunched":
         this.onToolLaunched?.(msg.c.tool);
         break;
+      case "RunReceipt":
+        this.onRunReceipt?.(msg.c);
+        return;
       case "CommandResult":
         this.onCommandResult?.(msg.c);
         break;

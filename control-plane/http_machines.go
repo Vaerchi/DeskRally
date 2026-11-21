@@ -4,11 +4,13 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
@@ -28,12 +30,7 @@ func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
 	}
 	// RLS already scoped the query to the tenant; now filter to the groups the caller's
 	// memberships actually cover, so a group-scoped viewer only sees their machines.
-	visible := make([]Machine, 0, len(all))
-	for _, m := range all {
-		if p.Grant.AllowsInGroup(CapViewMachines, m.GroupID) {
-			visible = append(visible, m)
-		}
-	}
+	visible := visibleMachines(p, all)
 	// Optional custom-property filter (docs/01 §4): `?property_key=site[&property_value=HQ]` narrows
 	// the listing to machines carrying that property. The matching-id set is INTERSECTED with what the
 	// caller can already see (never unioned), so the filter can only narrow a listing — it can never
@@ -59,12 +56,51 @@ func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
 	}
 	presenceKnown := s.annotatePresence(r, p.TenantID, visible, all)
 	stampDerived(visible)
+	var rows any = visible
+	if r.URL.Query().Get("include") == "properties" {
+		if s.MachineProperties == nil {
+			writeError(w, http.StatusInternalServerError, "machine property store not configured")
+			return
+		}
+		ids := make([]string, 0, len(visible))
+		for _, m := range visible {
+			ids = append(ids, m.ID)
+		}
+		properties, err := s.MachineProperties.ListPropertiesForMachines(r.Context(), p.TenantID, ids)
+		if err != nil {
+			writeListError(w, err, "could not list machine properties")
+			return
+		}
+		type machineWithProperties struct {
+			Machine
+			Properties map[string]string `json:"properties"`
+		}
+		enriched := make([]machineWithProperties, 0, len(visible))
+		for _, m := range visible {
+			bag := properties[m.ID]
+			if bag == nil {
+				bag = map[string]string{}
+			}
+			enriched = append(enriched, machineWithProperties{Machine: m, Properties: bag})
+		}
+		rows = enriched
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"machines": visible,
+		"machines": rows,
 		// Explicit so the console can say "presence unavailable" instead of silently rendering
 		// every machine as offline when the feed is down (see presence.go's fail-soft note).
 		"presence_known": presenceKnown,
 	})
+}
+
+func visibleMachines(p *Principal, all []Machine) []Machine {
+	visible := make([]Machine, 0, len(all))
+	for _, m := range all {
+		if p.Grant.AllowsInGroup(CapViewMachines, m.GroupID) {
+			visible = append(visible, m)
+		}
+	}
+	return visible
 }
 
 // annotatePresence stamps Online/LastSeen onto the caller's OWN machines from the signaling
@@ -105,6 +141,7 @@ func (s *Server) annotatePresence(r *http.Request, tenantID string, visible, own
 		}
 		return false
 	}
+	s.annotateWake(r, visible, owned, snapshot)
 	for i := range visible {
 		// Take the address of a per-iteration copy, not of the loop variable.
 		online := snapshot.IsOnline(visible[i].DeviceID)
@@ -843,85 +880,168 @@ func (s *Server) handleListMachineProperties(w http.ResponseWriter, r *http.Requ
 // setMachinePropertyRequest is the body of PUT /machines/{id}/properties/{key}. The key is the path
 // segment; only the value travels in the body.
 type setMachinePropertyRequest struct {
-	Value string `json:"value"`
+	Value          string `json:"value"`
+	invalidUnicode bool
 }
 
-// handleSetMachineProperty backs PUT /machines/{id}/properties/{key}: idempotent upsert of one
-// custom property, gated on CapManageMachines for the machine's group. Returns {"property": {...}}.
+// machinePropertyJSONValue retains the raw value's Unicode validity while
+// preserving encoding/json's string and null handling.
+type machinePropertyJSONValue struct {
+	value             string
+	unpairedSurrogate bool
+}
+
+func (v *machinePropertyJSONValue) UnmarshalJSON(data []byte) error {
+	if data[0] == '"' {
+		v.unpairedSurrogate = hasUnpairedJSONSurrogate(data)
+	}
+	return json.Unmarshal(data, &v.value)
+}
+
+func (req *setMachinePropertyRequest) UnmarshalJSON(data []byte) error {
+	raw := struct {
+		Value machinePropertyJSONValue `json:"value"`
+	}{Value: machinePropertyJSONValue{value: req.Value}}
+	err := json.Unmarshal(data, &raw)
+	req.Value = raw.Value.value
+	req.invalidUnicode = !utf8.Valid(data) || raw.Value.unpairedSurrogate
+	return err
+}
+
 func (s *Server) handleSetMachineProperty(w http.ResponseWriter, r *http.Request) {
-	m, ok := s.resolveMachineForProperties(w, r, CapManageMachines)
-	if !ok {
-		return
-	}
-	p := principalFrom(r.Context())
-	key := r.PathValue("key") // single path segment, already URL-unescaped by ServeMux
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "key is required")
-		return
-	}
-	if len(key) > maxMachinePropertyKeyLen {
-		writeError(w, http.StatusBadRequest, "key is too long")
-		return
-	}
-	var req setMachinePropertyRequest
-	// docs/25 F05: one property value, itself capped at maxMachinePropertyValueLen (4 KiB) two checks
-	// below — but that check could only run AFTER an unbounded decode had already buffered whatever
-	// the client sent, with the tenant connection pinned throughout. The transport bound has to come
-	// first; the semantic bound stays where it is.
-	if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &req, "malformed set-property request body"); err != nil {
-		return
-	}
-	if len(req.Value) > maxMachinePropertyValueLen {
-		writeError(w, http.StatusBadRequest, "value is too long")
-		return
-	}
-	if err := s.MachineProperties.SetProperty(r.Context(), p.TenantID, m.ID, key, req.Value); err != nil {
-		// A cross-tenant/unknown machine surfaces here as ErrMachineNotFound (the composite FK), even
-		// though the resolve above already 404s it — belt and suspenders on the direct-store path.
-		if errors.Is(err, ErrMachineNotFound) {
-			writeError(w, http.StatusNotFound, "unknown machine")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "could not set machine property")
-		return
-	}
-	// Audit the mutation; a recording failure fails the request (handleEnroll pattern): an
-	// unauditable mutation must not happen silently.
-	if err := s.recordMgmtAudit(r, "machine.property.set", "machine", m.ID,
-		map[string]any{"key": key}); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not record audit event")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"property": MachineProperty{Key: key, Value: req.Value}})
+	s.handleSingleMachinePropertyEdit(w, r, false)
 }
 
-// handleDeleteMachineProperty backs DELETE /machines/{id}/properties/{key}: remove one custom
-// property, gated on CapManageMachines for the machine's group. Deleting an absent key is a 404.
 func (s *Server) handleDeleteMachineProperty(w http.ResponseWriter, r *http.Request) {
-	m, ok := s.resolveMachineForProperties(w, r, CapManageMachines)
+	s.handleSingleMachinePropertyEdit(w, r, true)
+}
+
+func (s *Server) handleSingleMachinePropertyEdit(w http.ResponseWriter, r *http.Request, remove bool) {
+	// As on origin/main: resolve and authorize the target first (group-specific 403 / 404 unknown machine),
+	// with no earlier capability check; the transaction re-checks scope on the locked row.
+	machine, ok := s.resolveMachineForProperties(w, r, CapManageMachines)
 	if !ok {
 		return
 	}
 	p := principalFrom(r.Context())
+	store := s.fieldStore(w)
+	if store == nil {
+		return
+	}
 	key := r.PathValue("key")
 	if key == "" {
 		writeError(w, http.StatusBadRequest, "key is required")
 		return
 	}
-	if err := s.MachineProperties.DeleteProperty(r.Context(), p.TenantID, m.ID, key); err != nil {
-		if errors.Is(err, ErrMachinePropertyNotFound) {
-			writeError(w, http.StatusNotFound, "unknown property")
+	if !remove {
+		if err := validateMachinePropertyKey(key); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "could not delete machine property")
+	}
+	var req setMachinePropertyRequest
+	if !remove {
+		if decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &req, "malformed set-property request body") != nil {
+			return
+		}
+		if len(req.Value) > maxMachinePropertyValueLen {
+			writeError(w, http.StatusBadRequest, "value is too long")
+			return
+		}
+	}
+	edit := machinePropertyEdit{key: key, value: req.Value, remove: remove, invalidUnicode: req.invalidUnicode}
+	_, isMemory := s.Machines.(*InMemoryMachineStore)
+	_ = edit.prepare([]string{machine.ID}, isMemory)
+	events, err := store.editProperties(r.Context(), p, s.Machines, s.MgmtAudit, &edit)
+	if err != nil {
+		if IsDenied(err) {
+			writeDenied(w, err)
+		} else {
+			writeMachineFieldError(w, err)
+		}
 		return
 	}
-	if err := s.recordMgmtAudit(r, "machine.property.delete", "machine", m.ID,
-		map[string]any{"key": key}); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not record audit event")
+	switch edit.results[0].Error {
+	case "unknown machine":
+		writeError(w, http.StatusNotFound, "unknown machine")
+		return
+	case "not set":
+		writeError(w, http.StatusNotFound, "unknown property")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "key": key})
+	s.dispatchMachineFieldEvents(p, events)
+	if remove {
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "key": key})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"property": MachineProperty{Key: key, Value: edit.value}})
+}
+
+type bulkSetMachinePropertyRequest struct {
+	MachineIDs     []string `json:"machine_ids"`
+	Key            string   `json:"key"`
+	Value          string   `json:"value"`
+	Delete         bool     `json:"delete"`
+	invalidUnicode bool
+}
+
+func (req *bulkSetMachinePropertyRequest) UnmarshalJSON(data []byte) error {
+	type request bulkSetMachinePropertyRequest
+	raw := struct {
+		*request
+		Value machinePropertyJSONValue `json:"value"`
+	}{request: (*request)(req), Value: machinePropertyJSONValue{value: req.Value}}
+	err := json.Unmarshal(data, &raw)
+	req.Value = raw.Value.value
+	req.invalidUnicode = !utf8.Valid(data) || raw.Value.unpairedSurrogate
+	return err
+}
+
+func (s *Server) handleBulkSetMachineProperty(w http.ResponseWriter, r *http.Request) {
+	p := principalFrom(r.Context())
+	if err := p.Grant.Require(CapManageMachines); err != nil {
+		writeDenied(w, err)
+		return
+	}
+	if s.Machines == nil || s.MachineProperties == nil {
+		writeError(w, http.StatusInternalServerError, "machine or property store not configured")
+		return
+	}
+	var req bulkSetMachinePropertyRequest
+	if err := decodeJSONBody(w, r, maxBulkJSONBodyBytes, &req, "malformed request body"); err != nil {
+		return
+	}
+	if err := validateMachinePropertyKey(req.Key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	switch {
+	case !req.Delete && len(req.Value) > maxMachinePropertyValueLen:
+		writeError(w, http.StatusBadRequest, "value is too long")
+		return
+	case len(req.MachineIDs) == 0:
+		writeError(w, http.StatusBadRequest, "machine_ids must not be empty")
+		return
+	case len(req.MachineIDs) > maxBulkStatusMachines:
+		writeError(w, http.StatusBadRequest, "at most 200 machines per request")
+		return
+	}
+	edit := machinePropertyEdit{key: req.Key, value: req.Value, remove: req.Delete, bulk: true, invalidUnicode: req.invalidUnicode}
+	if err := edit.prepare(req.MachineIDs, false); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	store := s.fieldStore(w)
+	if store == nil {
+		return
+	}
+	events, err := store.editProperties(r.Context(), p, s.Machines, s.MgmtAudit, &edit)
+	if err != nil {
+		writeMachineFieldError(w, err)
+		return
+	}
+	s.dispatchMachineFieldEvents(p, events)
+	writeJSON(w, http.StatusOK, map[string]any{"results": edit.results})
 }
 
 // enrollRequest is the body of POST /enroll: the target group plus optional identity fields. The

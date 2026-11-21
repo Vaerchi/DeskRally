@@ -25,7 +25,7 @@ export interface AdhocRunDeps {
   /** The control-plane session id of the CURRENT connection, or null. Read again after the await. */
   currentSessionId: () => string | null;
   /** Send `RunCommand` to the current agent. */
-  sendRunCommand: (command: string, shell: CommandShell, asUser: boolean) => void;
+  sendRunCommand: (command: string, shell: CommandShell, asUser: boolean, requestId: string) => void;
   /** Is THIS run still the current operation (no newer command, same connection)? Checked after the
    *  await: a superseded run neither sends nor reports. */
   isCurrent: () => boolean;
@@ -49,6 +49,6 @@ export async function runAdhocCommand(spec: AdhocCommandSpec, deps: AdhocRunDeps
   if (deps.currentSessionId() !== sessionId) {
     return { sent: false, stale: false, error: "The session changed while the command was being authorized; nothing ran." };
   }
-  deps.sendRunCommand(grant.command, grant.shell === "cmd" ? "Cmd" : "PowerShell", grant.run_as === "user");
+  deps.sendRunCommand(grant.command, grant.shell === "cmd" ? "Cmd" : "PowerShell", grant.run_as === "user", grant.request_id);
   return { sent: true, requestId: grant.request_id };
 }

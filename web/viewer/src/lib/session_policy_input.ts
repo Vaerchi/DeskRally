@@ -9,6 +9,23 @@ export const MAX_SESSION_LIMIT = 100000;
 export const MIN_SESSION_SECONDS = 60;
 export const MAX_SESSION_SECONDS_CEILING = 2592000;
 
+export const MAX_DEFAULT_IDLE_MINUTES = 60;
+
+export function defaultIdleMinutes(seconds: number): string {
+  return String(seconds / 60);
+}
+
+export function parseDefaultIdleMinutes(text: string): number | null {
+  const value = text.trim();
+  if (!/^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/.test(value)) return null;
+  const minutes = Number(value);
+  if (minutes > MAX_DEFAULT_IDLE_MINUTES) return null;
+  const seconds = minutes * 60;
+  const rounded = Math.round(seconds);
+  // Allow floating-point error when displaying an API value that includes partial minutes.
+  return Math.abs(seconds - rounded) < 1e-9 && (rounded > 0 || minutes === 0) ? rounded : null;
+}
+
 export interface SessionPolicyInput {
   max_concurrent_sessions: number;
   max_session_seconds: number;

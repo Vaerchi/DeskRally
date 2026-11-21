@@ -192,6 +192,7 @@ pub struct SignalingClient {
     /// The local address of this connection's TCP socket: the interface the OS actually routes to the
     /// signaling server through. ICE limits its host candidates to it (see `ice_route_ip`).
     local_ip: Option<std::net::IpAddr>,
+    connected_at: (std::time::SystemTime, Instant),
 }
 
 fn socket_local_ip(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) -> Option<std::net::IpAddr> {
@@ -223,6 +224,7 @@ impl SignalingClient {
         let (ws, _resp) = connect_async_tls_with_config(url, None, false, Some(tls))
             .await
             .map_err(|e| e.to_string())?;
+        let connected_at = (std::time::SystemTime::now(), Instant::now());
         let local_ip = socket_local_ip(ws.get_ref());
         let (write, mut read) = ws.split();
 
@@ -284,7 +286,18 @@ impl SignalingClient {
             let _ = cancel_tx_r.send(true);
         });
 
-        Ok((Self { out_tx, liveness, cancel_tx, local_ip }, in_rx))
+        Ok((Self { out_tx, liveness, cancel_tx, local_ip, connected_at }, in_rx))
+    }
+
+    /// Wall and monotonic clock samples taken when this signaling connection was established.
+    pub fn connected_at(&self) -> (std::time::SystemTime, Instant) {
+        self.connected_at
+    }
+
+    /// Wait until this connection is retired, including when retirement already happened.
+    pub async fn closed(&self) {
+        let mut rx = self.cancel_tx.subscribe();
+        let _ = rx.wait_for(|closed| *closed).await;
     }
 
     /// The local IP this connection reaches the signaling server from, when it is routable (not

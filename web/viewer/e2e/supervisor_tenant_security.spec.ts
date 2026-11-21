@@ -71,6 +71,7 @@ test("a failed or malformed session policy read disables the inputs and Save", a
   await expect(page.getByTestId("session-limit-error")).toBeVisible();
   await expect(page.getByTestId("session-limit-input")).toBeDisabled();
   await expect(page.getByTestId("session-maxage-input")).toBeDisabled();
+  await expect(page.getByTestId("session-default-idle-input")).toBeDisabled();
   await expect(page.getByTestId("session-limit-save")).toBeDisabled();
   await expect(page.getByTestId("session-limit-current")).toHaveCount(0);
   await expect(page.getByTestId("session-maxage-current")).toHaveCount(0);
@@ -81,6 +82,7 @@ test("a malformed session policy body is treated as unread", async ({ page }) =>
   await expect(page.getByTestId("session-limit-error")).toBeVisible();
   await expect(page.getByTestId("session-limit-input")).toBeDisabled();
   await expect(page.getByTestId("session-maxage-input")).toBeDisabled();
+  await expect(page.getByTestId("session-default-idle-input")).toBeDisabled();
   await expect(page.getByTestId("session-limit-save")).toBeDisabled();
   await expect(page.getByTestId("session-limit-current")).toHaveCount(0);
 });
@@ -100,6 +102,33 @@ test("when every read succeeds the controls are enabled and show the server valu
   await expect(page.getByTestId("session-maxage-input")).toHaveValue("3600");
   await expect(page.getByTestId("session-limit-save")).toBeEnabled();
   await expect(page.getByTestId("session-limit-current")).toContainText("5");
+});
+
+test("saves the organization idle timeout in seconds and reads it back in minutes", async ({ page }) => {
+  await mount(page, { security: "ok", session: "ok" });
+
+  let policy = { max_concurrent_sessions: 5, max_session_seconds: 3600, default_max_idle_seconds: 0 };
+  await page.route("**/cp/tenant/session-policy", async (route) => {
+    if (route.request().method() === "PUT") {
+      policy = { ...policy, ...route.request().postDataJSON() };
+    }
+    await route.fulfill({ json: policy });
+  });
+
+  const idle = page.getByTestId("session-default-idle-input");
+  await expect(idle).toHaveValue("0");
+  await idle.fill("12");
+  const saved = page.waitForResponse((response) =>
+    response.url().endsWith("/cp/tenant/session-policy") && response.request().method() === "PUT",
+  );
+  await page.getByTestId("session-limit-save").click();
+  await saved;
+  expect(policy.default_max_idle_seconds).toBe(720);
+
+  await page.reload();
+  await (await consoleTab(page, { name: "Security" })).click();
+  await expect(idle).toBeEnabled();
+  await expect(idle).toHaveValue("12");
 });
 
 // docs/69 step 4: turning on "Require verified sessions" PUTs require WITH the saved limits (the PUT replaces the

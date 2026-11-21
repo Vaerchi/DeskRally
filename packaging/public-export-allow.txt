@@ -566,3 +566,24 @@ web/viewer/e2e/session_binding_live.spec.ts:credential-assignment-review
 web/viewer/e2e/session_binding_live.spec.ts:literal-credential
 web/viewer/e2e/session_binding_live.spec.ts:long-hex
 web/viewer/src/lib/session_binding.test.ts:long-hex
+# 2026-11-20 sync: WoL (docs/70), run receipts (docs/72) - golden vectors (fixed test seeds: public keys/signatures/placeholder UUIDs), RFC1918 test networks, token variable names and placeholder test strings; reviewed by Claude.
+control-plane/http_wake_test.go:long-hex
+control-plane/lan_pgstore_test.go:private-network
+control-plane/lan_test.go:private-network
+control-plane/pgstore_wake_test.go:literal-credential
+control-plane/pgstore_wake.go:literal-credential
+control-plane/wake_dispatch_test.go:credential-assignment-review
+control-plane/wake_dispatch_test.go:literal-credential
+control-plane/wake_dispatch_test.go:long-hex
+control-plane/wake_vectors_test.go:private-network
+crates/agent-windows/src/lan_facts.rs:private-network
+crates/agent-windows/src/lan_reporter.rs:private-network
+crates/protocol/src/signaling.rs:private-network
+crates/protocol/testdata/run-receipt-vectors.json:long-base64
+crates/protocol/testdata/run-receipt-vectors.json:long-hex
+crates/protocol/testdata/run-receipt-vectors.json:private-network
+crates/protocol/testdata/wake-vectors.json:long-base64
+crates/protocol/testdata/wake-vectors.json:long-hex
+crates/protocol/testdata/wake-vectors.json:private-network
+server/signaling/wake_test.go:private-network
+server/signaling/wake.go:literal-credential

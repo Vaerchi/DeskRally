@@ -976,6 +976,7 @@ async fn main() {
                 command: command.clone(),
                 shell: *shell,
                 as_user: *as_user,
+                request_id: None,
             });
             sends_attempted += 1;
             if let Err(e) = t.send_frame(Frame::new(ChannelId::Control, payload)).await {

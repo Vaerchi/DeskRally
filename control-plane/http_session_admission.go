@@ -110,12 +110,14 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 		limits.MaxObserversPerMachine = 2
 	}
 	var tenantMaxSessionSeconds int
+	var tenantPolicy SessionPolicy
 	var bindingMode SessionBindingMode
 	if s.SessionPolicies != nil {
 		pol, perr := s.SessionPolicies.Get(ctx, tenantID)
 		if perr != nil {
 			return nil, &sessionRefusal{Status: http.StatusInternalServerError, Msg: "could not resolve session policy"}
 		}
+		tenantPolicy = pol
 		limits.Tenant = pol.MaxConcurrentSessions
 		tenantMaxSessionSeconds = pol.MaxSessionSeconds
 		bindingMode = SessionBindingMode(bindingOrWarn(pol.SessionBinding))
@@ -148,7 +150,7 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 				return nil, &sessionRefusal{Status: http.StatusInternalServerError, Msg: "could not resolve group session policy"}
 			}
 		}
-		// PASS4 ABSOLUTE GATE: all four new group restrictions are refused for unattended
+		// PASS4 ABSOLUTE GATE: recording and session duration restrictions are refused for unattended
 		// sessions until per-session agent capability negotiation ships.
 		//
 		// require_session_policy pre-dates migrations 0043–0046. A machine with that flag
@@ -161,11 +163,15 @@ func (s *Server) resolveSessionAdmission(ctx context.Context, tenantID, userID s
 			return nil, &sessionRefusal{Status: http.StatusForbidden, Msg: "require_recording is temporarily not supported for unattended sessions; " +
 				"this restriction will be enabled once agent capability negotiation is available"}
 		}
-		if gp.ProhibitRecording || gp.MaxSessionDurationSeconds > 0 || gp.MaxIdleSeconds > 0 {
-			return nil, &sessionRefusal{Status: http.StatusForbidden, Msg: "prohibit_recording, max_session_duration_seconds, and max_idle_seconds are temporarily " +
+		if gp.ProhibitRecording || gp.MaxSessionDurationSeconds > 0 {
+			return nil, &sessionRefusal{Status: http.StatusForbidden, Msg: "prohibit_recording and max_session_duration_seconds are temporarily " +
 				"not supported for unattended sessions; these restrictions will be enforced once " +
 				"agent capability negotiation is available"}
 		}
+	}
+	groupPolicy.MaxIdleSeconds = effectiveSessionIdleSeconds(groupPolicy.MaxIdleSeconds, tenantPolicy)
+	if groupPolicy.MaxIdleSeconds > 0 && s.Grants == nil {
+		return nil, &sessionRefusal{Status: http.StatusInternalServerError, Msg: "idle timeout requires a configured ticket and policy issuer"}
 	}
 	return &sessionAdmission{Rec: rec, Limits: limits, GroupPolicy: groupPolicy, TenantMaxSessionSeconds: tenantMaxSessionSeconds, BindingMode: bindingMode}, nil
 }
@@ -194,12 +200,16 @@ func (s *Server) brokerSessionStart(ctx context.Context, rec *SessionRecord, m *
 			ticket = s.Grants.MintObserverSessionTicket(rec.ID, userID, tenantID, m.DeviceID,
 				now, now+sessionTicketTTL.Milliseconds())
 		}
-		resp["signaling"] = map[string]any{
+		signaling := map[string]any{
 			"url":        url,
 			"device_id":  m.DeviceID,
 			"session_id": rec.ID,
 			"ticket":     ticket,
 		}
+		if attestation := s.sessionNameAttestation(ctx, ticket.Claims); attestation != nil {
+			signaling["name_attestation"] = attestation
+		}
+		resp["signaling"] = signaling
 		// docs/69: the trust material that lets the console and the agent bind this session to their
 		// keys. For EVERY brokered session, so before the policy's early return below; the grant's level
 		// is the one the policy below would carry.

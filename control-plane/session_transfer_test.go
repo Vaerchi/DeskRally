@@ -792,8 +792,19 @@ func TestTransferTicketIdempotentBeforeRedemptionAnd409After(t *testing.T) {
 			if str(sig, "session_id") != s2 || str(sig, "device_id") != transferTestDevice || str(sig, "url") != "ws://signal.example/ws" {
 				t.Fatalf("signaling = %v", sig)
 			}
-			if _, ok := sig["ticket"].(map[string]any); !ok {
-				t.Fatalf("no ticket in %v", sig)
+			ticket, ok := sig["ticket"].(map[string]any)
+			if !ok {
+				t.Fatal("transfer response has no ticket")
+			}
+			attestation, ok := sig["name_attestation"].(map[string]any)
+			if !ok {
+				t.Fatal("transfer response has no name attestation")
+			}
+			claims := attestation["claims"].(map[string]any)
+			ticketClaims := ticket["claims"].(map[string]any)
+			if claims["display_name"] != "Bob" || claims["technician_id"] != h.bob ||
+				claims["session_id"] != s2 || claims["exp_ms"] != ticketClaims["exp_ms"] {
+				t.Fatal("transfer attestation is not bound to the recipient and their ticket")
 			}
 		}
 		// S2's brokering is the same as POST /sessions': the plain control path mints no policy for a group

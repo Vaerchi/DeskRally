@@ -183,13 +183,13 @@ pub fn key_fingerprint(pubkey_hex: &str) -> Option<String> {
     Some(hex::encode(Sha256::digest(&raw)))
 }
 
-fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
+pub(crate) fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
     out.extend_from_slice(field);
 }
 
 /// Raw bytes of a CANONICAL UUID (36 chars, hyphens at 8/13/18/23): the same strictness as Go's `uuidBytes`.
-fn uuid_raw(s: &str) -> Option<[u8; 16]> {
+pub(crate) fn uuid_raw(s: &str) -> Option<[u8; 16]> {
     let b = s.as_bytes();
     if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
         return None;

@@ -46,11 +46,17 @@ const RECORD: SessionRecord = {
   note: "",
 };
 
+const NAME: NonNullable<SessionSignaling["name_attestation"]> = {
+  claims: { v: 1, session_id: "s-1", technician_id: "u-1", display_name: "Ada", exp_ms: TICKET.claims.exp_ms },
+  sig: "cd".repeat(64),
+};
+
 const SIGNALING: SessionSignaling = {
   url: "ws://cp-signal.example:8080/ws",
   device_id: DEVICE,
   session_id: "s-1",
   ticket: TICKET,
+  name_attestation: NAME,
 };
 
 /** Minimal WebSocket stand-in: opens on a microtask, records every sent payload. */
@@ -103,11 +109,13 @@ describe("M2 brokered connect wiring", () => {
     vi.stubGlobal("WebSocket", FakeWebSocket);
     const signaling = new SignalingClient(brokered!.signaling.url);
     await signaling.open();
-    signaling.requestConnect(asDeviceId(DEVICE), brokered!.signaling.ticket);
+    signaling.requestConnect(asDeviceId(DEVICE), brokered!.signaling.ticket, brokered!.signaling.name_attestation);
 
     const ws = FakeWebSocket.instances[0];
     expect(ws.url).toBe(SIGNALING.url);
-    expect(JSON.parse(ws.sent[0])).toEqual({ type: "connect_request", target: DEVICE, ticket: TICKET });
+    expect(JSON.parse(ws.sent[0])).toEqual({ type: "connect_request", target: DEVICE, ticket: TICKET, name_attestation: NAME });
+    signaling.requestConnect(asDeviceId(DEVICE), TICKET);
+    expect(JSON.parse(ws.sent[1])).toEqual({ type: "connect_request", target: DEVICE, ticket: TICKET });
   });
 
   it("control plane unreachable → null, and the fallback connect_request stays ticketless", async () => {

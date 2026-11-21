@@ -4,9 +4,9 @@
  * A BROWSER + control-plane feature (no agent, no WebRTC), so the Playwright run IS the live proof (VM
  * N/A; loop 23 precedent). Against a real DEV control plane (stub full-owner auth, in-memory stores):
  *
- *   1. Seed two machines (POST /enroll) and tag ONE with site=HQ (PUT .../properties/site).
- *   2. In the Groups tab, create a dynamic group keyed on site=HQ.
- *   3. Resolve its members and assert it contains ONLY the tagged machine — the live predicate.
+ *   1. Enroll three machines and tag one with site=HQ.
+ *   2. In Smart groups, create a group that matches site=HQ or the second machine's hostname.
+ *   3. Resolve and check that each branch contributes one member.
  *   4. Delete the group and assert it is gone.
  *
  * Self-skips (loudly) only when a prerequisite is genuinely absent. A SKIP IS NOT A PASS.
@@ -32,6 +32,7 @@ let cpProc: ChildProcess | null = null;
 let browser: Browser | null = null;
 let skipReason: string | null = null;
 let hqName = "";
+let receptionName = "";
 let otherName = "";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -87,10 +88,11 @@ test.beforeAll(async () => {
     return;
   }
   try {
-    // Two machines; tag ONLY the first with site=HQ (unique names so the members list is unambiguous).
     hqName = `HQ-BOX-${Date.now()}`;
+    receptionName = `RECEPTION-${Date.now()}`;
     otherName = `OTHER-BOX-${Date.now()}`;
     const hqPk = await enroll(hqName);
+    await enroll(receptionName);
     await enroll(otherName);
     await setProp(hqPk, "site", "HQ");
   } catch (e) {
@@ -119,12 +121,17 @@ test("operator creates a dynamic group and resolves its live members", async () 
   await expect(page.getByTestId("dynamic-groups")).toBeVisible({ timeout: 15_000 });
   await expect(page.getByTestId("groups-empty")).toHaveText(/no dynamic groups/i);
 
-  // Create a group keyed on site=HQ.
+  // Each member satisfies a different branch.
   await page.getByTestId("group-name").fill("HQ machines");
-  await page.getByTestId("group-key").fill("site");
-  await page.getByTestId("group-value").fill("HQ");
+  await page.getByTestId("group-match").selectOption("any");
+  const conditions = page.getByTestId("group-condition");
+  await conditions.nth(0).getByTestId("group-key").fill("site");
+  await conditions.nth(0).getByTestId("group-value").fill("HQ");
+  await page.getByTestId("group-add-condition").click();
+  await conditions.nth(1).getByTestId("group-field").selectOption("hostname");
+  await conditions.nth(1).getByTestId("group-value").fill(receptionName);
   await page.getByTestId("group-add").click();
-  await expect(page.getByTestId("group-row-HQ machines")).toBeVisible();
+  await expect(page.getByTestId("group-row-HQ machines")).toContainText(`site = HQ OR hostname = ${receptionName}`);
 
   // A duplicate name is refused inline (409 surfaced as the panel error).
   await page.getByTestId("group-name").fill("HQ machines");
@@ -132,11 +139,11 @@ test("operator creates a dynamic group and resolves its live members", async () 
   await page.getByTestId("group-add").click();
   await expect(page.getByTestId("group-error")).toContainText(/already exists/i);
 
-  // Resolve members: ONLY the tagged machine appears (the live predicate, narrowed to visible).
   await page.getByTestId("group-resolve-HQ machines").click();
   const members = page.getByTestId("group-members");
-  await expect(members).toContainText("Members (1)");
+  await expect(members).toContainText("Members (2)");
   await expect(members).toContainText(hqName);
+  await expect(members).toContainText(receptionName);
   await expect(members).not.toContainText(otherName);
 
   // Delete the group → back to empty, and a reload proves it is durable server-side.

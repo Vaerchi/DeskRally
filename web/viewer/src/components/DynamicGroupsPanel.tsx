@@ -1,15 +1,22 @@
-/**
- * Dynamic machine groups (docs/01 §4): create + list + delete SAVED machine-property predicates, and
- * resolve a group's members LIVE over GET/POST/DELETE /dynamic-groups + /dynamic-groups/{id}/machines.
- *
- * A dynamic group stores only a predicate (a property key, and optionally a value — empty value = "any
- * value"); its members are computed on demand by the server, narrowed to the machines the caller may
- * already see. Thin like the other console panels: it owns only load/refresh/in-flight/resolve state.
- */
-
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { createLatestWins } from "../lib/latest_wins";
-import type { ConsoleApi, DynamicGroup, MachineRecord } from "../lib/console_api";
+import type { ConsoleApi, DynamicGroup, DynamicGroupMatch, DynamicGroupOperator, MachineRecord } from "../lib/console_api";
+import {
+  conditionTakesValue, dynamicGroupFields, dynamicGroupOperatorLabels, dynamicGroupOperators,
+  MAX_DYNAMIC_GROUP_CONDITIONS, summarizeDynamicGroup, validateDynamicGroup, type DynamicGroupField,
+} from "../lib/dynamic_groups";
+
+interface ConditionRow {
+  id: number;
+  field: DynamicGroupField;
+  key: string;
+  op: DynamicGroupOperator;
+  value: string;
+}
+
+function newConditionRow(id: number): ConditionRow {
+  return { id, field: "property", key: "", op: "equals", value: "" };
+}
 
 export interface DynamicGroupsPanelProps {
   api: ConsoleApi;
@@ -20,8 +27,12 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
-  const [key, setKey] = useState("");
-  const [value, setValue] = useState("");
+  const [match, setMatch] = useState<DynamicGroupMatch>("all");
+  const [rows, setRows] = useState(() => [newConditionRow(0)]);
+  const nextRowId = useRef(1);
+  function updateRow(id: number, patch: Partial<Omit<ConditionRow, "id">>) {
+    setRows((current) => current.map((row) => row.id === id ? { ...row, ...patch } : row));
+  }
   const [saving, setSaving] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
   // The currently-resolved group's members (id of the group + the machine rows), or null when none open.
@@ -71,18 +82,21 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
     async (e: FormEvent) => {
       e.preventDefault();
       const n = name.trim();
-      const k = key.trim();
-      if (n === "" || k === "") {
-        setError("a group needs a name and a property key");
+      const conditions = rows.map(({ field, key, op, value }) => ({
+        field: field === "property" ? `property:${key.trim()}` : field, op, value,
+      }));
+      const validationError = validateDynamicGroup(n, match, conditions);
+      if (validationError) {
+        setError(validationError);
         return;
       }
       setSaving(true);
       setError(null);
       try {
-        await api.createDynamicGroup({ name: n, propertyKey: k, propertyValue: value });
+        await api.createDynamicGroup({ name: n, match, conditions });
         setName("");
-        setKey("");
-        setValue("");
+        setMatch("all");
+        setRows([newConditionRow(nextRowId.current++)]);
         await refresh();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -90,7 +104,7 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
         setSaving(false);
       }
     },
-    [api, name, key, value, refresh],
+    [api, name, match, rows, refresh],
   );
 
   const handleRemove = useCallback(
@@ -143,13 +157,71 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="HQ machines" data-testid="group-name" />
         </label>
         <label className="panel__toolbar-field">
-          Property key
-          <input value={key} onChange={(e) => setKey(e.target.value)} placeholder="site" data-testid="group-key" />
+          Match
+          <select value={match} onChange={(e) => setMatch(e.target.value as DynamicGroupMatch)} data-testid="group-match">
+            <option value="all">Match all</option>
+            <option value="any">Match any</option>
+          </select>
         </label>
-        <label className="panel__toolbar-field">
-          Value (blank = any)
-          <input value={value} onChange={(e) => setValue(e.target.value)} placeholder="HQ" data-testid="group-value" />
-        </label>
+        <fieldset className="dynamic-groups__conditions" disabled={saving}>
+          <legend>Conditions</legend>
+          {rows.map(({ id, field, key, op, value }, index) => (
+            <div key={id} className="dynamic-groups__condition" data-testid="group-condition">
+              <label className="panel__toolbar-field">
+                Field
+                <select value={field} onChange={(e) => {
+                  const next = e.target.value as DynamicGroupField;
+                  updateRow(id, { field: next, key: "", op: "equals", value: next === "online" ? "true" : "" });
+                }} data-testid="group-field">
+                  {Object.entries(dynamicGroupFields).map(([fieldValue, label]) => (
+                    <option key={fieldValue} value={fieldValue}>{label}</option>
+                  ))}
+                </select>
+              </label>
+              {field === "property" && (
+                <label className="panel__toolbar-field">
+                  Property key
+                  <input value={key} onChange={(e) => updateRow(id, { key: e.target.value })} placeholder="site" data-testid="group-key" />
+                </label>
+              )}
+              <label className="panel__toolbar-field">
+                Operator
+                <select value={op} onChange={(e) => {
+                  const next = e.target.value as DynamicGroupOperator;
+                  updateRow(id, { op: next, value: conditionTakesValue(next) ? value : "" });
+                }} data-testid="group-op">
+                  {dynamicGroupOperators[field].map((operator) => (
+                    <option key={operator} value={operator}>{dynamicGroupOperatorLabels[operator]}</option>
+                  ))}
+                </select>
+              </label>
+              {conditionTakesValue(op) && (
+                <label className="panel__toolbar-field">
+                  Value
+                  {field === "online" ? (
+                    <select value={value} onChange={(e) => updateRow(id, { value: e.target.value })} data-testid="group-value">
+                      <option value="true">True</option>
+                      <option value="false">False</option>
+                    </select>
+                  ) : (
+                    <input value={value} onChange={(e) => updateRow(id, { value: e.target.value })} data-testid="group-value" />
+                  )}
+                </label>
+              )}
+              <button className="panel__action" type="button" aria-label={`Remove condition ${index + 1}`}
+                disabled={rows.length === 1} onClick={() => setRows((current) => current.filter((row) => row.id !== id))}>
+                Remove
+              </button>
+            </div>
+          ))}
+          <button className="panel__action" type="button" disabled={rows.length >= MAX_DYNAMIC_GROUP_CONDITIONS}
+            onClick={() => {
+              const row = newConditionRow(nextRowId.current++);
+              setRows((current) => [...current, row]);
+            }} data-testid="group-add-condition">
+            Add condition
+          </button>
+        </fieldset>
         <button className="panel__action" type="submit" disabled={saving} data-testid="group-add">
           {saving ? "Saving…" : "Add"}
         </button>
@@ -160,8 +232,7 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
         )}
       </form>
       <p className="panel__note" data-testid="dynamic-groups-help">
-        A smart group is a saved property match (for example <code>site</code> = <code>HQ</code>); its machines are
-        worked out live each time. It organises and finds machines only — it does not grant access.
+        A smart group finds machines you can access that currently meet its conditions.
       </p>
 
       <table className="panel__table">
@@ -183,10 +254,7 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
           {groups.map((g) => (
             <tr key={g.id} data-testid={`group-row-${g.name}`}>
               <td className="panel__name">{g.name}</td>
-              <td className="panel__mono">
-                {g.property_key}
-                {g.property_value ? ` = ${g.property_value}` : " (any)"}
-              </td>
+              <td className="panel__mono">{summarizeDynamicGroup(g)}</td>
               <td className="panel__col--action">
                 <button
                   className="panel__action"
@@ -220,7 +288,7 @@ export function DynamicGroupsPanel({ api }: DynamicGroupsPanelProps) {
             <ul>
               {resolved.machines.map((m) => (
                 <li key={m.id} data-testid={`group-member-${m.id}`}>
-                  {m.name || m.device_id}
+                  {m.alias || m.name || m.device_id}
                 </li>
               ))}
             </ul>

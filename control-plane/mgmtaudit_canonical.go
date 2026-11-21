@@ -125,8 +125,8 @@ func canonicalUUIDish(s string) string {
 }
 
 // parsePgUUID accepts exactly the spellings PostgreSQL's uuid_in accepts — 32 hex digits,
-// optionally wrapped in a matched pair of braces, with at most one OPTIONAL hyphen at each of
-// the four group boundaries — and returns the canonical lowercase 8-4-4-4-12 rendering, which is
+// optionally wrapped in a matched pair of braces, with at most one OPTIONAL hyphen at
+// each internal four-hex-digit boundary — and returns the canonical lowercase 8-4-4-4-12 rendering, which is
 // what the column reads back as.
 //
 // The two error directions are NOT symmetric, which is why this matches uuid_in rather than
@@ -147,7 +147,7 @@ func parsePgUUID(s string) (string, bool) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c == '-' {
-			if prevHyphen || (n != 8 && n != 12 && n != 16 && n != 20) {
+			if prevHyphen || n == 0 || n == 32 || n%4 != 0 {
 				return "", false
 			}
 			prevHyphen = true

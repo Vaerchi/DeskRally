@@ -157,13 +157,13 @@ func TestParseAPITokenCapabilities(t *testing.T) {
 }
 
 func TestAPITokenGrantableSetExcludesUserFKPaths(t *testing.T) {
-	// The allow-list must be exactly the fleet/reporting five. If someone widens it to a cap whose
+	// The allow-list must be exactly the listed fleet/reporting capabilities. If someone widens it to a cap whose
 	// handler keys on a real user (session start, user management, enrollment) or that would let a
 	// token mint tokens (manage_tenant), this test fails and forces them to confront the FK/lookup
 	// consequence documented in 0027 and apitoken.go.
 	want := map[Capability]bool{
 		CapViewMachines: true, CapManageMachines: true, CapManageGroups: true,
-		CapViewSessions: true, CapViewAudit: true,
+		CapViewSessions: true, CapViewAudit: true, CapWakeMachine: true,
 	}
 	for _, c := range AllCapabilities {
 		if IsAPITokenGrantableCapability(c) != want[c] {

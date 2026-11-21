@@ -1,9 +1,9 @@
-import {test,expect,type Page} from "@playwright/test";
+import {test,expect,type Page,type WebSocketRoute} from "@playwright/test";
 import { clickInViewerPanel, openAccountControls } from "./nav";
 import { openManualConnect } from "./manual_connect";
 async function fixture(page:Page, withPolicy=false) {
  await page.clock.install();
- const state={starts:0,policy:200,mints:[] as string[],mintStatus:200,ends:[] as string[],closeSignaling:false};
+ const state={starts:0,policy:200,mints:[] as string[],mintStatus:200,ends:[] as string[],closeSignaling:false,signaling:undefined as WebSocketRoute | undefined};
  await page.route(/.*/,route=>new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort());
  await page.route("**/cp/**",async route=> {
   const path=new URL(route.request().url()).pathname;
@@ -23,9 +23,16 @@ async function fixture(page:Page, withPolicy=false) {
  return route.fulfill({json:{session:{id:"ended"}}});
  });
  // closeSignaling: later signaling connections drop at once, so a retry mints a record that never connects.
- await page.routeWebSocket("ws://127.0.0.1:5188/ws",ws=>{if(state.closeSignaling) ws.close();});
+ await page.routeWebSocket("ws://127.0.0.1:5188/ws",ws=>{state.signaling=ws;if(state.closeSignaling) ws.close();});
  await page.addInitScript(()=> {
-  const w=window as any;w.peers=[];
+  const w=window as any;w.peers=[];w.signalingClosed=false;
+  const NativeWebSocket=window.WebSocket;
+  window.WebSocket=class extends NativeWebSocket {
+   constructor(url: string | URL, protocols?: string | string[]) {
+    super(url,protocols);
+    if(String(url) === "ws://127.0.0.1:5188/ws") this.addEventListener("close",()=>{w.signalingClosed=true;});
+   }
+  };
   class Peer {
    connectionState="new";onconnectionstatechange:any;ontrack:any;onicecandidate:any;frames=1;
    dc:any={readyState:"open",sent:[] as ArrayBuffer[],send(bytes:ArrayBuffer){this.sent.push(bytes);},close(){this.readyState="closed";this.onclose?.();}};
@@ -98,6 +105,30 @@ test("revoked original session is explained and never automatically replaced",as
  await page.clock.runFor(120000);expect(state.starts).toBe(1);
  await expect(page.getByTestId("viewer-reconnect")).toBeVisible();
 });
+for (const revision of [1, undefined]) {
+ for (const close of ["unexpected", "recovery refusal"]) {
+  test(`signaling ${close} ${revision === undefined ? "preserves legacy" : "clears revisioned"} participants`,async({page})=> {
+   const state=await fixture(page);
+   state.signaling!.send(JSON.stringify({
+    type:"session_participants",device_id:"00112233-4455-6677-8899-aabbccddeeff",revision,
+    participants:[{session_id:"co-tech",technician_id:"tech-alice"}],
+   }));
+   const badge=page.getByTestId("session-participants");
+   await expect(badge).toBeVisible();
+   if(close === "unexpected") {
+    state.signaling!.close();
+   } else {
+    state.policy=409;
+    await page.evaluate(()=>(window as any).peers[0].fail());
+    await page.clock.runFor(2000);
+    await expect(page.getByTestId("viewer-recovery")).toContainText("administrator ended session");
+   }
+   await expect.poll(()=>page.evaluate(()=>(window as any).signalingClosed)).toBe(true);
+   if(revision === undefined) await expect(badge).toBeVisible();
+   else await expect(badge).toHaveCount(0);
+  });
+ }
+}
 test("Disconnect cancels pending automatic recovery",async({page})=> {
  const state=await fixture(page);
  await page.evaluate(()=>(window as any).peers[0].fail());

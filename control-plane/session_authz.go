@@ -19,7 +19,8 @@ type heldSession struct {
 	Machine *Machine
 	// Access is the level the control plane would sign for this session NOW: the group's current
 	// mandate, re-read on every call (never frozen at session start).
-	Access SessionAccessLevel
+	Access         SessionAccessLevel
+	MaxIdleSeconds int
 }
 
 type sessionRefusal struct {
@@ -75,11 +76,13 @@ func (s *Server) checkHeldSession(ctx context.Context, p *Principal, sessionID, 
 	if !sameUserID(p.UserID, rec.TechnicianID) {
 		return nil, &sessionRefusal{Status: http.StatusForbidden, Msg: "only the technician holding this session may " + verb}
 	}
+	var tenantPolicy SessionPolicy
 	if s.SessionPolicies != nil {
 		pol, perr := s.SessionPolicies.Get(ctx, p.TenantID)
 		if perr != nil {
 			return nil, &sessionRefusal{Status: http.StatusInternalServerError, Msg: "could not resolve session policy"}
 		}
+		tenantPolicy = pol
 		if pol.MaxSessionSeconds > 0 && time.Since(rec.StartedAt) > time.Duration(pol.MaxSessionSeconds)*time.Second {
 			return &heldSession{Rec: rec}, &sessionRefusal{Status: http.StatusConflict,
 				Msg: "session has exceeded its maximum duration", Expired: true}
@@ -97,6 +100,7 @@ func (s *Server) checkHeldSession(ctx context.Context, p *Principal, sessionID, 
 		return nil, &sessionRefusal{Status: http.StatusConflict, Msg: "machine is " + m.Status + "; reactivate it to " + verb}
 	}
 	access := SessionAccessControl
+	var groupIdle int
 	if s.GroupSessionPolicies != nil && rec.MachineGroupID != "" {
 		eff, gerr := s.EffectivePolicy(ctx, p.TenantID, rec.MachineGroupID)
 		if gerr != nil {
@@ -106,11 +110,17 @@ func (s *Server) checkHeldSession(ctx context.Context, p *Principal, sessionID, 
 			return nil, &sessionRefusal{Status: http.StatusConflict, Msg: eff.Conflict}
 		}
 		gp := eff.GroupSessionPolicy
+		groupIdle = gp.MaxIdleSeconds
 		if gp.EnforceViewOnly {
 			access = SessionAccessViewOnly
 		}
 	}
-	return &heldSession{Rec: rec, Machine: m, Access: access}, nil
+	return &heldSession{
+		Rec:            rec,
+		Machine:        m,
+		Access:         access,
+		MaxIdleSeconds: effectiveSessionIdleSeconds(groupIdle, tenantPolicy),
+	}, nil
 }
 
 // revokedIfHolder turns a capability denial into a refusal that carries the record when, and only

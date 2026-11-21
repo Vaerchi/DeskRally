@@ -114,13 +114,13 @@ export interface InputHandoffView {
   error: string | null;
 }
 
-/**
- * A target's label. Signaling carries no display names (docs/61 §7b), so it is built from ids that
- * belong to THIS session and never shift: no ordinal (ordinals renumber as people join and leave), and
- * the session id is included because one technician can have several sessions (Codex 3d review).
- */
-export function handTargetLabel(p: SessionParticipantEntry): string {
+/** Duplicate names retain the signaling-session suffix so each target is distinguishable. */
+export function handTargetLabel(p: SessionParticipantEntry, participants: readonly SessionParticipantEntry[] = []): string {
   const session = `session ${p.session_id.slice(0, 8)}`;
+  if (p.display_name) {
+    const duplicate = participants.some(other => other.session_id !== p.session_id && other.display_name === p.display_name);
+    return duplicate ? `${p.display_name} · ${session}` : p.display_name;
+  }
   return p.technician_id ? `Technician ${p.technician_id.slice(0, 8)} · ${session}` : `Technician · ${session}`;
 }
 
@@ -130,7 +130,7 @@ function handTargets(own: string, participants: readonly SessionParticipantEntry
     .filter((p) => p.session_id !== own && p.access !== "view_only")
     .slice()
     .sort((a, b) => a.session_id.localeCompare(b.session_id))
-    .map((p) => ({ sessionId: p.session_id, label: handTargetLabel(p) }));
+    .map((p) => ({ sessionId: p.session_id, label: handTargetLabel(p, participants) }));
 }
 
 /**
@@ -157,6 +157,8 @@ export function inputHandoffView(
   participants: readonly SessionParticipantEntry[],
 ): InputHandoffView {
   const youHaveControl = m.mode === "owned" && ownSessionId !== null && m.ownerSession === ownSessionId;
+  const owner = participants.find(p => p.session_id === m.ownerSession);
+  const otherOwner = owner?.display_name ? handTargetLabel(owner, participants) : "Another technician";
   // Without our own id we cannot tell "us" from "them": say neither (Codex 3d review).
   const badge =
     m.mode === "owned"
@@ -164,7 +166,7 @@ export function inputHandoffView(
         ? "One technician has input control"
         : youHaveControl
           ? "You have input control"
-          : "Another technician has input control"
+          : `${otherOwner} has input control`
       : m.mode === "blocked"
         ? "Input locked"
         : null;
@@ -180,7 +182,7 @@ export function inputHandoffView(
         ? "Input is locked: the technician who had control left. Take control to continue."
         : youHaveControl
           ? "You have input control."
-          : "Another technician has input control.";
+          : `${otherOwner} has input control.`;
   const mayHandNow = m.mode === "shared" || youHaveControl;
   const disabledReason = m.pending
     ? "Waiting for the agent…"

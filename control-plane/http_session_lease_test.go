@@ -490,15 +490,8 @@ func TestMaxAgeMutationRequiresOwnership(t *testing.T) {
 	}
 }
 
-// TestRenewDoesNotApplyNewGroupRestrictions verifies that the renewal path (Pass4) does NOT apply
-// the four new group restrictions (require_recording, prohibit_recording, max_session_duration_seconds,
-// max_idle_seconds) to the signed lease, even when those restrictions are set on the group mid-session.
-//
-// WHY: the admission gate refuses session STARTS when any of these are set. An operator who adds them
-// to a group mid-session must not cause old agents (which pre-date 7c81bde) to silently receive
-// unenforceable policy via renewal. The renewed lease must carry the safe defaults (allow_recording=true,
-// require_recording=false, max_session_duration_seconds=0, max_idle_seconds=0).
-func TestRenewDoesNotApplyNewGroupRestrictions(t *testing.T) {
+// Renewals sign the current idle timeout and keep the admission gates for recording and duration.
+func TestRenewSignsEffectiveIdle(t *testing.T) {
 	f := newLeaseFixture(t)
 
 	// Verify baseline: a fresh lease has safe defaults.
@@ -523,7 +516,19 @@ func TestRenewDoesNotApplyNewGroupRestrictions(t *testing.T) {
 		t.Fatalf("baseline max_idle_seconds = %d, want 0", beforeSP.Claims.Policy.MaxIdleSeconds)
 	}
 
-	// Now set all four new restrictions on the group mid-session.
+	// A tenant default added mid-session takes effect on the next lease.
+	idle := 600
+	f.srv.SessionPolicies = NewInMemoryTenantSessionPolicyStore()
+	if err := f.srv.SessionPolicies.Set(t.Context(), leaseTenant, SessionPolicy{DefaultMaxIdleSeconds: &idle}); err != nil {
+		t.Fatal(err)
+	}
+	fallback := f.renewAs(t, "tech@acme.test")
+	if fallback.code != http.StatusOK {
+		t.Fatalf("renew with tenant fallback = %d: %s", fallback.code, fallback.body)
+	}
+	assertSignedIdle(t, f.issuer, fallback.decoded.SessionPolicy.Signed, 600)
+
+	// Set a group override and restrictions that remain gated.
 	if err := f.groups.Set(context.Background(), leaseTenant, leaseGroup, GroupSessionPolicy{
 		GroupID:                   leaseGroup,
 		RequireRecording:          true,
@@ -534,7 +539,7 @@ func TestRenewDoesNotApplyNewGroupRestrictions(t *testing.T) {
 		t.Fatalf("set restrictive group policy: %v", err)
 	}
 
-	// Renewal must succeed (the session continues) and the new restrictions must NOT appear in the lease.
+	// Renewal carries the override with the existing recording and duration defaults.
 	after := f.renewAs(t, "tech@acme.test")
 	if after.code != http.StatusOK {
 		t.Fatalf("renew after new restrictions set = %d: %s — renewal must succeed; "+
@@ -555,8 +560,11 @@ func TestRenewDoesNotApplyNewGroupRestrictions(t *testing.T) {
 		t.Fatalf("lease after duration set has max_session_duration_seconds=%d — new restriction must not be applied",
 			afterSP.Claims.Policy.MaxSessionDurationSeconds)
 	}
-	if afterSP.Claims.Policy.MaxIdleSeconds != 0 {
-		t.Fatalf("lease after idle set has max_idle_seconds=%d — new restriction must not be applied",
-			afterSP.Claims.Policy.MaxIdleSeconds)
+	assertSignedIdle(t, f.issuer, after.decoded.SessionPolicy.Signed, 300)
+
+	f.srv.SessionPolicies = unreadableTenantSessionPolicyStore{}
+	unreadable := f.renewAs(t, "tech@acme.test")
+	if unreadable.code != http.StatusInternalServerError || unreadable.decoded.SessionPolicy.Signed != "" {
+		t.Fatalf("renew with unreadable policy = %d: %s, want 500 and no signed policy", unreadable.code, unreadable.body)
 	}
 }

@@ -198,6 +198,60 @@ func TestStartSessionMintsAVerifiableSignature(t *testing.T) {
 	}
 }
 
+func assertSignedIdle(t *testing.T, issuer *GrantIssuer, signedJSON string, want uint32) {
+	t.Helper()
+	var signed SignedSessionPolicy
+	if err := json.Unmarshal([]byte(signedJSON), &signed); err != nil {
+		t.Fatalf("decode signed policy: %v", err)
+	}
+	p := signed.Claims.Policy
+	if p.MaxIdleSeconds != want {
+		t.Fatalf("signed idle = %d, want %d", p.MaxIdleSeconds, want)
+	}
+	msg, err := sessionPolicySigningBytes(p.TechnicianID, p.SessionID, p.MachineID, p.Access,
+		p.AllowRecording, p.RequireRecording, p.MaxSessionDurationSeconds, p.MaxIdleSeconds,
+		signed.Claims.IssuedAtMs, signed.Claims.ExpiresAtMs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, pubErr := hex.DecodeString(issuer.PublicKeyHex())
+	sig, sigErr := hex.DecodeString(signed.Sig)
+	if pubErr != nil || sigErr != nil || !ed25519.Verify(pub, msg, sig) {
+		t.Fatal("policy signature did not verify with the expected idle timeout")
+	}
+}
+
+func TestStartSessionSignsTenantIdleTimeout(t *testing.T) {
+	const (
+		userID = "11111111-1111-1111-1111-111111111111"
+		tenantID = "tenant-123"
+		deviceID = "22222222-2222-4222-8222-222222222222"
+	)
+	owner := &Principal{UserID: userID, TenantID: tenantID,
+		Grant: NewGrant(userID, tenantID, NewMembership(RoleOwner, AllGroups()))}
+	srv, _ := newTestServer(owner)
+	issuer, err := GenerateGrantIssuer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Grants = issuer
+	idle := 420
+	if err := srv.SessionPolicies.Set(t.Context(), tenantID, SessionPolicy{DefaultMaxIdleSeconds: &idle}); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, httptest.NewRequest("POST", "/sessions",
+		strings.NewReader(`{"machine_id":"`+deviceID+`"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("start = %d: %s", response.Code, response.Body.String())
+	}
+	var out startSessionResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &out); err != nil || out.SessionPolicy == nil {
+		t.Fatalf("missing start policy: %v", err)
+	}
+	assertSignedIdle(t, issuer, out.SessionPolicy.Signed, 420)
+}
+
 // Without a grant issuer there is nothing to sign with, so no policy is offered — and the session still
 // starts. The viewer then installs nothing and the session behaves as it did before the feature (this is
 // the DEV/dev-stub path, and the one the pre-loop-80 Playwright specs exercise).
@@ -337,49 +391,6 @@ func TestStartSessionRefusedForPolicyDoesNotLeakAnOpenSession(t *testing.T) {
 	// that never inserted, which is a different design.
 	if len(sessions) == 0 {
 		t.Fatal("no session record at all; this test is no longer exercising the insert-then-refuse path")
-	}
-}
-
-// TestStartSessionMaxIdleSecondsRefusedEvenWithRequireSessionPolicy asserts 403 for a machine
-// WITH require_session_policy=true attempting to start into a group with max_idle_seconds set.
-//
-// Pass4 scope reduction: max_idle_seconds is refused unconditionally for unattended sessions.
-// The Pass3 fix enrolled the machine with RequireSessionPolicy=true as a proxy for capability;
-// Pass4 removes that condition — require_session_policy pre-dates migrations 0043–0046 and is
-// not sufficient evidence that the agent understands these new fields.
-func TestStartSessionMaxIdleSecondsRefusedEvenWithRequireSessionPolicy(t *testing.T) {
-	const tenantID = "tenant-123"
-	const deviceID = "44444444-4444-4444-8444-444444444444"
-
-	owner := &Principal{UserID: "11111111-1111-1111-1111-111111111111", TenantID: tenantID,
-		Grant: NewGrant("11111111-1111-1111-1111-111111111111", tenantID,
-			NewMembership(RoleOwner, AllGroups()))}
-	srv, _ := newTestServer(owner)
-	seed, _ := hex.DecodeString(goldenSeedHex)
-	iss, _ := NewGrantIssuerFromSeed(seed)
-	srv.Grants = iss
-
-	if err := srv.Machines.EnrollMachine(t.Context(), tenantID, &Machine{
-		DeviceID:             deviceID,
-		Name:                 "test-machine",
-		GroupID:              DevDefaultMachineGroupID,
-		RequireSessionPolicy: true,
-		Status:               MachineStatusActive,
-	}); err != nil {
-		t.Fatalf("enroll machine: %v", err)
-	}
-	if err := srv.GroupSessionPolicies.Set(t.Context(), tenantID, DevDefaultMachineGroupID,
-		GroupSessionPolicy{MaxIdleSeconds: 300}); err != nil {
-		t.Fatalf("set group policy: %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/sessions",
-		strings.NewReader(`{"machine_id":"`+deviceID+`"}`)))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("start into max_idle_seconds group with require_session_policy=true = %d, want 403 — "+
-			"the unconditional Pass4 gate must fire regardless of require_session_policy: %s",
-			rec.Code, rec.Body.String())
 	}
 }
 
@@ -560,30 +571,6 @@ func TestStartSessionMaxSessionDurationRefusesWithoutRequireSessionPolicy(t *tes
 		strings.NewReader(`{"machine_id":"22222222-2222-4222-8222-222222222222"}`)))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("start into max_session_duration group without require_session_policy = %d, want 403: %s",
-			rec.Code, rec.Body.String())
-	}
-}
-
-// TestStartSessionMaxIdleSecondsRefusesWithoutRequireSessionPolicy asserts 403 when a machine
-// lacking require_session_policy attempts to connect into a group with an idle timeout.
-func TestStartSessionMaxIdleSecondsRefusesWithoutRequireSessionPolicy(t *testing.T) {
-	owner := &Principal{UserID: "11111111-1111-1111-1111-111111111111", TenantID: "tenant-123",
-		Grant: NewGrant("11111111-1111-1111-1111-111111111111", "tenant-123",
-			NewMembership(RoleOwner, AllGroups()))}
-	srv, _ := newTestServer(owner)
-	seed, _ := hex.DecodeString(goldenSeedHex)
-	iss, _ := NewGrantIssuerFromSeed(seed)
-	srv.Grants = iss
-
-	if err := srv.GroupSessionPolicies.Set(t.Context(), "tenant-123", DevDefaultMachineGroupID,
-		GroupSessionPolicy{MaxIdleSeconds: 300}); err != nil {
-		t.Fatalf("set group policy: %v", err)
-	}
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/sessions",
-		strings.NewReader(`{"machine_id":"22222222-2222-4222-8222-222222222222"}`)))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("start into max_idle_seconds group without require_session_policy = %d, want 403: %s",
 			rec.Code, rec.Body.String())
 	}
 }

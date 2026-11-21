@@ -602,6 +602,9 @@ pub enum ControlMessage {
         /// word doing the work above is *silently*. It has its own message,
         /// [`ControlMessage::ElevatedRun`], which carries a control-plane signature authorizing it.
         as_user: bool,
+        /// Request UUID for a negotiated run receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// controller → agent (loop 87, docs/01 §3 "Elevate client to admin mid-session"): run ONE
     /// command with the interactive user's **linked elevated token** — their own full administrator
@@ -762,10 +765,16 @@ pub enum ControlMessage {
         stdout: String,
         /// Captured standard error (UTF-8 lossy; capped — see `truncated`).
         stderr: String,
-        /// `true` ⇒ stdout and/or stderr exceeded the capture cap and were cut off.
+        /// Output exceeded the capture cap or a stream did not reach EOF by the drain deadline.
         truncated: bool,
-        /// `true` ⇒ the command exceeded its time budget and was killed (its whole process tree).
+        /// The process wait exhausted its time budget and the runner attempted termination.
         timed_out: bool,
+    },
+    /// Agent → controller, sent before the terminal reply on the ordered control channel.
+    RunReceipt {
+        /// The signed claims and Ed25519 signature.
+        #[serde(flatten)]
+        receipt: rmt_protocol::run_receipt::SignedRunReceipt,
     },
     /// controller → agent (loop 89, docs/01 §5): **start recording this session to video** on the
     /// guest's own disk. The agent tees the VP8 it is already encoding into IVF files next to a JSON
@@ -1217,6 +1226,7 @@ pub fn observer_rule(msg: &ControlMessage) -> ObserverRule {
         | ControlMessage::DirectoryListing { .. }
         | ControlMessage::DirectoryListingRefused { .. }
         | ControlMessage::CommandResult { .. }
+        | ControlMessage::RunReceipt { .. }
         | ControlMessage::RecordingStarted { .. }
         | ControlMessage::RecordingStopped { .. }
         | ControlMessage::SessionEnding { .. }

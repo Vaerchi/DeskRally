@@ -134,6 +134,8 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 func resetSchemaWith(t *testing.T, pool *pgxpool.Pool, withGroupTree bool) {
 	t.Helper()
 	execScript(t, pool, `
+		DROP FUNCTION IF EXISTS cp_purge_stale_lan_facts(timestamptz);
+		DROP TABLE IF EXISTS machine_lan, machine_lan_state, signaling_incarnation;
 		DROP TABLE IF EXISTS agent_directive, tenant_directive_policy CASCADE;
 		DROP TABLE IF EXISTS tenant_branding_pointer, tenant_branding_revision, tenant_hostname_assignment CASCADE;
 		DROP FUNCTION IF EXISTS cp_attended_redeem_scoped(bytea, bytea, text, text, bytea, timestamptz, text, boolean);
@@ -191,12 +193,13 @@ func resetSchemaWith(t *testing.T, pool *pgxpool.Pool, withGroupTree bool) {
 		DROP TABLE IF EXISTS platform_operator, platform_config;
 		DROP SEQUENCE IF EXISTS mfa_generation_seq;
 		DROP TABLE IF EXISTS
-			help_request_call, help_request_op, help_request, group_tree_version, session_transfer, toolbox_item, session_ticket_redemption, api_token, tenant_branding, tenant_session_policy,
+			run_record, help_request_call, help_request_op, help_request, group_tree_version, session_transfer, toolbox_item, session_ticket_redemption, api_token, tenant_branding, tenant_session_policy,
 			group_session_policy,
-			user_credential_token, machine_property, tenant_ip_allowlist, dynamic_group,
+			user_credential_token, machine_field_order, machine_field, machine_property, tenant_ip_allowlist, dynamic_group,
 			user_session, user_totp, user_credential,
 			audit_event, session_record, enrollment_token, attended_session, machine,
 			membership, machine_group, role, app_user, tenant, throttle_counter CASCADE;
+		DROP FUNCTION IF EXISTS check_run_record_session_machine();
 	`)
 	// 0009, 0012, 0017 and 0018 are applied with the core because the pgx stores hard-depend on
 	// their columns: pending_secret (which keeps an unconfirmed re-enrollment from disarming 2FA) is

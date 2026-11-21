@@ -13,7 +13,9 @@ pub mod session_binding;
 pub mod channel;
 pub mod directive;
 pub mod frame;
+pub mod run_receipt;
 pub mod signaling;
+pub mod wake;
 
 pub use channel::ChannelId;
 pub use frame::{Frame, FrameError};

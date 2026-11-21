@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -25,6 +26,13 @@ type Session struct {
 	Target       *Peer
 	TechnicianID string
 	Access       string
+
+	ticketTenant   string
+	controlPlaneID string
+
+	// Membership publication and displayName are guarded by Broker.mu.
+	published   bool
+	displayName string
 }
 
 // peer returns the far side of the session relative to `from`, or nil if `from` is not a
@@ -84,6 +92,7 @@ type Broker struct {
 	// that device, enabling concurrent multi-session tracking and SessionParticipants broadcasts.
 	// Keyed by DeviceId → set of Session.Id. Written under mu.
 	deviceSessions map[string]map[string]*Session
+	rosterRevision uint64 // Broker-wide counter orders snapshots for each recipient.
 }
 
 // NewBroker constructs a broker over the given registry. serverPubkey is echoed for pinning;
@@ -91,7 +100,7 @@ type Broker struct {
 // (nil to disable) is the control plane's grant-issuer Ed25519 key that session tickets must
 // verify against.
 func NewBroker(reg *Registry, serverPubkey, relayAddr string, ticketPub ed25519.PublicKey) *Broker {
-	return &Broker{
+	b := &Broker{
 		reg:            reg,
 		serverPubkey:   serverPubkey,
 		relayAddr:      relayAddr,
@@ -101,6 +110,8 @@ func NewBroker(reg *Registry, serverPubkey, relayAddr string, ticketPub ed25519.
 		sessions:       make(map[string]*Session),
 		deviceSessions: make(map[string]map[string]*Session),
 	}
+	reg.targetGone = b.targetGone
+	return b
 }
 
 // WithTurn attaches the ICE/TURN issuance policy and returns the broker, for construction-time
@@ -164,8 +175,14 @@ func (b *Broker) WithStrictTicketRedemption() *Broker {
 // its device. That value is only ever taken from a ticket this function VERIFIED — see
 // controlPlaneSessionOf below for why the dev path deliberately sends nothing.
 func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSessionTicket) (*Session, error) {
+	return b.connectRequest(requester, target, ticket, nil)
+}
+
+func (b *Broker) connectRequest(requester *Peer, target string, ticket *SignedSessionTicket, attestation json.RawMessage) (*Session, error) {
+	var admissionMs int64
 	if b.ticketPub != nil {
-		if err := verifyTicket(b.ticketPub, ticket, b.nowMs(), target); err != nil {
+		admissionMs = b.nowMs()
+		if err := verifyTicket(b.ticketPub, ticket, admissionMs, target); err != nil {
 			_ = requester.Send(Rejected{Reason: "connect request not authorized"})
 			return nil, fmt.Errorf("connect_request: %w", err)
 		}
@@ -192,6 +209,7 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 	// available; the control plane's shared ledger then catches what a per-process map structurally
 	// cannot — the same ticket presented to a DIFFERENT replica, or to this one after a restart.
 	// The order also means a same-instance replay never reaches the network.
+	var ticketTenant, displayName string
 	if b.ticketPub != nil {
 		if !b.spent.consume(ticket.Claims.SessionID, ticket.Claims.ExpiresAtMs, b.nowMs()) {
 			_ = requester.Send(Rejected{Reason: "connect request not authorized"})
@@ -200,10 +218,15 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 			return nil, fmt.Errorf("connect_request: %w: ticket for session %s was already used",
 				errTicketInvalid, clipForLog(ticket.Claims.SessionID))
 		}
-		if err := b.redeemTicket(ticket); err != nil {
+		confirmed, err := b.redeemTicket(ticket)
+		if err != nil {
 			_ = requester.Send(Rejected{Reason: "connect request not authorized"})
 			return nil, fmt.Errorf("connect_request: %w: ticket for session %s was already redeemed "+
 				"elsewhere in the deployment", errTicketInvalid, clipForLog(ticket.Claims.SessionID))
+		}
+		ticketTenant = ticket.Claims.TenantID
+		if confirmed {
+			displayName = verifiedDisplayName(b.ticketPub, attestation, ticket.Claims, admissionMs)
 		}
 	}
 
@@ -219,16 +242,36 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 		access = ticket.Claims.Access
 	}
 	sess := &Session{
-		Id: sessionID, Requester: requester, Target: agent,
-		TechnicianID: b.technicianOf(ticket), Access: access,
+		Id:             sessionID,
+		Requester:      requester,
+		Target:         agent,
+		TechnicianID:   b.technicianOf(ticket),
+		Access:         access,
+		ticketTenant:   ticketTenant,
+		controlPlaneID: b.controlPlaneSessionOf(ticket),
 	}
 
 	b.mu.Lock()
+	b.reg.mu.RLock()
+	current := b.targetCurrentLocked(agent) && !b.reg.expired(agent)
+	if !current || requester.wake.disconnected.Load() {
+		b.reg.mu.RUnlock()
+		b.mu.Unlock()
+		_ = requester.Send(Rejected{Reason: "peer became unreachable"})
+		return nil, fmt.Errorf("connect_request: peer became unreachable")
+	}
 	// Atomically check single-session admission and add the session in one critical section.
 	// We hold b.mu across both the check and the insert so two concurrent connect_requests
 	// cannot both see 0 existing sessions and both proceed.
 	if multiCap := agent.MultiSessionCapable; multiCap == nil || !*multiCap {
-		if existing := len(b.deviceSessions[agent.DeviceId]); existing > 0 {
+		existing := 0
+		for _, session := range b.deviceSessions[agent.DeviceId] {
+			if session.Target == agent {
+				existing++
+			}
+		}
+		if existing > 0 {
+			b.reg.mu.RUnlock()
 			b.mu.Unlock()
 			_ = requester.Send(Rejected{
 				Reason: "agent busy: single-session agent already has an active session; " +
@@ -243,6 +286,7 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 		b.deviceSessions[agent.DeviceId] = make(map[string]*Session)
 	}
 	b.deviceSessions[agent.DeviceId][sessionID] = sess
+	b.reg.mu.RUnlock()
 	b.mu.Unlock()
 
 	// ICE servers FIRST, before `brokered`. The ordering is load-bearing, not stylistic: both
@@ -274,7 +318,7 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 	// Tell each side about the other, pinning the peer's pubkey. Both also learn the CONTROL-PLANE
 	// session id: the agent needs it to bind a session policy, and the requester supplied the ticket
 	// it came from, so telling it back discloses nothing it did not already hold.
-	cpSession := b.controlPlaneSessionOf(ticket)
+	cpSession := sess.controlPlaneID
 	technician := b.technicianOf(ticket)
 	if err := agent.Send(Brokered{
 		Session:             sessionID,
@@ -313,23 +357,36 @@ func (b *Broker) ConnectRequest(requester *Peer, target string, ticket *SignedSe
 	_ = agent.Send(assignment)
 	_ = requester.Send(assignment)
 
-	// Broadcast the updated participant list to all peers on this device (agent + all controllers).
-	// This tells the new controller how many other techs are already connected, tells the existing
-	// controllers a new tech joined, and tells the agent it is now in a multi-tech session.
-	// Failures are logged at debug but never fatal (participant lists are advisory).
-	b.broadcastParticipants(agent)
+	// Publish only after both peers received brokered, while this exact join and
+	// the original target registration are still current.
+	b.mu.Lock()
+	b.reg.mu.RLock()
+	var updates []rosterUpdate
+	if b.sessions[sessionID] == sess && b.targetCurrentLocked(agent) && !requester.wake.disconnected.Load() {
+		sess.published = true
+		sess.displayName = displayName
+		updates = b.rosterUpdatesLocked(agent, nil)
+	}
+	b.reg.mu.RUnlock()
+	b.mu.Unlock()
+	enqueueRosters(updates)
+
+	b.sendAgentParticipants(agent)
 
 	return sess, nil
 }
 
-// buildParticipantList returns the current SessionParticipants message for the given agent.
+// buildParticipantList builds the legacy agent roster.
 // Must be called with b.mu held.
-func (b *Broker) buildParticipantList(agentDeviceId string) SessionParticipants {
+func (b *Broker) buildParticipantList(agent *Peer) SessionParticipants {
 	sp := SessionParticipants{
-		DeviceID:     agentDeviceId,
+		DeviceID:     agent.DeviceId,
 		Participants: make([]SessionParticipantEntry, 0),
 	}
-	for _, s := range b.deviceSessions[agentDeviceId] {
+	for _, s := range b.deviceSessions[agent.DeviceId] {
+		if s.Target != agent {
+			continue
+		}
 		entry := SessionParticipantEntry{
 			SessionID:    s.Id,
 			TechnicianID: s.TechnicianID,
@@ -340,41 +397,105 @@ func (b *Broker) buildParticipantList(agentDeviceId string) SessionParticipants 
 	return sp
 }
 
-// broadcastParticipants sends a SessionParticipants update to the agent and all its controllers.
-// Must be called WITHOUT b.mu held (it acquires the lock to build the list).
-func (b *Broker) broadcastParticipants(agent *Peer) {
+// sendAgentParticipants preserves the target agent's legacy roster payload.
+func (b *Broker) sendAgentParticipants(agent *Peer) {
 	b.mu.Lock()
-	sp := b.buildParticipantList(agent.DeviceId)
-	// Collect current peers under the lock so we don't hold the lock during sends.
-	recipients := make([]*Peer, 0, len(sp.Participants)+1)
-	recipients = append(recipients, agent)
-	for _, s := range b.deviceSessions[agent.DeviceId] {
-		if s.Requester != nil && s.Requester != agent {
-			recipients = append(recipients, s.Requester)
-		}
+	b.reg.mu.RLock()
+	if !b.targetCurrentLocked(agent) {
+		b.reg.mu.RUnlock()
+		b.mu.Unlock()
+		return
 	}
+	snapshot := b.buildParticipantList(agent)
+	b.reg.mu.RUnlock()
 	b.mu.Unlock()
+	if err := agent.Send(snapshot); err != nil {
+		log.Print("session_participants: failed to notify agent")
+	}
+}
 
-	for _, p := range recipients {
-		if err := p.Send(sp); err != nil {
-			log.Printf("session_participants: failed to notify %q: %v", p.DeviceId, err)
+type rosterUpdate struct {
+	peer     *Peer
+	snapshot SessionParticipants
+}
+
+// rosterUpdatesLocked builds snapshots for surviving and removed requesters.
+// Caller holds Broker.mu and Registry.mu. Removed peers start with an empty
+// roster and receive the current roster if they still belong to this target.
+func (b *Broker) rosterUpdatesLocked(target *Peer, removed map[*Peer]struct{}) []rosterUpdate {
+	recipients := make(map[*Peer]*Session)
+	for peer := range removed {
+		recipients[peer] = nil
+	}
+	// A replacement can publish after the registry releases its gate and
+	// before targetGone runs. Preserve any membership the same requester
+	// already joined on that replacement.
+	current := b.reg.peers[target.DeviceId]
+	var live []*Session
+	if current != nil && !current.wake.disconnected.Load() {
+		for _, s := range b.deviceSessions[target.DeviceId] {
+			if s.Target != current || !s.published || s.Requester.wake.disconnected.Load() {
+				continue
+			}
+			live = append(live, s)
+			if _, wasRemoved := removed[s.Requester]; current == target || wasRemoved {
+				recipients[s.Requester] = s
+			}
 		}
 	}
+	if len(recipients) == 0 {
+		return nil
+	}
+	b.rosterRevision++
+	updates := make([]rosterUpdate, 0, len(recipients))
+	for peer, membership := range recipients {
+		if peer.wake.disconnected.Load() {
+			continue
+		}
+		snapshot := SessionParticipants{
+			DeviceID: target.DeviceId, Revision: b.rosterRevision,
+			Participants: make([]SessionParticipantEntry, 0),
+		}
+		if membership != nil {
+			canSeeNames := !peer.agentConnection.Load() && membership.Target.Tenant != "" &&
+				membership.ticketTenant == membership.Target.Tenant
+			for _, s := range live {
+				entry := SessionParticipantEntry{SessionID: s.Id, TechnicianID: s.TechnicianID, Access: s.Access}
+				if canSeeNames && s.ticketTenant == membership.ticketTenant {
+					entry.DisplayName = s.displayName
+				}
+				snapshot.Participants = append(snapshot.Participants, entry)
+			}
+		}
+		updates = append(updates, rosterUpdate{peer: peer, snapshot: snapshot})
+	}
+	return updates
+}
+
+func enqueueRosters(updates []rosterUpdate) {
+	for _, update := range updates {
+		update.peer.enqueueRoster(update.snapshot)
+	}
+}
+
+// Caller holds Registry.mu.
+func (b *Broker) targetCurrentLocked(agent *Peer) bool {
+	return b.reg.peers[agent.DeviceId] == agent && !agent.wake.disconnected.Load()
 }
 
 // redeemTicket records the ticket's single use in the control plane's SHARED ledger and reports
 // whether the broker must be refused.
 //
-// It returns an error ONLY for a definitive "already redeemed" answer. Every other outcome — no
-// redeemer configured, timeout, connection refused, 401, 404, 5xx — returns nil and lets the broker
+// The boolean reports confirmation by the shared ledger. When strict redemption is disabled,
+// an unavailable ledger leaves confirmation false and lets the broker
 // proceed on the LOCAL verdict, loudly logged. That posture is the opposite of the device-identity
 // resolver's fail-closed one; ticketredeem.go's header sets out why the two differ, and the short
 // version is that this call de-duplicates an already-verified, tenant-bound, device-bound,
 // ~2-minute credential, so refusing on a control-plane blip would turn a restart into a fleet-wide
 // brokering outage — a worse and likelier event than the replay it defends against.
-func (b *Broker) redeemTicket(ticket *SignedSessionTicket) error {
+func (b *Broker) redeemTicket(ticket *SignedSessionTicket) (bool, error) {
 	if b.redeemer == nil {
-		return nil
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ticketRedeemTimeout)
 	defer cancel()
@@ -382,9 +503,9 @@ func (b *Broker) redeemTicket(ticket *SignedSessionTicket) error {
 	err := b.redeemer.Redeem(ctx, ticket.Claims)
 	switch {
 	case err == nil:
-		return nil
+		return true, nil
 	case errors.Is(err, ErrTicketAlreadyRedeemed):
-		return err
+		return false, err
 	default:
 		if b.ticketStrict {
 			// Strict (fail-closed) mode: any ledger uncertainty refuses the broker. The operator
@@ -395,7 +516,7 @@ func (b *Broker) redeemTicket(ticket *SignedSessionTicket) error {
 				"(SIGNALING_STRICT_TICKET_REDEMPTION is set; unset it to allow brokering during ledger outages). "+
 				"The ticket is locally spent and cannot be retried; the technician must obtain a new session ticket.",
 				err, clipForLog(ticket.Claims.SessionID), ticket.Claims.DeviceID)
-			return fmt.Errorf("session-ticket ledger unavailable: %w", err)
+			return false, fmt.Errorf("session-ticket ledger unavailable: %w", err)
 		}
 		// Fail-open (default) mode: LOUD on purpose, and at WARNING rather than a debug line: while
 		// this is happening, a captured ticket really can be replayed at another replica, and the
@@ -404,7 +525,7 @@ func (b *Broker) redeemTicket(ticket *SignedSessionTicket) error {
 			"on this instance's local single-use check ALONE; a ticket replayed at another signaling "+
 			"instance would not be detected while this persists",
 			err, clipForLog(ticket.Claims.SessionID), ticket.Claims.DeviceID)
-		return nil
+		return false, nil
 	}
 }
 
@@ -441,56 +562,100 @@ func (b *Broker) RelaySdp(session string, from *Peer, sdp string, kind SdpKind) 
 	return dst.Send(SdpMsg{Session: session, Sdp: sdp, Kind: kind})
 }
 
-// dropSession removes a session (e.g. after a peer proved unreachable mid-broker).
-// It also cleans up deviceSessions and notifies remaining participants.
-func (b *Broker) dropSession(id string) {
-	b.mu.Lock()
-	sess, had := b.sessions[id]
-	delete(b.sessions, id)
-	if had && sess != nil && sess.Target != nil {
-		delete(b.deviceSessions[sess.Target.DeviceId], id)
-		if len(b.deviceSessions[sess.Target.DeviceId]) == 0 {
-			delete(b.deviceSessions, sess.Target.DeviceId)
-		}
-	}
-	var agent *Peer
-	if had && sess != nil {
-		agent = sess.Target
-	}
-	b.mu.Unlock()
-	if agent != nil {
-		b.broadcastParticipants(agent)
+// deleteSessionLocked requires Broker.mu.
+func (b *Broker) deleteSessionLocked(s *Session) {
+	delete(b.sessions, s.Id)
+	device := s.Target.DeviceId
+	delete(b.deviceSessions[device], s.Id)
+	if len(b.deviceSessions[device]) == 0 {
+		delete(b.deviceSessions, device)
 	}
 }
 
-// RemovePeerSessions tears down every session the given peer participates in. Called when a
-// connection drops so the session table does not leak. Sends SessionParticipants updates to
-// any remaining participants on the same devices.
+func (b *Broker) dropSession(id string) {
+	b.mu.Lock()
+	s := b.sessions[id]
+	if s == nil {
+		b.mu.Unlock()
+		return
+	}
+	b.deleteSessionLocked(s)
+	removed := make(map[*Peer]struct{})
+	if s.published {
+		removed[s.Requester] = struct{}{}
+	}
+	b.reg.mu.RLock()
+	updates := b.rosterUpdatesLocked(s.Target, removed)
+	b.reg.mu.RUnlock()
+	b.mu.Unlock()
+	enqueueRosters(updates)
+	b.sendAgentParticipants(s.Target)
+}
+
+// endTargetSession removes only the matching live session on the reporting connection.
+func (b *Broker) endTargetSession(target *Peer, controlPlaneID string) {
+	b.mu.Lock()
+	var id string
+	for _, s := range b.deviceSessions[target.DeviceId] {
+		if s.Target == target && s.controlPlaneID == controlPlaneID {
+			id = s.Id
+			break
+		}
+	}
+	b.mu.Unlock()
+	if id != "" {
+		b.dropSession(id)
+	}
+}
+
+// targetGone is called after the registry releases its locks and device gate.
+// It removes only sessions targeting the removed connection and does no socket I/O.
+func (b *Broker) targetGone(target *Peer) {
+	b.removePeerMemberships(target, true)
+}
+
+// RemovePeerSessions tears down both sides of a disconnected peer's memberships.
 func (b *Broker) RemovePeerSessions(p *Peer) {
 	if p == nil {
 		return
 	}
-	// Collect affected agents BEFORE the lock so we can notify after.
+	p.stopRoster()
+	b.removePeerMemberships(p, false)
+}
+
+func (b *Broker) removePeerMemberships(peer *Peer, targetOnly bool) {
 	b.mu.Lock()
-	var affectedAgents []*Peer
-	for id, s := range b.sessions {
-		if s.Requester == p || s.Target == p {
-			delete(b.sessions, id)
-			if s.Target != nil {
-				delete(b.deviceSessions[s.Target.DeviceId], id)
-				if len(b.deviceSessions[s.Target.DeviceId]) == 0 {
-					delete(b.deviceSessions, s.Target.DeviceId)
-				}
-				// Collect the agent to notify remaining participants (but only if agent itself isn't gone).
-				if s.Target != p {
-					affectedAgents = append(affectedAgents, s.Target)
-				}
-			}
+	affected := make(map[*Peer]map[*Peer]struct{})
+	sessions := b.sessions
+	if targetOnly {
+		sessions = b.deviceSessions[peer.DeviceId]
+	}
+	for _, s := range sessions {
+		if s.Target != peer && (targetOnly || s.Requester != peer) {
+			continue
+		}
+		b.deleteSessionLocked(s)
+		removed := affected[s.Target]
+		if removed == nil {
+			removed = make(map[*Peer]struct{})
+			affected[s.Target] = removed
+		}
+		if s.published {
+			removed[s.Requester] = struct{}{}
 		}
 	}
+	var updates []rosterUpdate
+	b.reg.mu.RLock()
+	for target, removed := range affected {
+		updates = append(updates, b.rosterUpdatesLocked(target, removed)...)
+	}
+	b.reg.mu.RUnlock()
 	b.mu.Unlock()
-	for _, agent := range affectedAgents {
-		b.broadcastParticipants(agent)
+	enqueueRosters(updates)
+	if !targetOnly {
+		for target := range affected {
+			b.sendAgentParticipants(target)
+		}
 	}
 }
 

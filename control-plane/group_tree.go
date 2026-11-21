@@ -376,6 +376,17 @@ func minPositive(a, b int) int {
 	return a
 }
 
+// effectiveSessionIdleSeconds applies the tenant fallback after merging the group tree.
+func effectiveSessionIdleSeconds(groupIdle int, tenantPolicy SessionPolicy) int {
+	if groupIdle > 0 {
+		return groupIdle
+	}
+	if tenantPolicy.DefaultMaxIdleSeconds != nil {
+		return *tenantPolicy.DefaultMaxIdleSeconds
+	}
+	return 0
+}
+
 // EffectivePolicy resolves the strictest-merge policy for a group, replacing the exact-group read at every
 // session-policy call site (docs/62 D4). With no group store wired it degrades to the group's own row.
 func (s *Server) EffectivePolicy(ctx context.Context, tenantID, groupID string) (EffectiveGroupPolicy, error) {

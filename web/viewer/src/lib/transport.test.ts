@@ -11,7 +11,7 @@
  * `RTCPeerConnection`/`RTCDataChannel` that record what the transport does.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { WebRTCTransport, candidateKind, type SignalingClient, type TransportEvents } from "./transport";
+import { WebRTCTransport, candidateKind, SignalingClient, type TransportEvents } from "./transport";
 import {
   ChannelId,
   encodeFrame,
@@ -723,5 +723,33 @@ describe("WebRTCTransport outbound hold (docs/69)", () => {
     transport.send(ChannelId.Control, new Uint8Array([2]));
     expect(dc.sent).toHaveLength(0);
     transport.close();
+  });
+});
+
+describe("SignalingClient close notification", () => {
+  it.each(["socket", "explicit"])("notifies once after a %s close", async (kind) => {
+    const socket = { onopen: () => {}, onclose: () => {}, close: vi.fn() };
+    vi.stubGlobal("WebSocket", class {
+      constructor() { return socket; }
+    });
+    try {
+      const onClose = vi.fn();
+      const signaling = new SignalingClient("ws://signaling.test", onClose);
+      const opened = signaling.open();
+      socket.onopen();
+      await opened;
+
+      if (kind === "explicit") {
+        signaling.close();
+        expect(socket.close).toHaveBeenCalledOnce();
+        expect(onClose).toHaveBeenCalledOnce();
+      }
+      socket.onclose();
+      signaling.close();
+      socket.onclose();
+      expect(onClose).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

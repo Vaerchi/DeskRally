@@ -25,6 +25,7 @@ func applyTenantSessionPolicyMigration(t *testing.T, pool *pgxpool.Pool) {
 		"migrations/0029_tenant_session_policy.sql",
 		"migrations/0030_tenant_session_max_age.sql", // ALTER: adds max_session_seconds
 		"migrations/0083_tenant_session_binding.sql", // ALTER: adds session_binding (docs/69 step 4)
+		"migrations/0086_tenant_default_idle.sql",
 	} {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -50,22 +51,40 @@ func TestPgTenantSessionPolicyUnderRLS(t *testing.T) {
 	if p, err := store.Get(ctx, tidA); err != nil || p.MaxConcurrentSessions != 0 {
 		t.Fatalf("unset A = (%+v, %v), want 0", p, err)
 	}
-	// Upsert insert, then update; each read-back reflects the last write. Both columns round-trip.
-	if err := store.Set(ctx, tidA, SessionPolicy{MaxConcurrentSessions: 5, MaxSessionSeconds: 3600}); err != nil {
+	// Upsert insert, then update. An omitted idle timeout preserves the stored setting.
+	idle := 900
+	if err := store.Set(ctx, tidA, SessionPolicy{MaxConcurrentSessions: 5, MaxSessionSeconds: 3600, DefaultMaxIdleSeconds: &idle}); err != nil {
 		t.Fatalf("Set A insert: %v", err)
 	}
-	if p, _ := store.Get(ctx, tidA); p.MaxConcurrentSessions != 5 || p.MaxSessionSeconds != 3600 {
-		t.Fatalf("A after insert = %+v, want {5, 3600}", p)
+	if p, _ := store.Get(ctx, tidA); p.MaxConcurrentSessions != 5 || p.MaxSessionSeconds != 3600 || p.DefaultMaxIdleSeconds == nil || *p.DefaultMaxIdleSeconds != 900 {
+		t.Fatalf("A after insert = %+v, want limit 5, duration 3600, idle 900", p)
 	}
 	if err := store.Set(ctx, tidA, SessionPolicy{MaxConcurrentSessions: 2}); err != nil {
 		t.Fatalf("Set A update: %v", err)
 	}
-	if p, _ := store.Get(ctx, tidA); p.MaxConcurrentSessions != 2 {
-		t.Fatalf("A after update = %+v, want 2", p)
+	if p, err := store.Get(ctx, tidA); err != nil || p.MaxConcurrentSessions != 2 || p.DefaultMaxIdleSeconds == nil || *p.DefaultMaxIdleSeconds != 900 {
+		t.Fatalf("A after update = (%+v, %v), want limit 2 and idle 900", p, err)
 	}
-	// Tenant B is independent — its own row, unaffected by A's writes (RLS row-per-tenant).
-	if p, _ := store.Get(ctx, tidB); p.MaxConcurrentSessions != 0 {
-		t.Fatalf("B = %+v, want 0 (A's writes must not leak)", p)
+	invalid := MaxGroupIdleSeconds + 1
+	if err := store.Set(ctx, tidA, SessionPolicy{DefaultMaxIdleSeconds: &invalid}); err == nil {
+		t.Fatal("database accepted out-of-range idle timeout")
+	}
+	zero := 0
+	if err := store.Set(ctx, tidA, SessionPolicy{MaxConcurrentSessions: 2, DefaultMaxIdleSeconds: &zero}); err != nil {
+		t.Fatalf("clear idle: %v", err)
+	}
+	if p, err := store.Get(ctx, tidA); err != nil || p.DefaultMaxIdleSeconds == nil || *p.DefaultMaxIdleSeconds != 0 {
+		t.Fatalf("A after clear = (%+v, %v), want idle 0", p, err)
+	}
+	// An insert that leaves the column to PostgreSQL gets the migration's default.
+	if err := withTenant(ctx, appPool, tidB, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO tenant_session_policy (tenant_id) VALUES ($1)", tidB)
+		return err
+	}); err != nil {
+		t.Fatalf("insert B with column defaults: %v", err)
+	}
+	if p, err := store.Get(ctx, tidB); err != nil || p.MaxConcurrentSessions != 0 || p.DefaultMaxIdleSeconds == nil || *p.DefaultMaxIdleSeconds != 0 {
+		t.Fatalf("B = (%+v, %v), want limit 0 and idle 0", p, err)
 	}
 	if err := store.Set(ctx, tidB, SessionPolicy{MaxConcurrentSessions: 9}); err != nil {
 		t.Fatalf("Set B: %v", err)

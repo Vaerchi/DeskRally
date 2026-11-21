@@ -26,6 +26,8 @@ type SessionPolicy struct {
 	// stored" (warn for a new row), applied atomically inside the store's upsert, so a PUT that omits it (an older
 	// console's limits form) can never downgrade require to warn, even racing a concurrent change.
 	SessionBinding string `json:"session_binding,omitempty"`
+	// DefaultMaxIdleSeconds is used when the group tree has no idle timeout. On write, nil keeps the stored value.
+	DefaultMaxIdleSeconds *int `json:"default_max_idle_seconds"`
 }
 
 // MaxSessionLimit is the ceiling the console/API will accept for MaxConcurrentSessions. It is a sanity
@@ -73,6 +75,11 @@ func NormalizeSessionPolicy(p SessionPolicy) (SessionPolicy, bool) {
 		out.MaxSessionSeconds = MaxSessionSecondsCeiling
 		ok = false
 	}
+	if idle := p.DefaultMaxIdleSeconds; idle != nil && (*idle < 0 || *idle > MaxGroupIdleSeconds) {
+		clamped := min(max(*idle, 0), MaxGroupIdleSeconds)
+		out.DefaultMaxIdleSeconds = &clamped
+		ok = false
+	}
 	return out, ok
 }
 
@@ -118,7 +125,12 @@ var _ TenantSessionPolicyStore = (*InMemoryTenantSessionPolicyStore)(nil)
 func (s *InMemoryTenantSessionPolicyStore) Get(_ context.Context, tenantID string) (SessionPolicy, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.policies[tenantID], nil
+	p := s.policies[tenantID]
+	if p.DefaultMaxIdleSeconds != nil {
+		idle := *p.DefaultMaxIdleSeconds
+		p.DefaultMaxIdleSeconds = &idle
+	}
+	return p, nil
 }
 
 // Set implements TenantSessionPolicyStore: overwrite the tenant's policy.
@@ -128,6 +140,13 @@ func (s *InMemoryTenantSessionPolicyStore) Set(_ context.Context, tenantID strin
 	if p.SessionBinding == "" { // keep the stored mode (warn for a new entry), as the pg upsert does
 		p.SessionBinding = bindingOrWarn(s.policies[tenantID].SessionBinding)
 	}
+	idle := 0
+	if p.DefaultMaxIdleSeconds != nil {
+		idle = *p.DefaultMaxIdleSeconds
+	} else if stored := s.policies[tenantID].DefaultMaxIdleSeconds; stored != nil {
+		idle = *stored
+	}
+	p.DefaultMaxIdleSeconds = &idle
 	s.policies[tenantID] = p
 	return nil
 }

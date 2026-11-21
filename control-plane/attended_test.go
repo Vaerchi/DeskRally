@@ -75,16 +75,21 @@ type attendedRedeemResp struct {
 }
 type attendedConnectResp struct {
 	Signaling struct {
-		URL       string              `json:"url"`
-		DeviceID  string              `json:"device_id"`
-		SessionID string              `json:"session_id"`
-		Ticket    SignedSessionTicket `json:"ticket"`
+		URL             string              `json:"url"`
+		DeviceID        string              `json:"device_id"`
+		SessionID       string              `json:"session_id"`
+		Ticket          SignedSessionTicket `json:"ticket"`
+		NameAttestation *nameAttestation    `json:"name_attestation"`
 	} `json:"signaling"`
 }
 
 // TestAttendedConsentGate is the load-bearing test: no ticket before consent, a valid ticket after.
 func TestAttendedConsentGate(t *testing.T) {
 	srv, _ := newAttendedServer(t)
+	p := srv.Auth.(StubAuthenticator).Principal
+	users := NewInMemoryUserStore()
+	users.AddUser(&AuthUser{ID: p.UserID, TenantID: p.TenantID, DisplayName: "Attended technician"}, p.Grant)
+	srv.AuthAPI = &AuthService{Users: users}
 
 	// 1. Technician creates the session → a one-time code.
 	var created attendedCreateResp
@@ -127,6 +132,9 @@ func TestAttendedConsentGate(t *testing.T) {
 	var conn attendedConnectResp
 	if code := apiJSON(t, srv, "POST", "/attended-sessions/"+id+"/connect", "", &conn); code != http.StatusOK {
 		t.Fatalf("connect after consent: status %d", code)
+	}
+	if conn.Signaling.NameAttestation != nil {
+		t.Fatal("attended session minted a name attestation")
 	}
 	if conn.Signaling.Ticket.Claims.DeviceID != redeemed.DeviceID {
 		t.Fatalf("ticket device %q != redeemed device %q", conn.Signaling.Ticket.Claims.DeviceID, redeemed.DeviceID)

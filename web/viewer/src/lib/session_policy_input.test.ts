@@ -1,12 +1,27 @@
 /** Boundary tests for the session-policy form validator (mirrors server NormalizeSessionPolicy). */
 import { describe, it, expect } from "vitest";
-import { parseSessionPolicyInput } from "./session_policy_input";
+import { defaultIdleMinutes, parseDefaultIdleMinutes, parseSessionPolicyInput } from "./session_policy_input";
 
 function err(limit: string, age: string): string {
   const r = parseSessionPolicyInput(limit, age);
   if (r.ok) throw new Error(`expected rejection for ${JSON.stringify([limit, age])}`);
   return r.error;
 }
+
+describe("default idle timeout minutes", () => {
+  it.each([0, 1, 90, 300, 3599, 3600])("round-trips %d API seconds", (seconds) => {
+    expect(parseDefaultIdleMinutes(defaultIdleMinutes(seconds))).toBe(seconds);
+  });
+
+  it("displays minutes and converts edited minutes to seconds", () => {
+    expect(defaultIdleMinutes(300)).toBe("5");
+    expect(parseDefaultIdleMinutes(" 7.5 ")).toBe(450);
+  });
+
+  it.each(["", " ", "-1", "60.01", "61", "0.001", "1e1", "NaN", "Infinity"])("rejects %j", (text) => {
+    expect(parseDefaultIdleMinutes(text)).toBeNull();
+  });
+});
 
 describe("parseSessionPolicyInput", () => {
   it("accepts 0/0 (no limits)", () => {

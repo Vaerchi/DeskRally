@@ -39,6 +39,11 @@ export function EnrollmentTokensPanel({ api }: EnrollmentTokensPanelProps) {
   const [removing, setRemoving] = useState<string | null>(null);
   // The just-minted secret, shown ONCE. Null once dismissed.
   const [secret, setSecret] = useState<{ groupId: string; token: string } | null>(null);
+  // First run (deployment feedback 11-20): a brand-new tenant has no machine group, so nothing can be installed.
+  // Offer to create one right here instead of a hint hidden inside a disabled dropdown.
+  const [groupsLoaded, setGroupsLoaded] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [groupCreateError, setGroupCreateError] = useState<string | null>(null);
 
   // Latest-wins guard: only the newest refresh may touch tokens/groups/error/busy, so a slower older
   // listing landing after a post-revoke re-list cannot make a revoked enrollment secret look active.
@@ -69,6 +74,7 @@ export function EnrollmentTokensPanel({ api }: EnrollmentTokensPanelProps) {
         const items = await api.listMachineGroups();
         if (!guard.isCurrent(token)) return;
         setGroups(items);
+        setGroupsLoaded(true);
         setGroupId((current) => items.some((g) => g.id === current) ? current : items.length === 1 ? items[0].id : "");
       } catch (e) {
         if (!guard.isCurrent(token)) return;
@@ -150,6 +156,22 @@ export function EnrollmentTokensPanel({ api }: EnrollmentTokensPanelProps) {
     [tokens, textQuery],
   );
 
+  const handleCreateDefaultGroup = useCallback(async () => {
+    if (creatingGroup) return;
+    setCreatingGroup(true);
+    setGroupCreateError(null);
+    try {
+      await api.createMachineGroup({ name: "Default" });
+      await refresh(); // a single group is auto-selected by refresh()
+    } catch {
+      setGroupCreateError(
+        "Could not create the group. If you are not an administrator, ask one to create a machine group (Manage > Machine groups).",
+      );
+    } finally {
+      setCreatingGroup(false);
+    }
+  }, [api, creatingGroup, refresh]);
+
   const handleExport = useCallback(() => {
     saveBytesAsFile(
       "enrollment-tokens.csv",
@@ -180,6 +202,24 @@ export function EnrollmentTokensPanel({ api }: EnrollmentTokensPanelProps) {
           </select>
         </label>
       </div>
+      {groupsLoaded && groups.length === 0 && (
+        <div className="panel__detail" data-testid="enroll-no-groups">
+          <p>
+            Computers are installed into a machine group, and this organization has none yet. Create one to enable
+            the installer download.
+          </p>
+          <button
+            className="panel__action"
+            type="button"
+            disabled={creatingGroup}
+            onClick={() => void handleCreateDefaultGroup()}
+            data-testid="enroll-create-default-group"
+          >
+            {creatingGroup ? "Creating group…" : "Create a \"Default\" group"}
+          </button>
+          {groupCreateError && <p role="alert" data-testid="enroll-create-default-group-error">{groupCreateError}</p>}
+        </div>
+      )}
       <ManagedInstallDownload api={api} groupId={groupId} />
       {error && <p className="panel__toolbar-error" role="alert" data-testid="enroll-error">{error}</p>}
       <details>

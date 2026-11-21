@@ -814,6 +814,12 @@ func (s *PgDirectiveStore) ApplyAckVia(ctx context.Context, tenantID, id, device
 			out, outErr = d, ErrDirectiveKeyChanged
 			return nil
 		}
+		if completesUninstall {
+			key, _ := hex.DecodeString(lockedMachine.Pubkey)
+			if err := lockRunDeviceKey(ctx, tx, key, false); err != nil {
+				return err
+			}
+		}
 		d.State, d.AckedAt, d.StateDetail, d.UpdatedAt, d.LastAckTsMs = to, &now, a.Detail, now, a.TsMs
 		d.AgentState = to
 		meta := map[string]any{"from": a.From, "actor_kind": "agent", "detail": a.Detail}
@@ -848,7 +854,7 @@ func (s *PgDirectiveStore) ApplyAckVia(ctx context.Context, tenantID, id, device
 	return out, applied, outErr
 }
 
-// tombstoneMachineTx is the D-C9 tombstone: the machine becomes 'removed' (terminal). It is the ONE statement a
+// tombstoneMachineTx marks the machine 'removed' and clears its LAN facts. It is the shared step a
 // confirmed removal (ApplyAckVia) and an Owner's forget (ForgetMachine) both run, in the transaction that has
 // just ended the machine's active directive, so machine_directive_guard lets it through (and DR002 keeps it
 // there for good). Identity lookup (cp_machine_identity_by_device_id) and enrollment of the key
@@ -857,7 +863,7 @@ func tombstoneMachineTx(ctx context.Context, tx pgx.Tx, machineID string) error 
 	if _, err := tx.Exec(ctx, `UPDATE machine SET status = 'removed' WHERE id = $1`, machineID); err != nil {
 		return mapMachineGuardError(err)
 	}
-	return nil
+	return DeleteLanFactsTx(ctx, tx, machineID)
 }
 
 // forgetActiveDirectivesQuery locks (FOR UPDATE) every ACTIVE directive of one machine, oldest first. The
@@ -882,7 +888,7 @@ func (s *PgDirectiveStore) ForgetMachine(ctx context.Context, tenantID string, i
 		}
 		// THE machine row lock (FOR UPDATE): a request, an issuance (both FOR SHARE) and a final-ack apply (FOR
 		// UPDATE) on this machine serialize with this forget; whichever commits first is seen by the other.
-		// Lock order, as everywhere: machine, directive, audit chain.
+		// Lock order: machine, directive, device key, audit chain.
 		m, err := lockMachine(ctx, tx, in.MachineID, true)
 		if errors.Is(err, ErrMachineNotFound) {
 			outErr = err
@@ -911,6 +917,10 @@ func (s *PgDirectiveStore) ForgetMachine(ctx context.Context, tenantID string, i
 		}
 		closed, err := collectDirectives(rows)
 		if err != nil {
+			return err
+		}
+		key, _ := hex.DecodeString(m.Pubkey)
+		if err := lockRunDeviceKey(ctx, tx, key, false); err != nil {
 			return err
 		}
 		now, err := dbNow(ctx, tx)

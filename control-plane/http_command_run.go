@@ -16,7 +16,10 @@ package controlplane
 // already emits (a cmd line as-is; a PowerShell body wrapped around its base64), so the audited text
 // and the executed text are one and the same.
 
-import "net/http"
+import (
+	"encoding/json"
+	"net/http"
+)
 
 // runCommandBody is the request for POST /sessions/{id}/command-run. Body is the raw script the
 // operator typed (a cmd line or a PowerShell script); it is validated and length-capped exactly like a
@@ -61,18 +64,14 @@ func (s *Server) handleRunCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "this session is view-only; commands cannot run")
 		return
 	}
-	// Unlike a generic mutation, this endpoint's ENTIRE purpose is the central audit, so it must fail
-	// CLOSED when no audit store is wired: recordMgmtAudit silently no-ops in that configuration (it is
-	// nil only in pure-RBAC skeleton tests), which would hand out a runnable command with no record.
-	// Refuse before that can happen, rather than quietly breaking the guarantee the endpoint exists for.
-	if s.MgmtAudit == nil {
+	store, ok := s.MgmtAudit.(*PgMgmtAuditStore)
+	if !ok || store == nil {
 		writeError(w, http.StatusInternalServerError, "audit store not configured; commands cannot run")
 		return
 	}
 	requestID := newUUID()
-	// Audit FIRST, and fail the request if the audit cannot be written (recordMgmtAudit returns the
-	// error for exactly this): a command that cannot be recorded must not be handed out to run.
-	if err := s.recordMgmtAudit(r, "command.run_requested", "session", held.Rec.ID, map[string]any{
+	command := ToolboxCommand(req.Shell, req.Body)
+	meta, _ := json.Marshal(map[string]any{
 		"request_id":      requestID,
 		"session_id":      held.Rec.ID,
 		"machine_id":      held.Rec.MachineID,
@@ -81,16 +80,21 @@ func (s *Server) handleRunCommand(w http.ResponseWriter, r *http.Request) {
 		"command_sha256":  ToolboxBodySHA256(req.Body),
 		"command_preview": previewBytes(req.Body, commandAuditPreviewBytes),
 		"outcome":         "unknown",
-	}); err != nil {
+	})
+	event := &MgmtAuditEvent{ActorUserID: p.UserID, Action: "command.run_requested",
+		TargetKind: "session", TargetID: held.Rec.ID, Metadata: meta}
+	if err := store.recordCommandRun(r.Context(), p.TenantID, requestID, held.Rec.ID, held.Rec.MachineID,
+		req.Shell, req.RunAs, command, event); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not record the command run; nothing was dispatched")
 		return
 	}
 	// The audit has committed; only now is the authoritative command handed out.
+	s.dispatchToolboxEvent(p.TenantID, event)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"request_id": requestID,
 		"shell":      req.Shell,
 		"run_as":     req.RunAs,
-		"command":    ToolboxCommand(req.Shell, req.Body),
+		"command":    command,
 	})
 }
 

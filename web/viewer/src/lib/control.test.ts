@@ -724,6 +724,35 @@ describe("control codec: one-line command bar (wire-compat with Rust control.rs)
     ).toEqual({ t: "RunCommand", c: { command: "dir", shell: "Cmd", as_user: false } });
   });
 
+  it("carries a negotiated request ID in Rust field order", () => {
+    const enc = (value: string) => new TextEncoder().encode(value);
+    const requestId = "11111111-2222-4333-8444-555555555555";
+    const frame = `{"t":"RunCommand","c":{"command":"whoami","shell":"Cmd","as_user":false,"request_id":"${requestId}"}}`;
+    expect(dec(encodeControl({
+      t: "RunCommand", c: { command: "whoami", shell: "Cmd", as_user: false, request_id: requestId },
+    }))).toBe(frame);
+    expect(decodeControl(enc(frame))).toMatchObject({ c: { request_id: requestId } });
+  });
+
+  it("decodes the flattened Rust receipt and preserves the entire signed object", () => {
+    const enc = (value: string) => new TextEncoder().encode(value);
+    const requestId = "11111111-2222-4333-8444-555555555555";
+    const receipt = {
+      claims: {
+        tenant_id: "22222222-2222-4222-8222-222222222222", device_id: "device",
+        session_id: "33333333-3333-4333-8333-333333333333", request_id: requestId,
+        shell: "cmd", run_as: "system", exec_sha256: "ab".repeat(32),
+        outcome: "start_failed", exit_code: null, truncated: false, finished_at_ms: 1700000000000,
+      },
+      sig: "cd".repeat(64),
+    };
+    const bytes = enc(JSON.stringify({ t: "RunReceipt", c: receipt }));
+    const message = decodeControl(bytes);
+    expect(message).toEqual({ t: "RunReceipt", c: { requestId, receipt } });
+    expect(encodeControl(message)).toEqual(bytes);
+    expect(() => decodeControl(enc('{"t":"RunReceipt","c":{"claims":{},"sig":"ab"}}'))).toThrow();
+  });
+
   it("CommandResult → adjacently-tagged JSON (mirrors Rust literals), incl. a killed/truncated one", () => {
     expect(
       dec(

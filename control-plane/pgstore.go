@@ -564,6 +564,18 @@ func (s *PgUserStore) SetUserDisabled(ctx context.Context, tenantID, userID stri
 	})
 }
 
+// findUserDisplayName reads the roster label without loading authentication material.
+func (s *PgUserStore) findUserDisplayName(ctx context.Context, tenantID, userID string) (string, error) {
+	if namesNoUUIDRow(userID) {
+		return "", ErrNoUser
+	}
+	var name string
+	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT display_name FROM app_user WHERE id = $1 AND tenant_id = $2`, userID, tenantID).Scan(&name)
+	})
+	return name, err
+}
+
 // FindUserByID implements UserStore.
 func (s *PgUserStore) FindUserByID(ctx context.Context, tenantID, userID string) (*AuthUser, error) {
 	// An id no `uuid` column could hold is "no such user", not a 500 (pathid.go).
@@ -1283,7 +1295,7 @@ func (s *PgMachineStore) SetMachineNote(ctx context.Context, tenantID, machineID
 }
 
 // LookupDeviceIdentity implements MachineStore via the SECURITY DEFINER
-// cp_machine_identity_by_device_id (migrations/0010). It runs ON THE POOL, not withTenant: the
+// cp_machine_identity_by_device_id (latest definition in migration 0084). It runs on the pool: the
 // caller (the signaling server, through GET /internal/devices/{id}/identity) has no tenant context
 // — resolving the tenant is the whole point of the call — so RLS would filter the row away. The
 // function excludes rows with no pinned key, so an unpinned machine is indistinguishable from an
@@ -1294,12 +1306,13 @@ func (s *PgMachineStore) LookupDeviceIdentity(ctx context.Context, deviceID stri
 	}
 	var (
 		id, tenantID, status string
+		ephemeral            bool
 		pub                  []byte
 	)
 	err := s.Pool.QueryRow(ctx, `
-		SELECT device_id, tenant_id::text, pubkey, status
+		SELECT device_id, tenant_id::text, pubkey, status, ephemeral
 		FROM cp_machine_identity_by_device_id($1)
-	`, deviceID).Scan(&id, &tenantID, &pub, &status)
+	`, deviceID).Scan(&id, &tenantID, &pub, &status, &ephemeral)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrMachineNotFound
@@ -1309,7 +1322,7 @@ func (s *PgMachineStore) LookupDeviceIdentity(ctx context.Context, deviceID stri
 	if len(pub) == 0 {
 		return nil, ErrMachineNotFound
 	}
-	return &DeviceIdentity{DeviceID: id, TenantID: tenantID, Pubkey: hex.EncodeToString(pub), Status: status}, nil
+	return &DeviceIdentity{DeviceID: id, TenantID: tenantID, Pubkey: hex.EncodeToString(pub), Status: status, Ephemeral: ephemeral}, nil
 }
 
 // KeyTombstoned implements MachineStore (docs/65 D-C9) via the SECURITY DEFINER cp_machine_key_removed
@@ -1681,13 +1694,7 @@ func (s *PgMachinePropertyStore) SetProperty(ctx context.Context, tenantID, mach
 		return ErrMachineNotFound
 	}
 	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO machine_property (tenant_id, machine_id, key, value)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (tenant_id, machine_id, key)
-			DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-		`, tenantID, machineID, key, value)
-		return err
+		return upsertMachinePropertyTx(ctx, tx, tenantID, machineID, key, value)
 	})
 	if isForeignKeyViolation(err) {
 		return ErrMachineNotFound
@@ -1721,6 +1728,44 @@ func (s *PgMachinePropertyStore) DeleteProperty(ctx context.Context, tenantID, m
 		return ErrMachinePropertyNotFound
 	}
 	return nil
+}
+
+func (s *PgMachinePropertyStore) ListPropertiesForMachines(ctx context.Context, tenantID string, machineIDs []string) (map[string]map[string]string, error) {
+	out := make(map[string]map[string]string)
+	ids := make([]string, 0, len(machineIDs))
+	for _, id := range machineIDs {
+		if !namesNoUUIDRow(id) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT machine_id::text, key, value FROM machine_property
+			WHERE machine_id = ANY($1::text[]::uuid[])
+		`, ids)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, key, value string
+			if err := rows.Scan(&id, &key, &value); err != nil {
+				return err
+			}
+			if out[id] == nil {
+				out[id] = make(map[string]string)
+			}
+			out[id][key] = value
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // MachineIDsWithProperty implements MachinePropertyStore: the machine ids in the tenant whose bag has
@@ -1960,7 +2005,7 @@ func (s *PgDynamicGroupStore) ListDynamicGroups(ctx context.Context, tenantID st
 	var out []DynamicGroup
 	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT id::text, name, property_key, property_value
+			SELECT id::text, name, property_key, property_value, match, conditions
 			FROM dynamic_group ORDER BY name
 		`)
 		if err != nil {
@@ -1969,7 +2014,7 @@ func (s *PgDynamicGroupStore) ListDynamicGroups(ctx context.Context, tenantID st
 		defer rows.Close()
 		for rows.Next() {
 			var g DynamicGroup
-			if err := rows.Scan(&g.ID, &g.Name, &g.PropertyKey, &g.PropertyValue); err != nil {
+			if err := rows.Scan(&g.ID, &g.Name, &g.PropertyKey, &g.PropertyValue, &g.Match, &g.Conditions); err != nil {
 				return err
 			}
 			out = append(out, g)
@@ -1991,9 +2036,9 @@ func (s *PgDynamicGroupStore) GetDynamicGroup(ctx context.Context, tenantID, id 
 	var g DynamicGroup
 	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT id::text, name, property_key, property_value
+			SELECT id::text, name, property_key, property_value, match, conditions
 			FROM dynamic_group WHERE id = $1
-		`, id).Scan(&g.ID, &g.Name, &g.PropertyKey, &g.PropertyValue)
+		`, id).Scan(&g.ID, &g.Name, &g.PropertyKey, &g.PropertyValue, &g.Match, &g.Conditions)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDynamicGroupNotFound
@@ -2007,15 +2052,26 @@ func (s *PgDynamicGroupStore) GetDynamicGroup(ctx context.Context, tenantID, id 
 // CreateDynamicGroup implements DynamicGroupStore: INSERT with a DB-assigned id, RETURNING it into g.ID.
 // A duplicate name (the UNIQUE (tenant_id, name)) surfaces as ErrDynamicGroupNameTaken.
 func (s *PgDynamicGroupStore) CreateDynamicGroup(ctx context.Context, tenantID string, g *DynamicGroup) error {
+	match := g.Match
+	if match == "" {
+		match = "all"
+	}
+	var conditions any
+	if g.Conditions != nil {
+		conditions = g.Conditions
+	}
 	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			INSERT INTO dynamic_group (tenant_id, name, property_key, property_value)
-			VALUES ($1, $2, $3, $4)
+			INSERT INTO dynamic_group (tenant_id, name, property_key, property_value, match, conditions)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			RETURNING id::text
-		`, tenantID, g.Name, g.PropertyKey, g.PropertyValue).Scan(&g.ID)
+		`, tenantID, g.Name, g.PropertyKey, g.PropertyValue, match, conditions).Scan(&g.ID)
 	})
 	if isUniqueViolation(err) {
 		return ErrDynamicGroupNameTaken
+	}
+	if err == nil {
+		g.Match = match
 	}
 	return err
 }

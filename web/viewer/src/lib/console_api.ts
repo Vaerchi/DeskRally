@@ -32,11 +32,12 @@
 
 import { parseDeviceBinding, type BindingFailureReason, type ConsoleKey, type DeviceBinding } from "./session_binding";
 import { type AccessWindow, readWindow } from "./access_window";
+import type { RunReceipt } from "./control";
 import { DEFAULT_CONTROL_PLANE_URL, type FetchLike } from "./controlplane";
 import type { ActiveDirective, ActiveDirectiveList, AgentDirective, DirectiveKind, DirectivePolicy, ForgetMachineResult, MeCapability } from "./fleet_directives";
 import { readMeCapabilities } from "./fleet_directives";
 import { parseBrandingRevisions, parseBrandRevisionResult, type BrandingRevisionsView, type BrandRevisionInput, type BrandRevisionResult } from "./brand_revisions";
-import type { SignedSessionTicket } from "./protocol";
+import type { SignedNameAttestation, SignedSessionTicket } from "./protocol";
 import { parseAdoption, parseReachReport, type Adoption, type ReachReport } from "./reach";
 import {
   parseRecordingDetail,
@@ -61,6 +62,7 @@ import { trimTrailingSlashes } from "./trim_slashes";
  * Never conflate the two.
  */
 export interface MachineRecord {
+  properties?: Record<string, string>;
   id: string;
   tenant_id: string;
   device_id: string;
@@ -80,6 +82,7 @@ export interface MachineRecord {
    * consulted). Treat absent as unknown, never as offline — see `presence_known` on the listing.
    */
   online?: boolean;
+  wake?: "ready" | "no_lan_facts" | "no_relay";
   /** ISO timestamp of the last time the presence feed saw this device. Absent = never seen. */
   last_seen?: string;
   /**
@@ -168,11 +171,38 @@ export interface MachineListing {
   presenceKnown: boolean;
 }
 
+export type MachineFieldType = "text" | "number" | "date" | "choice" | "boolean";
+
+export interface MachineFieldInput {
+  key: string;
+  label: string;
+  type: MachineFieldType;
+  choices: string[] | null;
+}
+
+export interface MachineFieldIdentity {
+  id: string;
+  version: number;
+}
+
+export interface MachineField extends MachineFieldInput, MachineFieldIdentity {
+  position: number;
+}
+
+export interface MachineFieldList {
+  fields: MachineField[];
+  order_revision: number;
+}
+
+export interface MachineFieldReport {
+  machines: { machine_id: string; machine_name: string; value: string }[];
+  total: number;
+  next_cursor?: string;
+}
+
 /**
- * One operator-set custom property on a machine (Go `MachineProperty`, control-plane
- * migrations/0024). Display/automation metadata only — nothing authorizes on it (RBAC scopes on the
- * machine's group). The machine PRIMARY KEY (`MachineRecord.id`), never the device id, addresses the
- * `/machines/{id}/properties` routes these come from. Mirror the Go struct's JSON tags exactly.
+ * An operator-set custom property, addressed by machine primary key at `/machines/{id}/properties`.
+ * This is display and automation metadata. Authorization is scoped by machine group.
  */
 export interface MachineProperty {
   key: string;
@@ -182,10 +212,12 @@ export interface MachineProperty {
 /**
  * A fleet search/filter by custom property (docs/01 §4). `propertyKey` restricts the machine listing
  * to machines carrying that property; `propertyValue`, when non-empty, restricts further to that exact
- * value (empty = any value). An empty/whitespace `propertyKey` means "no filter" (list everything).
+ * value (empty = any value). Set `exactKey` for a defined key to preserve it verbatim.
+ * Free-form keys are trimmed, and an empty key means "no filter" (list everything).
  */
 export interface MachinePropertyFilter {
   propertyKey: string;
+  exactKey?: boolean;
   propertyValue?: string;
 }
 
@@ -222,6 +254,7 @@ export interface SessionPolicy {
   /** docs/69: "warn" (default) lets an unverifiable session continue, marked; "require" refuses it. Omitted on a
    *  PUT, the server keeps the stored mode, so the limits form never touches it. */
   session_binding?: "warn" | "require";
+  default_max_idle_seconds?: number;
 }
 
 export interface TenantSecurityPolicy {
@@ -310,10 +343,15 @@ function sessionPolicyFrom(body: unknown, action: string): SessionPolicy {
   if (mode !== undefined && mode !== "warn" && mode !== "require") {
     throw new ConsoleApiError(200, `could not ${action}: malformed response (bad session_binding)`, "server");
   }
+  const idle = obj.default_max_idle_seconds;
+  if (idle !== undefined && (typeof idle !== "number" || !Number.isInteger(idle) || idle < 0 || idle > 3600)) {
+    throw new ConsoleApiError(200, `could not ${action}: malformed response (bad default_max_idle_seconds)`, "server");
+  }
   return {
     max_concurrent_sessions: obj.max_concurrent_sessions,
     max_session_seconds: obj.max_session_seconds,
     session_binding: mode ?? "warn",
+    default_max_idle_seconds: idle ?? 0,
   };
 }
 
@@ -485,24 +523,30 @@ function brandingFrom(body: unknown): TenantBranding {
   };
 }
 
-/**
- * A dynamic machine group (docs/01 §4): a saved, named machine-property predicate. Its MEMBERS are not
- * stored — they are resolved live by `GET /dynamic-groups/{id}/machines`. `property_value === ""` means
- * "any value". Mirror the Go struct's JSON tags exactly.
- */
+export type DynamicGroupMatch = "all" | "any";
+export type DynamicGroupOperator =
+  | "equals" | "not_equals" | "contains" | "starts_with"
+  | "exists" | "not_exists" | "version_at_least";
+
+export interface DynamicGroupCondition {
+  field: string;
+  op: DynamicGroupOperator;
+  value: string;
+}
+
+/** A saved machine predicate. Older control planes return only the property fields. */
 export interface DynamicGroup {
   id: string;
   name: string;
   property_key: string;
   property_value: string;
+  match?: DynamicGroupMatch;
+  conditions?: DynamicGroupCondition[];
 }
 
-/** The body of `createDynamicGroup`. `propertyValue` is optional (empty = "any value"). */
-export interface CreateDynamicGroupInput {
-  name: string;
-  propertyKey: string;
-  propertyValue?: string;
-}
+export type CreateDynamicGroupInput =
+  | { name: string; propertyKey: string; propertyValue?: string }
+  | { name: string; match: DynamicGroupMatch; conditions: DynamicGroupCondition[] };
 
 /**
  * A STATIC machine group (docs/01 §4) — the `machine_group` row that is the RBAC scope unit and the
@@ -734,7 +778,7 @@ export interface WebhookDeliveryRecord {
  * a test and can never drift from the server's `property_key`/`property_value` query params.
  */
 export function machinesListPath(filter?: MachinePropertyFilter): string {
-  const key = (filter?.propertyKey ?? "").trim();
+  const key = filter?.exactKey ? filter.propertyKey : (filter?.propertyKey ?? "").trim();
   if (key === "") return "/machines";
   let path = `/machines?property_key=${encodeURIComponent(key)}`;
   const value = filter?.propertyValue ?? "";
@@ -915,6 +959,7 @@ export interface SessionSignaling {
   device_id: string;
   session_id: string;
   ticket: SignedSessionTicket;
+  name_attestation?: SignedNameAttestation;
 }
 
 /** Full `POST /sessions` response: the persisted record plus optional signaling coordinates. */
@@ -1165,6 +1210,23 @@ export interface ToolboxItemInput {
   shell: ToolboxShell;
   run_as: ToolboxRunAs;
   body: string;
+}
+
+/** Snapshot returned by the machine and toolbox run-history routes. */
+export interface RunHistoryEntry {
+  request_id: string;
+  requested_at: string;
+  technician_name: string;
+  item_name: string;
+  item_version?: number;
+  item_deleted: boolean;
+  run_as: string;
+  result: string;
+}
+
+export interface RunHistoryPage {
+  runs: RunHistoryEntry[];
+  next_offset?: number;
 }
 
 /** POST /toolbox/{id}/runs: the audited run request and the exact command to send. */
@@ -1428,12 +1490,15 @@ export interface ConsoleApi {
    * "everything is offline" apart from "the presence feed is down". Accepts the same optional
    * property filter as `listMachines`. Prefer this for panels that need to show online status.
    */
-  listMachinesWithPresence(filter?: MachinePropertyFilter): Promise<MachineListing>;
+  listMachinesWithPresence(filter?: MachinePropertyFilter, options?: { includeProperties?: boolean }): Promise<MachineListing>;
+  /** docs/70 Wake-on-LAN: ask an online relay on the machine's LAN to wake it. POST /machines/{id}/wake — wake_machine. */
+  requestWake(machineId: string): Promise<"requested" | "uncertain">;
   /** Set a machine's lifecycle status (active|quarantined|retired). POST /machines/{id}/status — CapManageMachines. */
   setMachineStatus(machineId: string, status: string): Promise<MachineRecord>;
   /** Apply one status to MANY machines (docs/01 §4). POST /machines/bulk-status — CapManageMachines,
    *  group-scoped per machine; returns a per-machine result (partial success is normal). */
   bulkSetMachineStatus(machineIds: readonly string[], status: string): Promise<BulkStatusResult[]>;
+  bulkSetMachineProperty(machineIds: readonly string[], key: string, value: string, remove: boolean): Promise<BulkStatusResult[]>;
   /** Reassign MANY machines to ONE target group (docs/01 §4). POST /machines/bulk-group — CapManageMachines
    *  on the TARGET group (blanket) AND on each machine's current group (per-machine); partial results. */
   bulkSetMachineGroup(machineIds: readonly string[], groupId: string): Promise<BulkStatusResult[]>;
@@ -1447,6 +1512,12 @@ export interface ConsoleApi {
    *  CapManageMachines for the machine's group. Returns the updated machine. */
   setMachineNote(machineId: string, note: string): Promise<MachineRecord>;
   /** Every custom property on a machine (by PRIMARY KEY). GET /machines/{id}/properties. */
+  listMachineFields(): Promise<MachineFieldList>;
+  createMachineField(input: MachineFieldInput): Promise<MachineField>;
+  updateMachineField(input: MachineFieldInput & MachineFieldIdentity): Promise<MachineField>;
+  deleteMachineField(key: string, identity: MachineFieldIdentity): Promise<void>;
+  reorderMachineFields(keys: readonly string[], orderRevision: number): Promise<number>;
+  reportMachineField(key: string, cursor?: string): Promise<MachineFieldReport>;
   listMachineProperties(machineId: string): Promise<MachineProperty[]>;
   /** Idempotent upsert of one property key. PUT /machines/{id}/properties/{key} body `{ value }`. */
   setMachineProperty(machineId: string, key: string, value: string): Promise<MachineProperty>;
@@ -1578,6 +1649,8 @@ export interface ConsoleApi {
   /** POST /toolbox/{id}/runs: authorize + audit a run request on the caller's live session; returns
    *  the exact command to send as RunCommand. 409 = view-only / ended / item changed. */
   requestToolboxRun(id: string, sessionId: string, expectedVersion: number): Promise<ToolboxRunGrant>;
+  listRunHistory(scope: "machines" | "toolbox", id: string, offset?: number): Promise<RunHistoryPage | null>;
+  postRunReceipt(receipt: RunReceipt, signal: AbortSignal): Promise<number>;
   /** Authorize + centrally audit an ad-hoc command against a held session, returning the exact command
    *  text to send (POST /sessions/{id}/command-run). The grant's shape matches a toolbox run. */
   requestCommandRun(sessionId: string, shell: ToolboxShell, runAs: ToolboxRunAs, body: string): Promise<ToolboxRunGrant>;
@@ -1787,6 +1860,8 @@ export interface ConsoleApiClientOptions {
   baseUrl?: string;
   /** Injectable fetch (defaults to the global `fetch`); the unit tests pass a fake. */
   fetch?: FetchLike;
+  /** Fetch without the console-wide 401 sign-out handler. */
+  receiptFetch?: FetchLike;
   /**
    * Source of the cookie string the CSRF hook reads (defaults to `document.cookie`; empty in a
    * DOM-less environment). Tests inject a fixed string.
@@ -1821,6 +1896,7 @@ async function isTransientUnavailable(res: Response): Promise<boolean> {
 export class ConsoleApiClient implements ConsoleApi {
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
+  private readonly receiptFetch: FetchLike;
   private readonly cookies: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private adoptedCsrf: { token: string; cookieBefore: string | null } | null = null;
@@ -1829,6 +1905,7 @@ export class ConsoleApiClient implements ConsoleApi {
     // Strip a trailing slash so `${baseUrl}/machines` never doubles up.
     this.baseUrl = trimTrailingSlashes((opts.baseUrl ?? DEFAULT_CONTROL_PLANE_URL));
     this.fetchImpl = opts.fetch ?? ((input, init) => fetch(input, init));
+    this.receiptFetch = opts.receiptFetch ?? ((input, init) => fetch(input, init));
     this.cookies = opts.cookies ?? (() => (typeof document === "undefined" ? "" : document.cookie));
     this.sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
@@ -1974,8 +2051,10 @@ export class ConsoleApiClient implements ConsoleApi {
     return this.getList<MachineRecord>(machinesListPath(filter), "machines", "list machines");
   }
 
-  async listMachinesWithPresence(filter?: MachinePropertyFilter): Promise<MachineListing> {
-    const body = await this.request(machinesListPath(filter), "list machines", { method: "GET" });
+  async listMachinesWithPresence(filter?: MachinePropertyFilter, options?: { includeProperties?: boolean }): Promise<MachineListing> {
+    let path = machinesListPath(filter);
+    if (options?.includeProperties) path += (path.includes("?") ? "&" : "?") + "include=properties";
+    const body = await this.request(path, "list machines", { method: "GET" });
     const envelope = body as Record<string, unknown> | null;
     const rows = envelope?.machines;
     if (!Array.isArray(rows)) {
@@ -1984,6 +2063,13 @@ export class ConsoleApiClient implements ConsoleApi {
     // A server that omits the flag (an older control plane) is treated as "unknown", which is the
     // conservative reading: better to say status is unavailable than to assert it.
     return { machines: rows as MachineRecord[], presenceKnown: envelope?.presence_known === true };
+  }
+
+  async requestWake(machineId: string): Promise<"requested" | "uncertain"> {
+    const body = await this.request(`/machines/${encodeURIComponent(machineId)}/wake`, "request wake", { method: "POST" });
+    const status = (body as { status?: unknown } | null)?.status;
+    if (status === "requested" || status === "uncertain") return status;
+    throw new ConsoleApiError(202, "could not request wake: malformed response", "server");
   }
 
   async setMachineStatus(machineId: string, status: string): Promise<MachineRecord> {
@@ -2038,6 +2124,24 @@ export class ConsoleApiClient implements ConsoleApi {
     return rows as BulkStatusResult[];
   }
 
+  async bulkSetMachineProperty(
+    machineIds: readonly string[],
+    key: string,
+    value: string,
+    remove: boolean,
+  ): Promise<BulkStatusResult[]> {
+    const op = "bulk edit machine property";
+    const body = await this.request("/machines/bulk-property", op, {
+      method: "POST",
+      body: { machine_ids: machineIds, key, value, delete: remove },
+    });
+    const rows = (body as Record<string, unknown> | null)?.results;
+    if (!Array.isArray(rows)) {
+      throw new ConsoleApiError(200, `could not ${op}: malformed response (no "results")`, "server");
+    }
+    return rows as BulkStatusResult[];
+  }
+
   async bulkSetMachineGroup(
     machineIds: readonly string[],
     groupId: string,
@@ -2052,6 +2156,57 @@ export class ConsoleApiClient implements ConsoleApi {
       throw new ConsoleApiError(200, `could not ${op}: malformed response (no "results")`, "server");
     }
     return rows as BulkStatusResult[];
+  }
+
+  async listMachineFields(): Promise<MachineFieldList> {
+    const op = "list machine fields";
+    const body = await this.request("/machine-fields", op, { method: "GET" }) as {
+      fields?: MachineField[] | null;
+      order_revision?: number;
+    } | null;
+    if (!body || typeof body.order_revision !== "number" || !Number.isInteger(body.order_revision) ||
+        (body.fields !== null && !Array.isArray(body.fields))) {
+      throw new ConsoleApiError(200, `could not ${op}: malformed response`, "server");
+    }
+    return { fields: body.fields ?? [], order_revision: body.order_revision };
+  }
+
+  async createMachineField(input: MachineFieldInput): Promise<MachineField> {
+    const op = "create machine field";
+    return this.pluck<MachineField>(await this.request("/machine-fields", op, { method: "POST", body: input }), "field", op);
+  }
+
+  async updateMachineField(input: MachineFieldInput & MachineFieldIdentity): Promise<MachineField> {
+    const op = "update machine field";
+    return this.pluck<MachineField>(await this.request(`/machine-fields/${encodeURIComponent(input.key)}`, op, {
+      method: "PUT", body: input,
+    }), "field", op);
+  }
+
+  async deleteMachineField(key: string, { id, version }: MachineFieldIdentity): Promise<void> {
+    const query = new URLSearchParams({ id, version: String(version) });
+    await this.request(`/machine-fields/${encodeURIComponent(key)}?${query}`, "delete machine field", { method: "DELETE" });
+  }
+
+  async reorderMachineFields(keys: readonly string[], orderRevision: number): Promise<number> {
+    const op = "reorder machine fields";
+    const body = await this.request("/machine-field-order", op, {
+      method: "PUT", body: { keys, order_revision: orderRevision },
+    }) as { order_revision?: number } | null;
+    if (typeof body?.order_revision !== "number") {
+      throw new ConsoleApiError(200, `could not ${op}: malformed response`, "server");
+    }
+    return body.order_revision;
+  }
+
+  async reportMachineField(key: string, cursor?: string): Promise<MachineFieldReport> {
+    const query = cursor === undefined ? "" : `?cursor=${encodeURIComponent(cursor)}`;
+    const op = "load nonconforming machine properties";
+    const body = await this.request(`/machine-fields/${encodeURIComponent(key)}/nonconforming${query}`, op, { method: "GET" }) as Partial<MachineFieldReport> | null;
+    if (!body || typeof body.total !== "number" || (body.machines !== null && !Array.isArray(body.machines))) {
+      throw new ConsoleApiError(200, `could not ${op}: malformed response`, "server");
+    }
+    return { machines: body.machines ?? [], total: body.total, next_cursor: body.next_cursor };
   }
 
   async listMachineProperties(machineId: string): Promise<MachineProperty[]> {
@@ -2533,6 +2688,24 @@ export class ConsoleApiClient implements ConsoleApi {
     return { request_id: String(body?.request_id ?? ""), shell, run_as: runAs, command };
   }
 
+  async listRunHistory(scope: "machines" | "toolbox", id: string, offset?: number): Promise<RunHistoryPage | null> {
+    const path = `/${scope}/${encodeURIComponent(id)}/runs${offset ? `?offset=${offset}` : ""}`;
+    try {
+      const body = await this.request(path, "load run history", { method: "GET" }) as RunHistoryPage;
+      if (!Array.isArray(body?.runs)) throw new ConsoleApiError(200, "Malformed run history", "server");
+      return body;
+    } catch (error) {
+      if (error instanceof ConsoleApiError && error.status === 403) return null;
+      throw error;
+    }
+  }
+
+  async postRunReceipt({ requestId, receipt }: RunReceipt, signal: AbortSignal): Promise<number> {
+    const path = `/runs/${encodeURIComponent(requestId)}/result`;
+    const res = await this.fetchRequest(path, { method: "POST", body: { receipt }, signal }, this.receiptFetch);
+    return res.status;
+  }
+
   async requestCommandRun(sessionId: string, shell: ToolboxShell, runAs: ToolboxRunAs, body: string): Promise<ToolboxRunGrant> {
     const resp = (await this.request(`/sessions/${encodeURIComponent(sessionId)}/command-run`, "run the command", {
       method: "POST",
@@ -2744,6 +2917,9 @@ export class ConsoleApiClient implements ConsoleApi {
         max_session_seconds: policy.max_session_seconds,
         // Sent only when the caller sets it: omitted, the server keeps the stored mode (the limits form never sends it).
         ...(policy.session_binding ? { session_binding: policy.session_binding } : {}),
+        ...(policy.default_max_idle_seconds !== undefined
+          ? { default_max_idle_seconds: policy.default_max_idle_seconds }
+          : {}),
       },
     });
     return sessionPolicyFrom(body, "set session policy");
@@ -2837,8 +3013,9 @@ export class ConsoleApiClient implements ConsoleApi {
   }
 
   async createDynamicGroup(input: CreateDynamicGroupInput): Promise<DynamicGroup> {
-    const req: Record<string, string> = { name: input.name, property_key: input.propertyKey };
-    if (input.propertyValue !== undefined) req.property_value = input.propertyValue;
+    const req = "conditions" in input
+      ? input
+      : { name: input.name, property_key: input.propertyKey, property_value: input.propertyValue };
     const body = await this.request("/dynamic-groups", "create dynamic group", { method: "POST", body: req });
     return this.pluck<DynamicGroup>(body, "group", "create dynamic group");
   }
@@ -3144,11 +3321,11 @@ export class ConsoleApiClient implements ConsoleApi {
    * cookie-authenticated mutations (csrf.go): this method reads `rmt_csrf` and echoes it as
    * `X-CSRF-Token`; a missing or wrong token is rejected 403.
    */
-  private async request(
+  private fetchRequest(
     path: string,
-    action: string,
     opts: { method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown; keepalive?: boolean; signal?: AbortSignal; public?: boolean },
-  ): Promise<unknown> {
+    fetchImpl = this.fetchImpl,
+  ): Promise<Response> {
     const headers: Record<string, string> = {};
     const init: RequestInit = { method: opts.method, credentials: "include" };
     if (opts.keepalive) init.keepalive = true;
@@ -3166,7 +3343,15 @@ export class ConsoleApiClient implements ConsoleApi {
     }
     if (Object.keys(headers).length > 0) init.headers = headers;
 
-    let res = await this.fetchImpl(`${this.baseUrl}${path}`, init);
+    return fetchImpl(`${this.baseUrl}${path}`, init);
+  }
+
+  private async request(
+    path: string,
+    action: string,
+    opts: Parameters<ConsoleApiClient["fetchRequest"]>[1],
+  ): Promise<unknown> {
+    let res = await this.fetchRequest(path, opts);
     // A momentary database fault on the server's side answers 503 "temporarily unavailable" with Retry-After.
     // That is not a sign-out (only 401 is) and not a failure of the read: retry an idempotent GET quietly a
     // couple of times, so a blip never reaches the operator. Mutations are never replayed.
@@ -3174,7 +3359,7 @@ export class ConsoleApiClient implements ConsoleApi {
       const secs = Number(res.headers.get("Retry-After"));
       const waitMs = Math.min(TRANSIENT_MAX_WAIT_MS, Math.max(500, Number.isFinite(secs) ? secs * 1000 : 2000));
       await this.sleep(waitMs);
-      res = await this.fetchImpl(`${this.baseUrl}${path}`, init);
+      res = await this.fetchRequest(path, opts);
     }
     if (!res.ok) throw await this.toError(res, action);
     if (res.status === 204) return null; // No Content — no body to parse

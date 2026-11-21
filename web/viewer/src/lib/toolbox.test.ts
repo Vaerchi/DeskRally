@@ -38,7 +38,7 @@ describe("runToolboxScript", () => {
     });
     expect(out).toEqual({ sent: true, requestId: "req-1" });
     expect(order).toEqual(["request item-1 sess-1 3", "send"]);
-    expect(sent).toEqual([["& (wrapped)", "PowerShell", true]]);
+    expect(sent).toEqual([["& (wrapped)", "PowerShell", true, "req-1"]]);
   });
 
   it("maps a cmd grant to the Cmd shell and system to as_user=false", async () => {
@@ -49,7 +49,7 @@ describe("runToolboxScript", () => {
       isCurrent: () => true,
       sendRunCommand: send,
     });
-    expect(send).toHaveBeenCalledWith("ipconfig", "Cmd", false);
+    expect(send).toHaveBeenCalledWith("ipconfig", "Cmd", false, "r");
   });
 
   it("sends nothing without a session record", async () => {

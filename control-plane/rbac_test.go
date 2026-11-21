@@ -15,11 +15,13 @@ func TestRoleHasCapability(t *testing.T) {
 		{"owner manage tenant", RoleOwner, CapManageTenant, true},
 		{"owner backstage", RoleOwner, CapBackstageShell, true},
 		{"owner audit", RoleOwner, CapViewAudit, true},
+		{"owner wake machine", RoleOwner, CapWakeMachine, true},
 
 		// Admin: full day-to-day, but NOT tenant administration.
 		{"admin manage users", RoleAdmin, CapManageUsers, true},
 		{"admin deploy agent", RoleAdmin, CapDeployAgent, true},
 		{"admin audit", RoleAdmin, CapViewAudit, true},
+		{"admin wake machine", RoleAdmin, CapWakeMachine, true},
 		{"admin NOT manage tenant", RoleAdmin, CapManageTenant, false},
 
 		// Owner and Admin may elevate a session to the guest's admin token; nobody else can.
@@ -33,6 +35,7 @@ func TestRoleHasCapability(t *testing.T) {
 		{"tech NOT elevate session", RoleTechnician, CapElevateSession, false},
 		{"tech backstage", RoleTechnician, CapBackstageShell, true},
 		{"tech deploy agent", RoleTechnician, CapDeployAgent, true},
+		{"tech wake machine", RoleTechnician, CapWakeMachine, true},
 		{"tech NOT manage users", RoleTechnician, CapManageUsers, false},
 		{"tech NOT audit", RoleTechnician, CapViewAudit, false},
 		{"tech NOT enroll mgmt", RoleTechnician, CapManageEnrollment, false},
@@ -40,6 +43,7 @@ func TestRoleHasCapability(t *testing.T) {
 		// ReadOnly: look, don't touch.
 		{"readonly view machines", RoleReadOnly, CapViewMachines, true},
 		{"readonly view sessions", RoleReadOnly, CapViewSessions, true},
+		{"readonly wake machine", RoleReadOnly, CapWakeMachine, false},
 		{"readonly NOT start session", RoleReadOnly, CapStartSession, false},
 		{"readonly NOT audit", RoleReadOnly, CapViewAudit, false},
 		{"readonly NOT elevate session", RoleReadOnly, CapElevateSession, false},
@@ -47,6 +51,7 @@ func TestRoleHasCapability(t *testing.T) {
 		// Auditor: ReadOnly + audit, still cannot act.
 		{"auditor audit", RoleAuditor, CapViewAudit, true},
 		{"auditor view machines", RoleAuditor, CapViewMachines, true},
+		{"auditor wake machine", RoleAuditor, CapWakeMachine, false},
 		{"auditor NOT start session", RoleAuditor, CapStartSession, false},
 		{"auditor NOT backstage", RoleAuditor, CapBackstageShell, false},
 		{"auditor NOT elevate session", RoleAuditor, CapElevateSession, false},

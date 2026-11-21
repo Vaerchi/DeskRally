@@ -5,6 +5,7 @@ package controlplane
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -245,14 +246,22 @@ func (s *Server) handleListDynamicGroups(w http.ResponseWriter, r *http.Request)
 	if groups == nil {
 		groups = []DynamicGroup{}
 	}
+	for i := range groups {
+		groups[i] = groups[i].effectivePredicate()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
 }
 
+// Ten values can each require six JSON bytes per decoded byte.
+const maxDynamicGroupJSONBodyBytes = 256 << 10
+
 // createDynamicGroupRequest is the body of POST /dynamic-groups.
 type createDynamicGroupRequest struct {
-	Name          string `json:"name"`
-	PropertyKey   string `json:"property_key"`
-	PropertyValue string `json:"property_value"` // optional; "" = "any value" (see MachineIDsWithProperty)
+	Name          string          `json:"name"`
+	PropertyKey   *string         `json:"property_key"`
+	PropertyValue *string         `json:"property_value"`
+	Match         *string         `json:"match"`
+	Conditions    json.RawMessage `json:"conditions"`
 }
 
 // handleCreateDynamicGroup (POST /dynamic-groups) creates a saved predicate. Managing groups needs
@@ -268,23 +277,59 @@ func (s *Server) handleCreateDynamicGroup(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req createDynamicGroupRequest
-	// docs/25 F05: three short strings, each length-checked below; capped so the decode cannot hold
-	// the pinned tenant connection open.
-	if err := decodeJSONBodyDetailed(w, r, maxSmallJSONBodyBytes, &req, "malformed request body"); err != nil {
+	if err := decodeJSONBodyDetailed(w, r, maxDynamicGroupJSONBodyBytes, &req, "malformed request body"); err != nil {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	req.PropertyKey = strings.TrimSpace(req.PropertyKey)
-	if req.Name == "" || req.PropertyKey == "" {
-		writeError(w, http.StatusBadRequest, "name and property_key are required")
+	if req.Name == "" || len(req.Name) > maxDynamicGroupNameLen {
+		writeError(w, http.StatusBadRequest, "name is required and must be at most 128 bytes")
 		return
 	}
-	if len(req.Name) > maxDynamicGroupNameLen || len(req.PropertyKey) > maxDynamicGroupKeyLen ||
-		len(req.PropertyValue) > maxDynamicGroupValLen {
-		writeError(w, http.StatusBadRequest, "name/property_key/property_value too long")
-		return
+	g := &DynamicGroup{Name: req.Name, Match: "all"}
+	if req.Conditions != nil || req.Match != nil {
+		if req.PropertyKey != nil || req.PropertyValue != nil {
+			writeError(w, http.StatusBadRequest, "use either legacy property fields or match and conditions")
+			return
+		}
+		var conditions []json.RawMessage
+		if req.Conditions != nil && json.Unmarshal(req.Conditions, &conditions) != nil {
+			writeError(w, http.StatusBadRequest, "conditions must be an array")
+			return
+		}
+		if len(conditions) >= 1 && len(conditions) <= maxDynamicGroupConditions {
+			g.Conditions = make([]Condition, len(conditions))
+			for i, condition := range conditions {
+				if err := json.Unmarshal(condition, &g.Conditions[i]); err != nil {
+					writeError(w, http.StatusBadRequest, fmt.Sprintf("condition %d: field, op and value must be strings", i+1))
+					return
+				}
+			}
+		}
+		match := ""
+		if req.Match != nil {
+			match = *req.Match
+		}
+		if err := validateDynamicGroupConditions(match, g.Conditions); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		g.Match = match
+	} else {
+		if req.PropertyKey != nil {
+			g.PropertyKey = strings.TrimSpace(*req.PropertyKey)
+		}
+		if req.PropertyValue != nil {
+			g.PropertyValue = *req.PropertyValue
+		}
+		if g.PropertyKey == "" {
+			writeError(w, http.StatusBadRequest, "name and property_key are required")
+			return
+		}
+		if len(g.PropertyKey) > maxMachinePropertyKeyLen || len(g.PropertyValue) > maxMachinePropertyValueLen {
+			writeError(w, http.StatusBadRequest, "name/property_key/property_value too long")
+			return
+		}
 	}
-	g := &DynamicGroup{Name: req.Name, PropertyKey: req.PropertyKey, PropertyValue: req.PropertyValue}
 	if err := s.DynamicGroups.CreateDynamicGroup(r.Context(), p.TenantID, g); err != nil {
 		if errors.Is(err, ErrDynamicGroupNameTaken) {
 			writeError(w, http.StatusConflict, "a dynamic group with that name already exists")
@@ -293,11 +338,14 @@ func (s *Server) handleCreateDynamicGroup(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "could not create dynamic group")
 		return
 	}
-	if err := s.recordMgmtAudit(r, "group.create", "group", g.ID, map[string]any{"name": g.Name, "property_key": g.PropertyKey}); err != nil {
+	response := g.effectivePredicate()
+	if err := s.recordMgmtAudit(r, "group.create", "group", g.ID, map[string]any{
+		"name": g.Name, "property_key": g.PropertyKey, "condition_count": len(response.Conditions),
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not record audit event")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"group": g})
+	writeJSON(w, http.StatusCreated, map[string]any{"group": response})
 }
 
 // handleDeleteDynamicGroup (DELETE /dynamic-groups/{id}) removes a saved predicate. CapManageGroups.
@@ -327,47 +375,67 @@ func (s *Server) handleDeleteDynamicGroup(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
 }
 
-// handleResolveDynamicGroup (GET /dynamic-groups/{id}/machines) resolves a group's members LIVE. It
-// reuses the SAME "narrow-only" resolution as GET /machines: list the tenant's machines, keep only those
-// the caller may see (AllowsInGroup), then INTERSECT with the machines carrying the group's property —
-// so a dynamic group can never reveal a machine the caller could not already list, nor widen their reach.
-func (s *Server) handleResolveDynamicGroup(w http.ResponseWriter, r *http.Request) {
+func (s *Server) readDynamicGroup(w http.ResponseWriter, r *http.Request) *DynamicGroup {
 	p := principalFrom(r.Context())
 	if err := p.Grant.Require(CapViewMachines); err != nil {
 		writeDenied(w, err)
-		return
+		return nil
 	}
-	if s.DynamicGroups == nil || s.Machines == nil || s.MachineProperties == nil {
-		writeError(w, http.StatusInternalServerError, "machine or dynamic group store not configured")
-		return
+	if s.DynamicGroups == nil {
+		writeError(w, http.StatusInternalServerError, "dynamic group store not configured")
+		return nil
 	}
 	g, err := s.DynamicGroups.GetDynamicGroup(r.Context(), p.TenantID, r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, ErrDynamicGroupNotFound) {
 			writeError(w, http.StatusNotFound, "dynamic group not found")
-			return
+			return nil
 		}
 		writeError(w, http.StatusInternalServerError, "could not read dynamic group")
+		return nil
+	}
+	return g
+}
+
+func (s *Server) handleGetDynamicGroup(w http.ResponseWriter, r *http.Request) {
+	if g := s.readDynamicGroup(w, r); g != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"group": g.effectivePredicate()})
+	}
+}
+
+// handleResolveDynamicGroup evaluates the saved predicate over the caller's visible machines.
+func (s *Server) handleResolveDynamicGroup(w http.ResponseWriter, r *http.Request) {
+	g := s.readDynamicGroup(w, r)
+	if g == nil {
 		return
 	}
+	if s.Machines == nil || s.MachineProperties == nil {
+		writeError(w, http.StatusInternalServerError, "machine store or machine property store not configured")
+		return
+	}
+	p := principalFrom(r.Context())
 	all, err := s.Machines.ListMachines(r.Context(), p.TenantID)
 	if err != nil {
 		writeListError(w, err, "could not list machines")
 		return
 	}
-	ids, err := s.MachineProperties.MachineIDsWithProperty(r.Context(), p.TenantID, g.PropertyKey, g.PropertyValue)
+	visible := visibleMachines(p, all)
+	ids := make([]string, 0, len(visible))
+	for _, m := range visible {
+		ids = append(ids, m.ID)
+	}
+	properties, err := s.MachineProperties.ListPropertiesForMachines(r.Context(), p.TenantID, ids)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not resolve dynamic group members")
 		return
 	}
+	presenceKnown := s.annotatePresence(r, p.TenantID, visible, all)
+	group := g.effectivePredicate()
 	members := make([]Machine, 0)
-	for _, m := range all {
-		// Narrow to the caller's visible machines AND intersect with the predicate (never widen).
-		if p.Grant.AllowsInGroup(CapViewMachines, m.GroupID) {
-			if _, ok := ids[m.ID]; ok {
-				members = append(members, m)
-			}
+	for _, m := range visible {
+		if group.matches(m, properties[m.ID], presenceKnown) {
+			members = append(members, m)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"group": g, "machines": members})
+	writeJSON(w, http.StatusOK, map[string]any{"group": group, "machines": members})
 }

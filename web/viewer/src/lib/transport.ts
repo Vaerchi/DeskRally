@@ -34,6 +34,7 @@ import {
   type Frame,
   type ServerToClient,
   type SessionId,
+  type SignedNameAttestation,
   type SignedSessionTicket,
 } from "./protocol";
 
@@ -102,7 +103,7 @@ export interface Transport {
    * the control-plane session ticket presented in `connect_request` (M2); omitted on the
    * direct-connect dev path.
    */
-  connect(target: DeviceId, ticket?: SignedSessionTicket): Promise<void>;
+  connect(target: DeviceId, ticket?: SignedSessionTicket, nameAttestation?: SignedNameAttestation): Promise<void>;
 
   /** Send a payload on a logical channel. May buffer until the channel is open. */
   send(channel: ChannelId, payload: Uint8Array): void;
@@ -128,7 +129,7 @@ export class SignalingClient {
   private readonly url: string;
   private handlers = new Set<(msg: ServerToClient) => void>();
 
-  constructor(url: string) {
+  constructor(url: string, private readonly onClose?: () => void) {
     this.url = url;
   }
 
@@ -139,16 +140,17 @@ export class SignalingClient {
       ws.onopen = () => { clearTimeout(timer); resolve(); };
       ws.onerror = () => { clearTimeout(timer); reject(new Error(`signaling connection failed: ${this.url}`)); };
       ws.onmessage = (ev) => {
+        if (this.ws !== ws) return;
         try {
           const msg = decodeSignaling(typeof ev.data === "string" ? ev.data : "");
           for (const h of this.handlers) h(msg);
-        } catch (err) {
-          console.error("[signaling] failed to decode message", err);
+        } catch {
+          console.error("[signaling] failed to decode message");
         }
       };
       ws.onclose = () => {
         clearTimeout(timer); reject(new Error("Signaling connection closed"));
-        if (this.ws === ws) this.ws = null;
+        this.finishClose(ws);
       };
       this.ws = ws;
     });
@@ -172,8 +174,8 @@ export class SignalingClient {
    * plane's `POST /sessions`) authorizes the rendezvous; a secured signaling server rejects the
    * request without it, dev-mode servers accept either way.
    */
-  requestConnect(target: DeviceId, ticket?: SignedSessionTicket): void {
-    this.send(ticket ? { type: "connect_request", target, ticket } : { type: "connect_request", target });
+  requestConnect(target: DeviceId, ticket?: SignedSessionTicket, nameAttestation?: SignedNameAttestation): void {
+    this.send({ type: "connect_request", target, ticket, name_attestation: ticket ? nameAttestation : undefined });
   }
 
   /** Trickle a locally-gathered ICE candidate to the peer via the server. */
@@ -186,10 +188,19 @@ export class SignalingClient {
     this.send({ type: "sdp", session, sdp, kind });
   }
 
-  close(): void {
-    this.ws?.close();
+  private finishClose(ws: WebSocket): void {
+    if (this.ws !== ws) return;
     this.ws = null;
+    this.onClose?.();
+  }
+
+  close(): void {
+    const ws = this.ws;
     this.handlers.clear();
+    if (ws) {
+      this.finishClose(ws);
+      ws.close();
+    }
   }
 }
 
@@ -342,7 +353,7 @@ export class WebRTCTransport implements Transport {
     return [...this.gathered];
   }
 
-  async connect(target: DeviceId, ticket?: SignedSessionTicket): Promise<void> {
+  async connect(target: DeviceId, ticket?: SignedSessionTicket, nameAttestation?: SignedNameAttestation): Promise<void> {
     this.setState("signaling");
 
     // docs/69 §3.3: ONE DTLS transport for everything (max-bundle), so the session's binding covers all of it.
@@ -431,7 +442,7 @@ export class WebRTCTransport implements Transport {
     // Kick off: ask the server to broker (presenting the session ticket when brokered). The
     // `brokered` reply carries the SessionId and we create the SDP offer then.
     this.setState("connecting");
-    this.signaling.requestConnect(target, ticket);
+    this.signaling.requestConnect(target, ticket, nameAttestation);
   }
 
   private async onSignal(pc: RTCPeerConnection, msg: ServerToClient): Promise<void> {

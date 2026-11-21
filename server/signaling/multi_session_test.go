@@ -142,23 +142,7 @@ func TestSessionParticipantsSentOnJoin(t *testing.T) {
 	}
 
 	// ctrl1 must also have been notified of ctrl2 joining.
-	ctrl1Msgs := ctrl1Conn.messages()
-	var ctrl1SPs []SessionParticipants
-	for _, m := range ctrl1Msgs {
-		if p, ok := m.Payload.(SessionParticipants); ok {
-			ctrl1SPs = append(ctrl1SPs, p)
-		}
-		if p, ok := m.Payload.(*SessionParticipants); ok {
-			ctrl1SPs = append(ctrl1SPs, *p)
-		}
-	}
-	if len(ctrl1SPs) < 2 {
-		t.Fatalf("ctrl1 received %d SessionParticipants, want at least 2", len(ctrl1SPs))
-	}
-	lastCtrl1SP := ctrl1SPs[len(ctrl1SPs)-1]
-	if len(lastCtrl1SP.Participants) != 2 {
-		t.Fatalf("ctrl1 final SessionParticipants: got %d participants, want 2", len(lastCtrl1SP.Participants))
-	}
+	waitRoster(t, ctrl1Conn, 2, 0)
 }
 
 // TestSessionParticipantsUpdatedOnDisconnect verifies that when one controller disconnects,
@@ -186,6 +170,7 @@ func TestSessionParticipantsUpdatedOnDisconnect(t *testing.T) {
 	}
 
 	// ctrl1 disconnects. The broker removes ctrl1's sessions.
+	before := waitRoster(t, ctrl2Conn, 2, 0)
 	broker.RemovePeerSessions(ctrl1)
 
 	// Agent should have received a new SessionParticipants with 1 participant.
@@ -208,23 +193,7 @@ func TestSessionParticipantsUpdatedOnDisconnect(t *testing.T) {
 	}
 
 	// ctrl2 should also have been notified that ctrl1 left.
-	ctrl2Msgs := ctrl2Conn.messages()
-	var ctrl2SPs []SessionParticipants
-	for _, m := range ctrl2Msgs {
-		if p, ok := m.Payload.(SessionParticipants); ok {
-			ctrl2SPs = append(ctrl2SPs, p)
-		}
-		if p, ok := m.Payload.(*SessionParticipants); ok {
-			ctrl2SPs = append(ctrl2SPs, *p)
-		}
-	}
-	if len(ctrl2SPs) == 0 {
-		t.Fatal("ctrl2 received no SessionParticipants messages")
-	}
-	lastCtrl2SP := ctrl2SPs[len(ctrl2SPs)-1]
-	if len(lastCtrl2SP.Participants) != 1 {
-		t.Fatalf("ctrl2 final SessionParticipants after ctrl1 disconnect: got %d, want 1", len(lastCtrl2SP.Participants))
-	}
+	waitRoster(t, ctrl2Conn, 1, before.Revision)
 
 	// Broker's deviceSessions must now have only 1 entry for agent-1.
 	broker.mu.Lock()

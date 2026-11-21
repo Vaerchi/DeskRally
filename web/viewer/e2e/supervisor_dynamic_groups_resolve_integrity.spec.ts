@@ -76,7 +76,7 @@ async function mount(page: Page, resolveById: Record<string, Handler>, groups: {
   });
   await page.goto(BASE);
   await (await consoleTab(page, { name: "Smart groups", exact: true })).click();
-  await expect(page.getByTestId("group-row-Alpha")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("group-row-Alpha")).toContainText("site = A", { timeout: 15_000 });
 }
 
 test("a slow older group's members cannot replace the newer group's members", async ({ page }) => {

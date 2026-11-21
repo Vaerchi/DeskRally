@@ -13,7 +13,7 @@ export interface ToolboxRunDeps {
   /** The control-plane session id of the CURRENT connection, or null. Read again after the await. */
   currentSessionId: () => string | null;
   /** Send `RunCommand` to the current agent. */
-  sendRunCommand: (command: string, shell: CommandShell, asUser: boolean) => void;
+  sendRunCommand: (command: string, shell: CommandShell, asUser: boolean, requestId: string) => void;
   /** Is THIS run still the command panel's current operation (no newer command, same connection)?
    *  Checked after the await: a superseded run neither sends nor reports, so it can never touch the
    *  pending state or error line of a later command or session. */
@@ -44,6 +44,6 @@ export async function runToolboxScript(item: ToolboxItem, deps: ToolboxRunDeps):
   if (deps.currentSessionId() !== sessionId) {
     return { sent: false, stale: false, error: "The session changed while the script was being authorized; nothing ran." };
   }
-  deps.sendRunCommand(grant.command, grant.shell === "cmd" ? "Cmd" : "PowerShell", grant.run_as === "user");
+  deps.sendRunCommand(grant.command, grant.shell === "cmd" ? "Cmd" : "PowerShell", grant.run_as === "user", grant.request_id);
   return { sent: true, requestId: grant.request_id };
 }
