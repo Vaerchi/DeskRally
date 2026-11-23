@@ -1,0 +1,30 @@
+[package]
+name = "rmt-agent-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Platform-agnostic agent core: platform traits, session mux, transport seam, reconnect."
+
+[dependencies]
+rmt-protocol = { path = "../protocol" }
+rmt-crypto = { path = "../crypto" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# M8 file transfer: end-to-end SHA-256 integrity over ChannelId::FileTransfer.
+sha2 = "0.10"
+# Pure-Rust DEFLATE (miniz_oxide backend, no C) for the software encode fallback.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# docs/48 C: the deployment-pass verifier (ECDSA P-256 over SHA-256(domain || body)).
+# Both already in Cargo.lock through webrtc-dtls; no new crate enters the build.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+serde_json = { workspace = true }

@@ -1,0 +1,28 @@
+# Daily Postgres backup for a Bridge deployment.
+#
+# Install (as the user that owns the deployment, NOT root — the script reads deploy/.env and talks to
+# the user's docker socket):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/bridge-backup.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now bridge-backup.timer
+#   loginctl enable-linger "$USER"     # <- REQUIRED, see below
+#
+# `enable-linger` is not optional: without it a user unit only runs while that user has a login
+# session, so the timer would stop firing the moment you close SSH — silently, which is the worst
+# way for a backup to stop.
+[Unit]
+Description=Bridge control-plane Postgres backup
+After=docker.service
+
+[Service]
+Type=oneshot
+# Adjust if the deployment does not live at ~/rmt2.
+Environment=BRIDGE_REPO_DIR=%h/rmt2
+Environment=BRIDGE_BACKUP_DIR=%h/bridge-backups
+Environment=BRIDGE_BACKUP_KEEP=14
+# REQUIRED: your age PUBLIC key (docs/22 section 7). Without it the script refuses to run.
+# Alternatively put BRIDGE_BACKUP_AGE_RECIPIENT=... in deploy/.env.
+#Environment=BRIDGE_BACKUP_AGE_RECIPIENT=age1...
+ExecStart=%h/rmt2/deploy/backup-db.sh

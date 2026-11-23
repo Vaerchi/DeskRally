@@ -1,0 +1,554 @@
+# Continuous integration for the remote-support platform.
+#
+# WHY THIS EXISTS (see docs/07-session-handoff.md): the no-skip local harness `scripts/verify-all.ps1`
+# is the thing worth protecting, and the H.264 -> VP8 migration added a NATIVE build prerequisite
+# (`vcpkg install libvpx:x64-windows-static`) that, when missing or the wrong triplet, fails at LINK
+# time in a way that reads like a code bug (LNK1181 / LNK2038). The `rust` job below reproduces the
+# exact toolchain a contributor needs and would have caught that class of breakage.
+#
+# HONESTY ABOUT COVERAGE — this CI deliberately does NOT claim to run everything, because two suites
+# genuinely cannot run green on a hosted runner and faking them green is worse than not running them:
+#   * `e2e_stream` (agent-windows) needs DXGI Desktop Duplication, which returns no frame unless the
+#     process is on the ACTIVE CONSOLE desktop. A hosted runner is Session 0 (a service) with no
+#     interactive desktop, so this GATES. Its encode->RTP path is covered by the synthetic-capturer
+#     `transport-webrtc` video test, which DOES run here.
+#   * The live cross-language e2e (`e2e_webrtc`, Playwright `test:e2e`) needs the signaling+relay
+#     servers running and, for the browser specs, a full stack. That orchestration is what
+#     `verify-all.ps1` does on a real desktop; replicating it here is future work.
+# To avoid the "green cargo test that ran nothing" trap those suites are the reason for, the broad
+# Rust steps run `--lib` (unit tests only) so a server-dependent integration test cannot SELF-SKIP
+# green — and because `--lib` never even BUILDS an integration target, the agent's deterministic
+# integration suites are then run BY NAME in their own step (see "Agent deterministic integration
+# suites" below); the e2e_* targets stay excluded on purpose.
+#
+# VERIFIED 2026-08-19 (PR #1): all three jobs green on a hosted runner. The first run failed the
+# whole control-plane suite with SQLSTATE 28P01 — newAppRolePool (rls_test.go) clears the password
+# when deriving the rmt_app pool, which is trust-auth shaped, and the stock postgres image defaults
+# to scram-sha-256; POSTGRES_HOST_AUTH_METHOD below is what reconciles CI with the local harness.
+# Actions are pinned to verified commits from their own repositories; comments retain the
+# previous release refs. Future action security updates require reviewed pin updates.
+
+name: CI
+
+# Build/test only: no job needs repository or package write permission.
+permissions:
+  contents: read
+
+on:
+  push:
+    # `ci/github-actions` IS THE DEPLOYED LINEAGE, and until 2026-09-03 it was never built here.
+    #
+    # The live box's auto-deploy follows a `deploy` tag on this branch, and `main` is ~78 commits
+    # behind it. So for the entire life of this workflow, CI ran on a branch nothing ships from and
+    # never once on the branch that reaches production: the newest run when this was noticed was
+    # from 2026-08-30, while the deployed commit had moved several times since. The deploy safety
+    # bar in docs/26 asks for "a CI-green sha on the deployed lineage", which was a condition this
+    # trigger made structurally impossible to satisfy.
+    #
+    # Keep `main` too — it is where PRs land — and keep the list explicit rather than `'**'`, so a
+    # throwaway feature branch does not consume a Windows runner on every push.
+    branches: [main, ci/github-actions]
+  pull_request:
+  # So a green signal can be obtained for a specific sha without inventing a commit. There was no
+  # manual trigger at all before, which is why the only way to test the deployed branch was to open
+  # a pull request against it.
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # The codec crate + the shipped agent binary. This is the job that guards the libvpx prerequisite
+  # and the static-CRT packaging invariant — the two things most likely to break on a fresh machine.
+  # ---------------------------------------------------------------------------------------------
+  rust:
+    name: Rust codec + agent (windows, libvpx + static-CRT)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust toolchain (MSVC)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo + target
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # NATIVE DEPENDENCIES via the runner's preinstalled vcpkg (VCPKG_INSTALLATION_ROOT, typically
+      # C:\vcpkg). Cache the built static triplet — building these from source is the slow part.
+      #
+      # BOTH are required, and `opus` was missing until 2026-09-03. The audio-passthrough work
+      # (WASAPI -> Opus -> WebRTC track) links a hand-declared Opus FFI, so without it the
+      # `rmt-transport-webrtc` test binary fails to LINK:
+      #
+      #     LINK : fatal error LNK1181: cannot open input file 'opus.lib'
+      #
+      # That had been broken for the whole life of the audio feature and nobody saw it, because this
+      # workflow only ever triggered on `main` while the deployed lineage is `ci/github-actions` —
+      # the first run after fixing that trigger found this immediately. Note the library is `opus`,
+      # NOT `libopus`: naming it `libopus` produces exactly the same LNK1181, one trap further on.
+      #
+      # The cache key names both packages, so adding a third native dep must bump it or the runner
+      # restores a tree that predates the new library and fails at link time for a reason that reads
+      # like a code error.
+      # Runner-provided variables exist in the shell, not necessarily in the workflow's
+      # env expression context. Reading env.VCPKG_INSTALLATION_ROOT there produced
+      # "\installed", so the cache was never saved and every run rebuilt both codecs.
+      - name: Resolve vcpkg cache path
+        id: vcpkg-path
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root -or -not [IO.Path]::IsPathFullyQualified($root) -or
+              -not (Test-Path -LiteralPath (Join-Path $root 'vcpkg.exe'))) {
+            throw 'The runner must provide an absolute VCPKG_INSTALLATION_ROOT containing vcpkg.exe.'
+          }
+          "installed=$(Join-Path $root 'installed')" >> $env:GITHUB_OUTPUT
+      - name: Cache vcpkg libvpx + opus (x64-windows-static)
+        id: vcpkg-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.vcpkg-path.outputs.installed }}
+          key: vcpkg-libvpx-opus-x64-windows-static-v3
+      - name: Install libvpx:x64-windows-static + opus:x64-windows-static
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install libvpx:x64-windows-static opus:x64-windows-static
+      # Fail LOUDLY and early if either static library is absent, rather than 200 lines later inside
+      # a linker invocation. A cache restored from an older key is the realistic way this happens.
+      - name: Assert both static libraries are present
+        shell: pwsh
+        run: |
+          $lib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib"
+          foreach ($f in 'vpx.lib', 'opus.lib') {
+            $p = Join-Path $lib $f
+            if (-not (Test-Path $p)) {
+              throw "$f is missing from $lib. The vcpkg cache key may predate this dependency — bump it. (A missing opus.lib surfaces as LNK1181 while linking rmt-transport-webrtc.)"
+            }
+            Write-Host "found $f"
+          }
+      - name: Point env-libvpx-sys and the Opus FFI at the vcpkg tree
+        shell: pwsh
+        run: |
+          # .cargo/config.toml defaults to C:/vcpkg (force=false, so these env vars win if vcpkg
+          # lives elsewhere on the runner). Keep them in step with the triplet above.
+          #
+          # OPUS_LIB_DIR is set for the same reason as the VPX pair and was missing beside them:
+          # `.cargo/config.toml` declares all four, CI overrode three, and the odd one out worked
+          # only while the runner's vcpkg happened to sit at the hard-coded default. That is the
+          # shape of a defence applied to some of its siblings and not the rest.
+          "VPX_LIB_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib"      >> $env:GITHUB_ENV
+          "VPX_INCLUDE_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\include" >> $env:GITHUB_ENV
+          "VPX_VERSION=1.13.0" >> $env:GITHUB_ENV
+          "OPUS_LIB_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib"     >> $env:GITHUB_ENV
+
+      # Unit tests only (--lib): deterministic, and a server-dependent integration test cannot
+      # self-skip green here. Both codec-seam implementations are compiled + exercised.
+      - name: Test transport-webrtc (VP8, default)
+        run: cargo test -p rmt-transport-webrtc --lib -- --nocapture
+      - name: Test transport-webrtc (h264 alternate encoder)
+        run: cargo test -p rmt-transport-webrtc --features h264 --lib -- --nocapture
+      - name: Workspace unit tests
+        run: cargo test --workspace --lib
+
+      - name: Agent updater bootstrap transactions (Windows PowerShell 5)
+        shell: powershell
+        run: |
+          ./scripts/test-enable-agent-auto-update.ps1
+          ./scripts/test-update-agent-path.ps1
+
+      # Deterministic integration suites, BY NAME. `--lib` above never builds integration targets,
+      # so without this step deleting `"os": os_description()` from the enrollment body, or
+      # `logging::init()` from `host_main`, passes CI while the local no-skip harness fails — the
+      # exact gap tests/enroll_wire.rs was written to close. These three need no live stack, no
+      # database and no interactive desktop: enroll_wire answers the agent from a one-shot loopback
+      # responder; probe_logging / host_logging drive the built binaries down argument-error paths
+      # (their only network touch is a dial to a CLOSED loopback port). The e2e_* suites stay
+      # excluded — they need DXGI or live servers, the self-skip trap `--lib` exists to avoid.
+      # enroll_wire's Win11-correction premise (host build >= 22000) holds on windows-latest
+      # (Server 2025, build 26100) and is asserted loudly inside the test, so a runner-image
+      # downgrade fails visibly rather than silently skipping.
+      - name: Agent deterministic integration suites (enroll_wire, probe_logging, host_logging)
+        run: cargo test -p rmt-agent-windows --test enroll_wire --test probe_logging --test host_logging
+
+      # The shipping agent is built with the static CRT so a bare box with no vcruntime140.dll can
+      # run it. Build it and PROVE it imports no CRT DLL — a dynamically-linked agent is a silent
+      # 0xC0000135 at service start, invisible until it is on a customer machine.
+      - name: Build release agent (static CRT)
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release -p rmt-agent-windows --bin agent_host --bin stream_probe
+      - name: Assert static CRT (no vcruntime/msvcp/ucrtbase import)
+        shell: pwsh
+        run: |
+          $dumpbin = (Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $dumpbin) { throw "dumpbin not found" }
+          foreach ($exe in 'agent_host.exe','stream_probe.exe') {
+            $deps = & $dumpbin /dependents "target\release\$exe" | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $exe" }
+            $bad = [regex]::Matches($deps, '(?im)^\s*(vcruntime\S*|msvcp\d\S*|ucrtbase\S*|api-ms-win-crt-\S*)\s*$')
+            if ($bad.Count -gt 0) { throw "$exe links the CRT dynamically: $($bad.Value -join ', ')" }
+            Write-Host "OK: $exe imports no CRT DLL"
+          }
+
+  # ---------------------------------------------------------------------------------------------
+  # Go servers. signaling + relay need no database; the control-plane's pgx/RLS tests do, so a real
+  # Postgres is provisioned and the migrations applied (as an owner role — RLS is bypassed for the
+  # owner, which is exactly what the migrations require). TEST_DATABASE_URL is set so the integration
+  # tests RUN rather than t.Skip (the false-green this whole effort exists to prevent).
+  # ---------------------------------------------------------------------------------------------
+  go:
+    name: Go servers (signaling, relay, control-plane + Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rmt_test
+          # Match the local harness's auth posture. newAppRolePool (rls_test.go) derives the
+          # rmt_app pool from TEST_DATABASE_URL by swapping the user and CLEARING the password
+          # outright — it is written against trust auth. The stock postgres image defaults to
+          # scram-sha-256, which rejects that empty password with SQLSTATE 28P01 and cascades
+          # into every pgx/RLS test (and, via the handler chains built over that pool, into a
+          # pile of confusing 500s). Trust is safe here: the service is only reachable from
+          # this job's network namespace and the database is thrown away with the runner.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26.8"
+          # This repo has no root go.sum — the three modules each carry their own, so setup-go's
+          # default root-only lookup finds nothing and skips module caching entirely ("Restore
+          # cache failed: Dependencies file is not found"). List them explicitly; the hash of all
+          # three is the cache key, so a dependency bump in any module invalidates it.
+          cache-dependency-path: |
+            control-plane/go.sum
+            server/signaling/go.sum
+            server/relay/go.sum
+
+      - name: Apply control-plane migrations (as owner) + provision rmt_app
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in control-plane/migrations/0*.sql; do
+            echo "applying $f"
+            # -1: one transaction per file, like controlplane migrate's applyOne (0065 uses LOCK TABLE,
+            # which Postgres refuses outside a transaction block).
+            psql "postgresql://postgres@localhost:5432/rmt_test" -v ON_ERROR_STOP=1 -q -1 -f "$f"
+          done
+          # No ALTER ROLE ... PASSWORD for rmt_app on purpose: the tests connect as that role with
+          # an EMPTY password (see POSTGRES_HOST_AUTH_METHOD above), so setting one here would be
+          # dead configuration that reads as though it were load-bearing. Assert the role the
+          # migrations are expected to have created, so a missing 0005 fails HERE with a clear
+          # message rather than as 28P01 auth noise in a hundred downstream tests.
+          if ! psql "postgresql://postgres@localhost:5432/rmt_test" -tAc \
+                 "SELECT 1 FROM pg_roles WHERE rolname = 'rmt_app'" | grep -q '^1$'; then
+            echo "role rmt_app was not created by the migrations (expected from 0005_app_role.sql)" >&2
+            exit 1
+          fi
+
+      - name: Build authenticated control-plane fixture for signaling tests
+        working-directory: control-plane
+        run: go build -o cptestfixture ./cmd/cptestfixture
+
+      - name: Test signaling
+        working-directory: server/signaling
+        run: go test ./... -count=1
+      - name: Test relay
+        working-directory: server/relay
+        run: go test ./... -count=1
+      - name: Test control-plane (pgx/RLS against real Postgres)
+        working-directory: control-plane
+        env:
+          # Owner DSN drives the tests; the RLS isolation test opens its own rmt_app connection.
+          TEST_DATABASE_URL: "postgres://postgres:postgres@localhost:5432/rmt_test?sslmode=disable"
+        run: go test ./... -count=1 -timeout 30m
+
+  # ---------------------------------------------------------------------------------------------
+  # Viewer unit suite and isolated clipboard browser tests. Live-stack Playwright tests remain
+  # covered by verify-all.ps1 on a real desktop (see the header note).
+  # ---------------------------------------------------------------------------------------------
+  web:
+    name: Web viewer (typecheck, unit, clipboard browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          # Match the Node major used to verify Vite 7 / Vitest 4 locally.
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/viewer/package-lock.json
+      - name: Install
+        working-directory: web/viewer
+        run: npm ci --engine-strict
+      # Full TypeScript typecheck. vitest transpiles with esbuild (no type errors surfaced), so a
+      # type regression can pass the unit suite; `tsc --noEmit` is the gate that catches it. Verified
+      # clean locally 2026-08-01.
+      - name: Typecheck (tsc --noEmit)
+        working-directory: web/viewer
+        run: npx tsc --noEmit
+      - name: Vitest unit suite
+        working-directory: web/viewer
+        run: npx vitest run --no-file-parallelism
+      - name: Install browser for isolated clipboard tests
+        working-directory: web/viewer
+        run: npx playwright install --with-deps chromium
+      - name: Clipboard consent and pop-out browser tests
+        working-directory: web/viewer
+        run: npx playwright test --config=playwright.popout.config.ts
+      - name: Desktop launch and separate monitor windows
+        working-directory: web/viewer
+        run: npx playwright test --config=playwright.desktop-launch.config.ts
+      - name: Independent monitor viewport desktop and mobile tests
+        working-directory: web/viewer
+        run: npx playwright test --config=playwright.monitor.config.ts
+
+      - name: Shared support session browser tests
+        working-directory: web/viewer
+        run: npx playwright test --config=playwright.attended-shared.config.ts
+
+  # ---------------------------------------------------------------------------------------------
+  # Container images. Added 2026-08-25 because the three Dockerfiles and deploy/docker-compose.yml
+  # had been AUTHORED but never built — each one carries an "UNVERIFIED IN THIS ENVIRONMENT" banner
+  # saying so, and nothing in CI contradicted it. The self-hosted deployment (docs/18) is the first
+  # thing that depends on them, so this job is what turns "authored" into "verified".
+  #
+  # Build only — no registry, no push. The question this answers is "do these images build and do
+  # the compose files resolve", not "should they be published".
+  # ---------------------------------------------------------------------------------------------
+  docker:
+    name: Container images (build + compose validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Each image is built from its OWN directory as the context (that is what the Dockerfiles
+      # assume: `COPY go.mod go.sum ./` relative to the service root, not the repo root). Building
+      # from the repo root would fail, and would fail confusingly.
+      - name: Build signaling image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: server/signaling
+          push: false
+          cache-from: type=gha,scope=signaling
+          cache-to: type=gha,scope=signaling,mode=max
+
+      - name: Build relay image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: server/relay
+          push: false
+          cache-from: type=gha,scope=relay
+          cache-to: type=gha,scope=relay,mode=max
+
+      - name: Build control-plane image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: control-plane
+          push: false
+          cache-from: type=gha,scope=controlplane
+          cache-to: type=gha,scope=controlplane,mode=max
+
+      # `compose config` resolves interpolation, merges the overlay and validates the schema without
+      # starting anything. The dummy values below are not decoration: the base file declares
+      # SIGNALING_TICKET_PUBKEY with `:?`, and the prod overlay does the same for SITE_ADDRESS and
+      # CP_SIGNALING_URL, so an unset one is a HARD failure. Supplying them here proves the
+      # required-variable guards work as well as that the YAML is valid.
+      # Every `:?`-required variable must be supplied by the steps below, or `compose config`
+      # dies mid-interpolation with a message about ONE variable and no hint that the CI env is the
+      # thing out of date. That has now cost three separate CI failures (APP_DB_PASSWORD,
+      # POSTGRES_PASSWORD, CP_DEVICE_IDENTITY_TOKEN), each time because a deploy fix added a guard
+      # and the workflow was not updated with it.
+      #
+      # So derive the required set from the compose files themselves and check it here, naming
+      # every variable that is missing at once. Adding a `:?` guard without wiring it now fails with
+      # an instruction instead of an interpolation error. Commented-out lines are excluded — the
+      # coturn block is commented and its TURN_SHARED_SECRET is not interpolated.
+      - name: Assert CI supplies every :?-required compose variable
+        env:
+          SIGNALING_TICKET_PUBKEY: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          SITE_ADDRESS: "remote.example.com"
+          CP_SIGNALING_URL: "wss://remote.example.com/ws"
+          PUBLIC_IP: "203.0.113.10"
+          APP_DB_PASSWORD: "ci-placeholder-not-a-real-secret"
+          POSTGRES_PASSWORD: "ci-placeholder-not-a-real-secret"
+          CP_DEVICE_IDENTITY_TOKEN: "ci-placeholder-not-a-real-secret-32ch"
+          # Required in the prod overlay: an ephemeral issuer key silently invalidates every
+          # enrolled agent after a restart, so the seed is guarded like the pubkey derived from it.
+          GRANT_ISSUER_SEED: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        run: |
+          set -euo pipefail
+          required="$(grep -hvE '^[[:space:]]*#' deploy/docker-compose.yml deploy/docker-compose.prod.yml             | grep -ohE '[$]\{[A-Za-z_][A-Za-z0-9_]*:[?]'             | sed -E 's/^[$]\{//; s/:[?]$//' | sort -u)"
+
+          if [ -z "$required" ]; then
+            echo "FAIL: found no :?-required variables at all — the extraction is broken, not the files" >&2
+            exit 1
+          fi
+          echo "required by the compose files:"; echo "$required" | sed 's/^/  /'
+
+          missing=""
+          for v in $required; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "FAIL: the compose files require these, and this workflow does not set them:$missing" >&2
+            echo "Add each to the env: block of every compose-validating step in this job." >&2
+            exit 1
+          fi
+          echo "OK: all $(echo "$required" | wc -l) required variables are supplied"
+
+      - name: Validate base compose (LAN/dev bring-up)
+        env:
+          SIGNALING_TICKET_PUBKEY: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Validate prod overlay (internet-facing, docs/18)
+        env:
+          SIGNALING_TICKET_PUBKEY: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          SITE_ADDRESS: "remote.example.com"
+          CP_SIGNALING_URL: "wss://remote.example.com/ws"
+          PUBLIC_IP: "203.0.113.10"
+          # Required by the prod overlay: the control plane connects as the least-privilege
+          # rmt_app role, never the superuser (docs/18 §4b). The `:?` guard is deliberate, so
+          # supplying a value here also proves the guard is wired.
+          APP_DB_PASSWORD: "ci-placeholder-not-a-real-secret"
+          # The overlay's migrate service builds MIGRATE_DATABASE_URL from this. Required with
+          # `:?` because a deploy that forgets it would otherwise get a DSN with an empty
+          # password and fail at connect time instead of at config time.
+          POSTGRES_PASSWORD: "ci-placeholder-not-a-real-secret"
+          # Guards the cross-tenant device-identity lookup signaling calls to authenticate
+          # register_agent. `:?` on BOTH halves, because signaling log.Fatal()s without it — a
+          # stack that omitted it could never have started at all.
+          CP_DEVICE_IDENTITY_TOKEN: "ci-placeholder-not-a-real-secret-32ch"
+          # Required in the prod overlay: an ephemeral issuer key silently invalidates every
+          # enrolled agent after a restart, so the seed is guarded like the pubkey derived from it.
+          GRANT_ISSUER_SEED: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        run: |
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml config --quiet
+
+      # The overlay's whole purpose is to WITHDRAW the host port publications the dev file makes.
+      # Assert that, rather than trusting that `ports: []` merged the way compose documents: a
+      # silent merge-instead-of-replace would leave four listeners on a public box.
+      # The overlay's whole purpose is to WITHDRAW the host port publications the dev file makes.
+      # Assert that, rather than trusting that `ports: []` merged the way compose documents: a
+      # silent merge-instead-of-replace would leave four listeners on a public box.
+      #
+      # `jq` over `compose config --format json`, not yq: jq is guaranteed present on ubuntu-latest,
+      # and asking compose for JSON avoids depending on a YAML tool at all.
+      - name: Assert the prod overlay withdraws the internal port publications
+        env:
+          SIGNALING_TICKET_PUBKEY: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          SITE_ADDRESS: "remote.example.com"
+          CP_SIGNALING_URL: "wss://remote.example.com/ws"
+          PUBLIC_IP: "203.0.113.10"
+          # Required by the prod overlay: the control plane connects as the least-privilege
+          # rmt_app role, never the superuser (docs/18 §4b). The `:?` guard is deliberate, so
+          # supplying a value here also proves the guard is wired.
+          APP_DB_PASSWORD: "ci-placeholder-not-a-real-secret"
+          # The overlay's migrate service builds MIGRATE_DATABASE_URL from this. Required with
+          # `:?` because a deploy that forgets it would otherwise get a DSN with an empty
+          # password and fail at connect time instead of at config time.
+          POSTGRES_PASSWORD: "ci-placeholder-not-a-real-secret"
+          # Guards the cross-tenant device-identity lookup signaling calls to authenticate
+          # register_agent. `:?` on BOTH halves, because signaling log.Fatal()s without it — a
+          # stack that omitted it could never have started at all.
+          CP_DEVICE_IDENTITY_TOKEN: "ci-placeholder-not-a-real-secret-32ch"
+          # Required in the prod overlay: an ephemeral issuer key silently invalidates every
+          # enrolled agent after a restart, so the seed is guarded like the pubkey derived from it.
+          GRANT_ISSUER_SEED: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml             config --format json > /tmp/merged.json
+
+          for svc in signaling relay controlplane; do
+            n="$(jq --arg s "$svc" '(.services[$s].ports // []) | length' /tmp/merged.json)"
+            if [ "$n" != "0" ]; then
+              echo "FAIL: $svc still publishes $n host port(s) under the prod overlay" >&2
+              jq --arg s "$svc" '.services[$s].ports' /tmp/merged.json >&2
+              exit 1
+            fi
+            echo "ok: $svc publishes no host ports"
+          done
+
+          # NEGATIVE CONTROL. Without it the loop above passes just as happily on a config where
+          # NOTHING is published and the stack is simply unreachable — which is not the property
+          # being asserted.
+          caddy_n="$(jq '(.services.caddy.ports // []) | length' /tmp/merged.json)"
+          if [ "$caddy_n" = "0" ]; then
+            echo "FAIL: caddy publishes nothing - the stack would be unreachable" >&2
+            exit 1
+          fi
+          echo "ok: caddy publishes $caddy_n host port(s)"
+
+          # And the base file on its own MUST still publish, or the overlay is asserting nothing:
+          # the withdrawal above would be true of a dev file that never published in the first place.
+          SIGNALING_TICKET_PUBKEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff             docker compose -f deploy/docker-compose.yml config --format json > /tmp/base.json
+          base_n="$(jq '(.services.signaling.ports // []) | length' /tmp/base.json)"
+          if [ "$base_n" = "0" ]; then
+            echo "FAIL: the base compose publishes nothing, so the overlay withdraws nothing" >&2
+            exit 1
+          fi
+          echo "ok: base publishes $base_n signaling port(s); the overlay withdrew them"
+
+      # --- Caddy config validation (docs/27 step 14) -------------------------------------------
+      # A parse error in the Caddyfile takes the WHOLE site down on reload, so it is validated in CI
+      # against the real caddy:2-alpine image the deployment runs. `caddy validate` resolves the
+      # {$SITE_ADDRESS} placeholder from the environment, so it is supplied here the same way the
+      # compose steps supply theirs. This does NOT prove the /download route serves anything — only
+      # that the config parses; the live curl matrix in docs/20 is what proves behaviour.
+      - name: Validate Caddyfile (parse only)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e SITE_ADDRESS=remote.example.com \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      # --- fail2ban filter regression (docs/27 step 15) ----------------------------------------
+      # The download jail keys on a 200 to /download/ from one IP. Assert the filter MATCHES a real
+      # access-log line for a served download and does NOT match a 404 — a filter that matched the
+      # 404s would ban the scanners we WANT logged and miss the abuse we care about.
+      - name: fail2ban filter matches a download 200, not a 404
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq fail2ban >/dev/null
+          hit='{"level":"info","ts":1.0,"logger":"http.log.access","msg":"handled request","request":{"remote_ip":"203.0.113.7","method":"GET","uri":"/download/DeskRallySupport.exe"},"status":200}'
+          miss='{"level":"info","ts":1.0,"logger":"http.log.access","msg":"handled request","request":{"remote_ip":"203.0.113.7","method":"GET","uri":"/download/nope.exe"},"status":404}'
+          echo "$hit"  > /tmp/hit.log
+          echo "$miss" > /tmp/miss.log
+          got_hit="$(fail2ban-regex /tmp/hit.log deploy/fail2ban/deskrally-download.conf --print-all-matched | grep -c 'Matched' || true)"
+          got_miss="$(fail2ban-regex /tmp/miss.log deploy/fail2ban/deskrally-download.conf --print-all-missed | grep -c 'Missed' || true)"
+          test "$got_hit" -ge 1  || { echo "FAIL: filter did not match a served-download line" >&2; exit 1; }
+          test "$got_miss" -ge 1 || { echo "FAIL: filter matched a 404 line it should ignore" >&2; exit 1; }
+          echo "ok: matches a 200 /download/ line and ignores the 404"

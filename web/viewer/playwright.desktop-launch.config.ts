@@ -1,0 +1,2 @@
+import { defineConfig } from '@playwright/test';
+export default defineConfig({testDir:'./e2e',testMatch:/(desktop_launch|monitor_windows|popout_controls|remembered_login)\.spec\.ts$/,workers:1,retries:0,timeout:30000,reporter:'list',use:{viewport:{width:1280,height:900}},webServer:{command:'npm run dev -- --port 5173 --strictPort --host 127.0.0.1',url:'http://127.0.0.1:5173',reuseExistingServer:!process.env.CI,env:{CONTROL_PLANE_ORIGIN:'http://127.0.0.1:9'}}});

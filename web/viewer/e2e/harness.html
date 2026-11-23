@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RMT E2E Harness</title>
+    <style>
+      body { margin: 0; background: #111; }
+      video { width: 100vw; height: 100vh; object-fit: contain; }
+    </style>
+  </head>
+  <body>
+    <!-- Muted + playsinline so headless autoplay is permitted; the real transport feeds this. -->
+    <video id="v" autoplay muted playsinline></video>
+    <script type="module" src="./harness.ts"></script>
+  </body>
+</html>

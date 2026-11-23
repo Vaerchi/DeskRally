@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily TURN cert export (restarts coturn only on renewal)
+
+[Timer]
+# Caddy renews ~30 days before expiry, so daily is ample; the restart is a ~1 s blip for TURN
+# clients and happens only when the cert actually changed.
+OnCalendar=*-*-* 04:10:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

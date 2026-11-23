@@ -1,0 +1,15 @@
+# cargo-audit configuration. Every ignore needs a reason a reviewer can check, and should be revisited when the
+# crate can be upgraded. Re-run `cargo audit` before each release; the vendored crates in third_party/ are not
+# matched by it (see scripts/check-vendored-upstream.py).
+
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5 (via p256 -> ecdsa -> elliptic-curve): timing variability in constant-time operations.
+    # p256 is used only to VERIFY deployment passes (crates/agent-core/src/deployment_pass.rs: VerifyingKey,
+    # PrehashVerifier); the key and signature are public, so timing reveals nothing secret. The fix needs
+    # crypto-bigint 0.7, which arrives with the p256 0.14 / elliptic-curve 0.14 line. Reviewed 2026-11-14.
+    "RUSTSEC-2026-0387",
+    # openh264-sys2 0.6.6: heap overflow in the H.264 DECODER. openh264 is behind transport-webrtc's optional `h264`
+    # feature, which shipped builds do not enable (video is VP8), and DeskRally only encodes. Reviewed 2026-11-14.
+    "RUSTSEC-2025-0008",
+]

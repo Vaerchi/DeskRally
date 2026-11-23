@@ -1,0 +1,21 @@
+{
+  "_comment": "Upstream base of each vendored crate. DeskRally carries modified copies (see each DESKRALLY-CHANGES.md), so upstream fixes do not arrive through cargo. scripts/check-vendored-upstream.py reports newer upstream releases; review their changelogs and security advisories, then re-apply DeskRally's change on the newer base or note why not. Update base_version here when a fork is rebased.",
+  "crates": [
+    {
+      "name": "webrtc-ice",
+      "path": "third_party/webrtc-ice",
+      "registry": "crates.io",
+      "base_version": "0.17.3",
+      "change_log": "third_party/webrtc-ice/DESKRALLY-CHANGES.md",
+      "deskrally_change": "relay_dialer.rs hook: TURN over TCP and TLS"
+    },
+    {
+      "name": "webrtc-sctp",
+      "path": "third_party/webrtc-sctp",
+      "registry": "crates.io",
+      "base_version": "0.17.3",
+      "change_log": "third_party/webrtc-sctp/DESKRALLY-CHANGES.md",
+      "deskrally_change": "one failed UDP send no longer closes the association"
+    }
+  ]
+}

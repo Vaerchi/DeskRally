@@ -1,0 +1,400 @@
+package controlplane
+
+// docs/69 §3.1: every brokered session carries `device_binding`. These pin the control-plane half: what
+// is issued, when it is withheld, and that a malformed console key changes no state.
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+const (
+	bindTestTenant = "55555555-5555-4555-8555-555555555555"
+	bindTestUser   = "66666666-6666-4666-8666-666666666666"
+	bindTestDevice = "77777777-7777-4777-8777-777777777777"
+)
+
+func bindTestIssuer(t *testing.T) *GrantIssuer {
+	t.Helper()
+	seed, _ := hex.DecodeString(goldenSeedHex)
+	iss, err := NewGrantIssuerFromSeed(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return iss
+}
+
+func bindTestDeviceKey() (string, ed25519.PrivateKey) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, 32))
+	return hex.EncodeToString(priv.Public().(ed25519.PublicKey)), priv
+}
+
+func TestAttachDeviceBindingIssuesAVerifiableGrant(t *testing.T) {
+	iss := bindTestIssuer(t)
+	srv := &Server{Grants: iss, BindingEnabled: true}
+	deviceKey, _ := bindTestDeviceKey()
+	resp := map[string]any{}
+	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, strings.ToUpper(deviceKey), bindTestUser,
+		bindTestTenant, "", SessionAccessViewOnly, goldenBindConsolePubHex, "", 1_000); r != nil {
+		t.Fatalf("refused: %+v", r)
+	}
+	b := resp["device_binding"].(map[string]any)
+	if b["mode"] != "warn" || b["device_pubkey"] != deviceKey || b["unavailable"] != nil {
+		t.Fatalf("binding = %+v", b)
+	}
+	var g SignedBindingGrant
+	if err := json.Unmarshal([]byte(b["grant"].(string)), &g); err != nil {
+		t.Fatal(err)
+	}
+	want := bindingGrantClaims{SessionID: goldenSessionID, DeviceID: bindTestDevice, TenantID: bindTestTenant,
+		TechnicianID: bindTestUser, Access: SessionAccessViewOnly, ConsolePubkey: goldenBindConsolePubHex,
+		IssuedAtMs: 1_000, ExpiresAtMs: 1_000 + bindingGrantTTL.Milliseconds()}
+	if g.Claims != want {
+		t.Fatalf("claims = %+v\nwant %+v", g.Claims, want)
+	}
+	msg, _ := bindingGrantSigningBytes(g.Claims)
+	pub, _ := hex.DecodeString(iss.PublicKeyHex())
+	sig, _ := hex.DecodeString(g.Sig)
+	if !ed25519.Verify(pub, msg, sig) {
+		t.Fatal("the issued grant does not verify against the issuer key")
+	}
+}
+
+func TestAttachDeviceBindingWithholdsInWarnAndRefusesInRequire(t *testing.T) {
+	deviceKey, _ := bindTestDeviceKey()
+	for _, tc := range []struct {
+		name, deviceKey, consoleKey, tenant string
+		reason                              string
+	}{
+		{"no console key", deviceKey, "", bindTestTenant, "console did not send a key"},
+		{"machine has no key", "", goldenBindConsolePubHex, bindTestTenant, "machine has no enrolled device key"},
+		{"machine key malformed", "00", goldenBindConsolePubHex, bindTestTenant, "machine has no enrolled device key"},
+		{"grant cannot be minted", deviceKey, goldenBindConsolePubHex, "tenant-123", "grant could not be issued"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			warn := &Server{Grants: bindTestIssuer(t), BindingEnabled: true}
+			resp := map[string]any{}
+			if r := warn.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser, tc.tenant, "",
+				SessionAccessControl, tc.consoleKey, "", 1); r != nil {
+				t.Fatalf("warn refused: %+v", r)
+			}
+			b := resp["device_binding"].(map[string]any)
+			if b["unavailable"] != tc.reason || b["grant"] != nil || b["device_pubkey"] != nil {
+				t.Fatalf("warn binding = %+v, want unavailable %q and no grant", b, tc.reason)
+			}
+
+			require := &Server{Grants: bindTestIssuer(t), BindingEnabled: true, BindingMode: func(string) SessionBindingMode { return SessionBindingRequire }}
+			if r := require.attachDeviceBinding(context.Background(), map[string]any{}, goldenSessionID, bindTestDevice, tc.deviceKey, bindTestUser,
+				tc.tenant, "", SessionAccessControl, tc.consoleKey, "", 1); r == nil {
+				t.Fatal("require mode brokered a session it cannot bind")
+			}
+		})
+	}
+}
+
+func TestSessionBindingModeFailsClosedOnAnUnknownValue(t *testing.T) {
+	s := &Server{BindingMode: func(string) SessionBindingMode { return "" }}
+	if got := s.sessionBindingMode(context.Background(), bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("unknown mode read as %q, want require", got)
+	}
+	if got := (&Server{}).sessionBindingMode(context.Background(), bindTestTenant); got != SessionBindingWarn {
+		t.Fatalf("unwired mode = %q, want warn (11-15)", got)
+	}
+}
+
+// Over HTTP: POST /sessions answers with device_binding, and a malformed console key is refused with 400
+// before any session record exists.
+func TestStartSessionCarriesDeviceBinding(t *testing.T) {
+	owner := &Principal{UserID: bindTestUser, TenantID: bindTestTenant,
+		Grant: NewGrant(bindTestUser, bindTestTenant, NewMembership(RoleOwner, AllGroups()))}
+	srv, _ := newTestServer(owner)
+	srv.Grants = bindTestIssuer(t)
+	srv.BindingEnabled = true
+	start := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/sessions", strings.NewReader(body)))
+		return rec
+	}
+
+	rec := start(`{"machine_id":"22222222-2222-4222-8222-222222222222","console_pubkey":"` + goldenBindConsolePubHex + `"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("start = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		DeviceBinding map[string]any `json:"device_binding"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	// The permissive dev store fabricates machines with no enrolled key: warn mode brokers, unbound.
+	if out.DeviceBinding["mode"] != "warn" || out.DeviceBinding["unavailable"] != "machine has no enrolled device key" {
+		t.Fatalf("device_binding = %+v", out.DeviceBinding)
+	}
+
+	before, _ := srv.SessionRecords.ListSessions(t.Context(), bindTestTenant, SessionSummaryFilter{})
+	bad := start(`{"machine_id":"22222222-2222-4222-8222-222222222222","console_pubkey":"not-a-key"}`)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("malformed console key = %d, want 400: %s", bad.Code, bad.Body.String())
+	}
+	after, _ := srv.SessionRecords.ListSessions(t.Context(), bindTestTenant, SessionSummaryFilter{})
+	if len(after) != len(before) {
+		t.Fatalf("a refused start created a session record (%d -> %d)", len(before), len(after))
+	}
+}
+
+// POST /sessions/{id}/binding-failed: only the session's technician, only a known reason, audited.
+func TestSessionBindingFailedIsAuditedForTheTechnicianOnly(t *testing.T) {
+	ctx := t.Context()
+	tech := &Principal{UserID: bindTestUser, TenantID: bindTestTenant,
+		Grant: NewGrant(bindTestUser, bindTestTenant, NewMembership(RoleOwner, AllGroups()))}
+	srv, _ := newTestServer(tech)
+	rec := &SessionRecord{MachineID: "m1", TechnicianID: bindTestUser, MachineGroupID: "group-a", MachineName: "HOST"}
+	if err := srv.SessionRecords.StartSession(ctx, bindTestTenant, rec); err != nil {
+		t.Fatal(err)
+	}
+	post := func(h http.Handler, id, body string) int {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest("POST", "/sessions/"+id+"/binding-failed", strings.NewReader(body)))
+		return rr.Code
+	}
+	if c := post(srv.Handler(), rec.ID, `{"reason":"something else"}`); c != http.StatusBadRequest {
+		t.Fatalf("unknown reason = %d, want 400", c)
+	}
+	if c := post(srv.Handler(), "99999999-9999-4999-8999-999999999999", `{"reason":"bad_signature"}`); c != http.StatusNotFound {
+		t.Fatalf("unknown session = %d, want 404", c)
+	}
+	other := &Principal{UserID: "88888888-8888-4888-8888-888888888888", TenantID: bindTestTenant,
+		Grant: NewGrant("88888888-8888-4888-8888-888888888888", bindTestTenant, NewMembership(RoleOwner, AllGroups()))}
+	srv.Auth = StubAuthenticator{Principal: other}
+	if c := post(srv.Handler(), rec.ID, `{"reason":"bad_signature"}`); c != http.StatusForbidden {
+		t.Fatalf("another user = %d, want 403", c)
+	}
+	srv.Auth = StubAuthenticator{Principal: tech}
+	if c := post(srv.Handler(), rec.ID, `{"reason":"fingerprint_mismatch"}`); c != http.StatusOK {
+		t.Fatalf("technician = %d, want 200", c)
+	}
+	events, err := srv.MgmtAudit.ListEvents(ctx, bindTestTenant, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range events {
+		if e.Action == "session.binding_failed" {
+			n++
+			if e.TargetID != rec.ID || !strings.Contains(string(e.Metadata), `"reason":"fingerprint_mismatch"`) {
+				t.Fatalf("audit event = %+v", e)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d session.binding_failed events, want exactly 1 (refused reports must not be recorded)", n)
+	}
+}
+
+// docs/69 §3.7 step 2: an installed agent without a pinned key fetches it without any session.
+func TestAgentGrantIssuerPubkeyIsPublic(t *testing.T) {
+	srv, _ := newTestServer(nil)
+	srv.Grants = bindTestIssuer(t)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/agent/grant-issuer-pubkey", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil || out["grant_issuer_pubkey"] != srv.Grants.PublicKeyHex() {
+		t.Fatalf("body = %s", rr.Body.String())
+	}
+}
+
+// docs/69 rollout: with binding OFF (the default until the answering agent ships) a start carries no
+// device_binding at all, even when the console sent a key, so the console shows no mark and holds nothing.
+func TestSessionBindingIsOffByDefault(t *testing.T) {
+	srv := &Server{Grants: bindTestIssuer(t)}
+	deviceKey, _ := bindTestDeviceKey()
+	resp := map[string]any{}
+	if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser, bindTestTenant, "",
+		SessionAccessControl, goldenBindConsolePubHex, "", 1); r != nil {
+		t.Fatalf("refused: %+v", r)
+	}
+	if _, present := resp["device_binding"]; present {
+		t.Fatalf("binding is off but the response carries device_binding: %+v", resp)
+	}
+}
+
+// docs/69 §3.9: the switch is on unless the operator writes exactly "off"; a typo must not disable it.
+func TestSessionBindingSwitchDefaultsOn(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"", true}, {"on", true}, {" ON ", true}, {"yes", true}, {"of", true}, {"0", true},
+		{"off", false}, {"OFF", false}, {"  Off\t", false},
+	} {
+		got, msg := SessionBindingSwitch(tc.raw)
+		if got != tc.want {
+			t.Errorf("SessionBindingSwitch(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+		if msg == "" {
+			t.Errorf("SessionBindingSwitch(%q): empty log line", tc.raw)
+		}
+	}
+}
+
+type failingSessionPolicies struct {
+	InMemoryTenantSessionPolicyStore
+}
+
+func (*failingSessionPolicies) Get(context.Context, string) (SessionPolicy, error) {
+	return SessionPolicy{}, errors.New("database unavailable")
+}
+
+// docs/69 step 4 + 3.6: the mode comes from the tenant's session policy; unset is warn, an unreadable policy is
+// require (fail closed), and a stored require is require.
+func TestSessionBindingModeFromTenantPolicy(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryTenantSessionPolicyStore()
+	s := &Server{SessionPolicies: store}
+	if got := s.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingWarn {
+		t.Fatalf("unset tenant = %q, want warn", got)
+	}
+	_ = store.Set(ctx, bindTestTenant, SessionPolicy{SessionBinding: "require"})
+	if got := s.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("require tenant = %q, want require", got)
+	}
+	_ = store.Set(ctx, bindTestTenant, SessionPolicy{SessionBinding: "garbage"})
+	if got := s.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("unknown stored mode = %q, want require", got)
+	}
+	failing := &Server{SessionPolicies: &failingSessionPolicies{}}
+	if got := failing.sessionBindingMode(ctx, bindTestTenant); got != SessionBindingRequire {
+		t.Fatalf("unreadable policy = %q, want require", got)
+	}
+}
+
+// A PUT that omits session_binding (an older console) keeps the stored mode; only an explicit "warn" lowers it.
+func TestSetSessionPolicyKeepsBindingModeWhenOmitted(t *testing.T) {
+	owner := &Principal{UserID: "u1", TenantID: "tenant-123",
+		Grant: NewGrant("u1", "tenant-123", NewMembership(RoleOwner, AllGroups()))}
+	srv, _ := newTestServer(owner)
+	h := srv.Handler()
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("PUT", "/tenant/session-policy", strings.NewReader(body)))
+		return rec
+	}
+	get := func() SessionPolicy {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/tenant/session-policy", nil))
+		var p SessionPolicy
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		return p
+	}
+	if got := get().SessionBinding; got != "warn" {
+		t.Fatalf("default GET session_binding = %q, want warn", got)
+	}
+	if rec := put(`{"max_concurrent_sessions":0,"max_session_seconds":0,"session_binding":"require"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set require: %d %s", rec.Code, rec.Body)
+	}
+	if rec := put(`{"max_concurrent_sessions":0,"max_session_seconds":3600}`); rec.Code != http.StatusOK {
+		t.Fatalf("old-console PUT: %d %s", rec.Code, rec.Body)
+	}
+	if got := get().SessionBinding; got != "require" {
+		t.Fatalf("after a PUT without session_binding = %q, want require kept", got)
+	}
+	if rec := put(`{"max_concurrent_sessions":0,"max_session_seconds":0,"session_binding":"warn"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set warn: %d %s", rec.Code, rec.Body)
+	}
+	if got := get().SessionBinding; got != "warn" {
+		t.Fatalf("after explicit warn = %q", got)
+	}
+	if rec := put(`{"session_binding":"off"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown mode = %d, want 400", rec.Code)
+	}
+}
+
+// One policy read per start (Codex bindmode r1 recommendation): a mode the admission already read is used as is,
+// with no second read (here the store would fail and force require), and an unknown value still fails closed.
+func TestAttachDeviceBindingUsesTheAdmissionMode(t *testing.T) {
+	srv := &Server{BindingEnabled: true, SessionPolicies: &failingSessionPolicies{}}
+	mode := func(known SessionBindingMode) string {
+		resp := map[string]any{}
+		// No console key: under warn that is "unavailable", under require a refusal; either way the mode is recorded.
+		_ = srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, "", bindTestUser,
+			bindTestTenant, known, SessionAccessControl, "", "", 1_000)
+		return resp["device_binding"].(map[string]any)["mode"].(string)
+	}
+	if got := mode(SessionBindingWarn); got != "warn" {
+		t.Fatalf("known warn = %q, want warn without a second (failing) read", got)
+	}
+	if got := mode(""); got != "require" {
+		t.Fatalf("unknown -> lookup on a failing store = %q, want require", got)
+	}
+	if got := mode("bogus"); got != "require" {
+		t.Fatalf("an unknown known value = %q, want require", got)
+	}
+}
+
+// docs/69 6.2: device_binding.v2 is set from the machine's reported agent version (0.1.33+), never for older or
+// unknown versions; it is a hint for which exchange the console runs.
+func TestDeviceBindingV2HintFollowsTheAgentVersion(t *testing.T) {
+	srv := &Server{Grants: bindTestIssuer(t), BindingEnabled: true}
+	deviceKey, _ := bindTestDeviceKey()
+	for _, tc := range []struct {
+		version string
+		want    bool
+	}{
+		{"0.1.33+abcdef12", true}, {"0.2.0", true}, {"1.0.0+x", true},
+		{"0.1.32+d67ce452", false}, {"0.1.0", false}, {"", false}, {"garbage", false},
+	} {
+		resp := map[string]any{}
+		if r := srv.attachDeviceBinding(context.Background(), resp, goldenSessionID, bindTestDevice, deviceKey, bindTestUser,
+			bindTestTenant, "", SessionAccessControl, goldenBindConsolePubHex, tc.version, 1_000); r != nil {
+			t.Fatalf("%q: refused: %+v", tc.version, r)
+		}
+		_, got := resp["device_binding"].(map[string]any)["v2"]
+		if got != tc.want {
+			t.Fatalf("agent %q: v2 present = %v, want %v", tc.version, got, tc.want)
+		}
+	}
+}
+
+type versionPresence struct {
+	versions map[string]string
+	err      error
+}
+
+func (p versionPresence) FetchPresence(context.Context) (*Presence, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &Presence{VersionByDevice: p.versions}, nil
+}
+
+// Codex sas-impl r4: attended sessions learn the guest's version from live presence, for the v2 hint.
+func TestLiveAgentVersionFeedsTheAttendedV2Hint(t *testing.T) {
+	srv := &Server{}
+	if v := srv.liveAgentVersion(context.Background(), bindTestDevice); v != "" {
+		t.Fatalf("no presence source: %q", v)
+	}
+	srv.Presence = versionPresence{err: errors.New("down")}
+	if v := srv.liveAgentVersion(context.Background(), bindTestDevice); v != "" {
+		t.Fatalf("feed down: %q", v)
+	}
+	srv.Presence = versionPresence{versions: map[string]string{bindTestDevice: "0.1.33"}}
+	if v := srv.liveAgentVersion(context.Background(), "other-device"); v != "" {
+		t.Fatalf("silent device: %q", v)
+	}
+	if v := srv.liveAgentVersion(context.Background(), bindTestDevice); v != "0.1.33" {
+		t.Fatalf("announced: %q", v)
+	}
+	if !agentVersionAtLeast(srv.liveAgentVersion(context.Background(), bindTestDevice), bindingV2MinAgent) {
+		t.Fatal("0.1.33 must earn the v2 hint")
+	}
+}
