@@ -339,7 +339,7 @@ Control-plane environment variables:
 | Var | Meaning |
 |---|---|
 | `CP_LISTEN` | listen address (default `:8081`) |
-| `DATABASE_URL` | Postgres DSN — **must connect as the `rmt_app` least-privilege role** (RLS-subject), never `postgres`/owner (they bypass RLS). **Unset ⇒ production startup refuses to serve.** Development mode requires the separate explicit CP_INSECURE_DEV flag and is not a deployment mode. |
+| `DATABASE_URL` | Postgres DSN — **must connect as the `rmt_app` least-privilege role** (RLS-subject), never `postgres`/owner (they bypass RLS). **Unset ⇒ production startup refuses to serve.** Development mode requires the separate explicit CP_INSECURE_DEV flag AND a `go build -tags cpdev` binary; release and container builds do not contain it. It is not a deployment mode. |
 | `GRANT_ISSUER_SEED` | 32-byte Ed25519 seed, hex (64 chars). Keeps `grant_issuer_pubkey` **stable across restarts**. Unset ⇒ ephemeral key regenerated each boot (agents pinned to the old key reject grants) |
 | `CP_ISSUER_NAME` | name used in TOTP provisioning URIs (default `rmt-control-plane`) |
 | `AGENT_PUBLISHED_VERSION` | operator-designated expected agent build, `<semver>+<short-sha>`; `GET /agent-version` returns it and the console flags outdated machines. Empty = tracking off (docker compose forwards it) |

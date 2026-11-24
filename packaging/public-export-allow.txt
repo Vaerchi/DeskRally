@@ -575,3 +575,4 @@ crates/protocol/testdata/wake-vectors.json:long-hex
 crates/protocol/testdata/wake-vectors.json:private-network
 server/signaling/wake_test.go:private-network
 server/signaling/wake.go:literal-credential
+control-plane/migrate_comment_edits.go:long-hex

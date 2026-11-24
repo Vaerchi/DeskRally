@@ -1,3 +1,5 @@
+//go:build cpdev
+
 // Command cpthemefixture is a TEST-ONLY control-plane HTTP server for the hostname-theming browser e2e
 // (docs/66 stage 2: web/viewer/e2e/join_brand_host.spec.ts).
 //

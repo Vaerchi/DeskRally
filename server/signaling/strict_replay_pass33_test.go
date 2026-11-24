@@ -103,7 +103,7 @@ func p33StartFixture(t *testing.T) string {
 	t.Helper()
 	bin := p33FixtureBin()
 	if _, err := os.Stat(bin); err != nil {
-		t.Fatalf("cptestfixture binary not found at %s — build with: go build -o cptestfixture.exe ./cmd/cptestfixture (in control-plane/)", bin)
+		t.Fatalf("cptestfixture binary not found at %s — build with: go build -tags cpdev -o cptestfixture.exe ./cmd/cptestfixture (in control-plane/)", bin)
 	}
 	cmd := exec.Command(bin)
 	cmd.Env = append(os.Environ(),
@@ -487,7 +487,7 @@ func TestPass33_RealCP_InvalidTicketsNeverReachCP(t *testing.T) {
 func TestPass33_RealCP_StrictModeRefusesOnCPDown(t *testing.T) {
 	// Fail if the fixture binary is absent: a missing binary is a build defect, not a skip condition.
 	if _, err := os.Stat(p33FixtureBin()); err != nil {
-		t.Fatalf("cptestfixture binary not found at %s — build with: go build -o cptestfixture.exe ./cmd/cptestfixture (in control-plane/)", p33FixtureBin())
+		t.Fatalf("cptestfixture binary not found at %s — build with: go build -tags cpdev -o cptestfixture.exe ./cmd/cptestfixture (in control-plane/)", p33FixtureBin())
 	}
 	key := newP33Issuer(t)
 

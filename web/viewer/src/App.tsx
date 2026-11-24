@@ -16,7 +16,7 @@ import type { MonitorCanvas } from "./lib/monitor_canvas";
  */
 
 import { MenuSection, ToolbarMenu } from "./components/ToolbarMenu";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   AccessPanel,
   DEFAULT_SIGNALING_URL,
@@ -37,33 +37,14 @@ import { JoinPage } from "./components/JoinPage";
 import { LoginForm } from "./components/LoginForm";
 import { SsoTotpForm } from "./components/SsoTotpForm";
 import { MachinesPanel } from "./components/MachinesPanel";
-import { SessionsPanel } from "./components/SessionsPanel";
-import { AuditPanel } from "./components/AuditPanel";
 import { NotificationBell } from "./components/NotificationBell";
 import { useAuditNotifications } from "./lib/use_audit_notifications";
 import { readThemePreference, saveThemePreference, type ThemePreference } from "./lib/theme";
 import { chromeMode, parseSessionChrome, SESSION_CHROME_KEY, type SessionChromePref } from "./lib/session_chrome";
-import { ReportsPanel } from "./components/ReportsPanel";
-import { RecordingsPanel } from "./components/RecordingsPanel";
-import { PlatformPanel } from "./components/PlatformPanel";
-import { ToolboxPanel } from "./components/ToolboxPanel";
 import { BrokeredSessionCore } from "./lib/brokered_session_core";
 import { RunReceiptSession } from "./lib/run_receipt_relay";
 import { runToolboxScript } from "./lib/toolbox_run";
-import { TenantSecurityPanel } from "./components/TenantSecurityPanel";
-import { DynamicGroupsPanel } from "./components/DynamicGroupsPanel";
-import { SitesPanel } from "./components/SitesPanel";
-import { MachineGroupsPanel } from "./components/MachineGroupsPanel";
-import { APITokensPanel } from "./components/APITokensPanel";
-import { EnrollmentTokensPanel } from "./components/EnrollmentTokensPanel";
-import { WebhooksPanel } from "./components/WebhooksPanel";
-import { FieldsPanel } from "./components/FieldsPanel";
 import type { MeCapability } from "./lib/fleet_directives";
-import { AppearancePanel } from "./components/AppearancePanel";
-import { UsersPanel } from "./components/UsersPanel";
-import { RolesPanel } from "./components/RolesPanel";
-import { MyAccountPanel } from "./components/MyAccountPanel";
-import { HelpPanel } from "./components/HelpPanel";
 import { isSamePath, shouldAdoptListing } from "./lib/filepath";
 import type { BrowseUploadRow } from "./components/FileManagerPanel";
 import { parseGrantCapabilities } from "./lib/grant";
@@ -297,6 +278,32 @@ import { ConsoleAreaBar } from "./components/ConsoleAreaBar";
 import { AppMenu } from "./components/AppMenu";
 import { TransferBanner } from "./components/TransferBanner";
 import { allowedBeforeBinding, createConsoleKey, runConsoleBinding, type BindingStatus } from "./lib/session_binding";
+
+// Console pages outside the core access path load on first use (outside review, 2026-11-23): the shell, the
+// machine list, Support and the session viewer stay in the first-load bundle, which the build budget
+// (scripts/check-bundle-budget.mjs) keeps from regrowing. One <Suspense> wraps the page area below.
+const SessionsPanel = lazy(() => import("./components/SessionsPanel").then((m) => ({ default: m.SessionsPanel })));
+const AuditPanel = lazy(() => import("./components/AuditPanel").then((m) => ({ default: m.AuditPanel })));
+const ReportsPanel = lazy(() => import("./components/ReportsPanel").then((m) => ({ default: m.ReportsPanel })));
+const RecordingsPanel = lazy(() => import("./components/RecordingsPanel").then((m) => ({ default: m.RecordingsPanel })));
+const PlatformPanel = lazy(() => import("./components/PlatformPanel").then((m) => ({ default: m.PlatformPanel })));
+const ToolboxPanel = lazy(() => import("./components/ToolboxPanel").then((m) => ({ default: m.ToolboxPanel })));
+const TenantSecurityPanel = lazy(() => import("./components/TenantSecurityPanel").then((m) => ({ default: m.TenantSecurityPanel })));
+const DynamicGroupsPanel = lazy(() => import("./components/DynamicGroupsPanel").then((m) => ({ default: m.DynamicGroupsPanel })));
+const SitesPanel = lazy(() => import("./components/SitesPanel").then((m) => ({ default: m.SitesPanel })));
+const MachineGroupsPanel = lazy(() => import("./components/MachineGroupsPanel").then((m) => ({ default: m.MachineGroupsPanel })));
+const APITokensPanel = lazy(() => import("./components/APITokensPanel").then((m) => ({ default: m.APITokensPanel })));
+const EnrollmentTokensPanel = lazy(() => import("./components/EnrollmentTokensPanel").then((m) => ({ default: m.EnrollmentTokensPanel })));
+const WebhooksPanel = lazy(() => import("./components/WebhooksPanel").then((m) => ({ default: m.WebhooksPanel })));
+const FieldsPanel = lazy(() => import("./components/FieldsPanel").then((m) => ({ default: m.FieldsPanel })));
+const AppearancePanel = lazy(() => import("./components/AppearancePanel").then((m) => ({ default: m.AppearancePanel })));
+const UsersPanel = lazy(() => import("./components/UsersPanel").then((m) => ({ default: m.UsersPanel })));
+const RolesPanel = lazy(() => import("./components/RolesPanel").then((m) => ({ default: m.RolesPanel })));
+const MyAccountPanel = lazy(() => import("./components/MyAccountPanel").then((m) => ({ default: m.MyAccountPanel })));
+const HelpPanel = lazy(() => import("./components/HelpPanel").then((m) => ({ default: m.HelpPanel })));
+
+// How often the machine list refreshes in the background while the console is visible (see the fleetTick effect).
+const FLEET_REFRESH_MS = 30_000;
 
 /** Present the agent's `MonitorDesc` list to the Viewer's picker (adds a human label). */
 function toMonitorInfo(list: MonitorDesc[]): MonitorInfo[] {
@@ -741,6 +748,7 @@ export default function App() {
     }
   }, [authGate]);
   const [fleetEpoch, setFleetEpoch] = useState(0);
+  const [fleetTick, setFleetTick] = useState(0);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -789,7 +797,26 @@ export default function App() {
     };
     // fleetEpoch re-runs this after a successful login. Without it the effect's [] deps left the
     // machine list empty until a full page reload — you could log in and still see nothing.
-  }, [fleetEpoch, authSession]);
+    // fleetTick re-runs it in the background (below), so a machine installed while the console is open appears.
+  }, [fleetEpoch, fleetTick, authSession]);
+
+  // 2026-11-23: a newly installed machine never appeared until a reload, because the list loaded only at sign-in.
+  // Refresh every FLEET_REFRESH_MS while the console is visible and signed in, and at once when it becomes visible
+  // again (a phone returning from the background, a tab switched back to).
+  useEffect(() => {
+    if (authGate !== "open") return;
+    const bump = () => {
+      if (document.visibilityState === "visible") setFleetTick((n) => n + 1);
+    };
+    const timer = window.setInterval(bump, FLEET_REFRESH_MS);
+    document.addEventListener("visibilitychange", bump);
+    window.addEventListener("focus", bump);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", bump);
+      window.removeEventListener("focus", bump);
+    };
+  }, [authGate]);
 
   // Per-tenant branding / white-label (docs/01 §9): apply the tenant's product name to the document
   // title and its accent to the `--accent` CSS variable (the whole console reads that variable). An
@@ -3370,7 +3397,9 @@ export default function App() {
             onClick={() => setHelpOpen(false)} aria-label="Close help">
             ✕ Close
           </button>
-          <HelpPanel />
+          <Suspense fallback={<div className="panel__hint" role="status" data-testid="page-loading">Loading…</div>}>
+            <HelpPanel />
+          </Suspense>
         </aside>
       )}
 
@@ -3433,32 +3462,34 @@ export default function App() {
           )}
           {area === "machines" && <MachinesPanel api={consoleApiRef.current}
             onConnect={(machine) => handleConnectFromList(asDeviceId(machine.device_id), machine.name || machine.device_id, DEFAULT_SIGNALING_URL, machine.alias || undefined)} />}
-          {area === "sessions" && <SessionsPanel api={consoleApiRef.current} onOpenRecording={recordingsAllowed ? (id) => { setOpenRecordingId(id); setArea("recordings"); } : undefined} />}
-          {area === "audit" && <AuditPanel api={consoleApiRef.current} />}
-          {area === "recordings" && recordingsAllowed && <RecordingsPanel api={consoleApiRef.current} initialRecordingId={openRecordingId} />}
-          {area === "reports" && <ReportsPanel api={consoleApiRef.current} />}
-          {area === "platform" && platformOperator && <PlatformPanel api={consoleApiRef.current} />}
-          {area === "toolbox" && <ToolboxPanel api={consoleApiRef.current} openBulkCore={(label, bulkId) => (device, signal) => BrokeredSessionCore.open(device, {
-            api: consoleApiRef.current,
-            authSession,
-          }, { signal, note: `Bulk run ${bulkId}: ${label}` })} />}
-          {area === "security" && <TenantSecurityPanel api={consoleApiRef.current} />}
-          {area === "sites" && <SitesPanel api={consoleApiRef.current} />}
-          {area === "groups" && <DynamicGroupsPanel api={consoleApiRef.current} />}
-          {area === "machinegroups" && <MachineGroupsPanel api={consoleApiRef.current} />}
-          {area === "apitokens" && <APITokensPanel api={consoleApiRef.current} />}
-          {area === "enrollment" && <EnrollmentTokensPanel api={consoleApiRef.current} />}
-          {area === "webhooks" && <WebhooksPanel api={consoleApiRef.current} />}
-          {area === "fields" && areaVisible(area, heldCaps, capabilityScopes) && (
-            <FieldsPanel api={consoleApiRef.current} canViewMachines={heldCaps?.has("view_machines") === true} />
-          )}
-          {area === "appearance" && (
-            <AppearancePanel api={consoleApiRef.current} onSaved={applyBranding} />
-          )}
-          {area === "users" && <UsersPanel api={consoleApiRef.current} />}
-          {area === "roles" && <RolesPanel api={consoleApiRef.current} />}
-          {area === "account" && <MyAccountPanel api={consoleApiRef.current} />}
-          {area === "help" && <HelpPanel />}
+          <Suspense fallback={<div className="panel__hint" role="status" data-testid="page-loading">Loading…</div>}>
+            {area === "sessions" && <SessionsPanel api={consoleApiRef.current} onOpenRecording={recordingsAllowed ? (id) => { setOpenRecordingId(id); setArea("recordings"); } : undefined} />}
+            {area === "audit" && <AuditPanel api={consoleApiRef.current} />}
+            {area === "recordings" && recordingsAllowed && <RecordingsPanel api={consoleApiRef.current} initialRecordingId={openRecordingId} />}
+            {area === "reports" && <ReportsPanel api={consoleApiRef.current} />}
+            {area === "platform" && platformOperator && <PlatformPanel api={consoleApiRef.current} />}
+            {area === "toolbox" && <ToolboxPanel api={consoleApiRef.current} openBulkCore={(label, bulkId) => (device, signal) => BrokeredSessionCore.open(device, {
+              api: consoleApiRef.current,
+              authSession,
+            }, { signal, note: `Bulk run ${bulkId}: ${label}` })} />}
+            {area === "security" && <TenantSecurityPanel api={consoleApiRef.current} />}
+            {area === "sites" && <SitesPanel api={consoleApiRef.current} />}
+            {area === "groups" && <DynamicGroupsPanel api={consoleApiRef.current} />}
+            {area === "machinegroups" && <MachineGroupsPanel api={consoleApiRef.current} />}
+            {area === "apitokens" && <APITokensPanel api={consoleApiRef.current} />}
+            {area === "enrollment" && <EnrollmentTokensPanel api={consoleApiRef.current} />}
+            {area === "webhooks" && <WebhooksPanel api={consoleApiRef.current} />}
+            {area === "fields" && areaVisible(area, heldCaps, capabilityScopes) && (
+              <FieldsPanel api={consoleApiRef.current} canViewMachines={heldCaps?.has("view_machines") === true} />
+            )}
+            {area === "appearance" && (
+              <AppearancePanel api={consoleApiRef.current} onSaved={applyBranding} />
+            )}
+            {area === "users" && <UsersPanel api={consoleApiRef.current} />}
+            {area === "roles" && <RolesPanel api={consoleApiRef.current} />}
+            {area === "account" && <MyAccountPanel api={consoleApiRef.current} />}
+            {area === "help" && <HelpPanel />}
+          </Suspense>
           {area === "live" && session && (
             <div className="app__session">
               {transferDialogOpen && brokeredSessionRef.current && (

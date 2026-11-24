@@ -2154,7 +2154,7 @@ $env:SIGNALING_ALLOWED_ORIGINS='*'   # LAB ONLY: signaling refuses to start with
 servers/signaling.exe -addr :8080
 servers/relay.exe -tcp :9000 -ws :9001
 # control-plane in dev mode (no DB); production sets DATABASE_URL + applies servers/migrations
-servers/controlplane.exe            # dev/in-memory; GET /grant/pubkey works for agent provisioning
+servers/controlplane.exe            # production build: needs DATABASE_URL (dev/in-memory mode needs a `go build -tags cpdev` binary)
 ```
 Then install the agent on a target (see `agent/README.md`) and open the viewer.
 

@@ -237,7 +237,12 @@ test("Disconnect while recovery authorization is pending ignores its late approv
 });
 test("denied replacement session stops recovery without direct-connect fallback",async({page})=> {
  await fixture(page);let attempts=0;
- await page.route("**/cp/sessions",async route=> {attempts++;await route.fulfill({status:403,json:{error:"access revoked"}});});
+ // Count only session STARTS (POST). GET /cp/sessions is the machine list's live-session read, which now refreshes
+ // in the background every 30 s (2026-11-23) and is not a reconnect attempt.
+ await page.route("**/cp/sessions",async route=> {
+  if(route.request().method()!=="POST")return route.fallback();
+  attempts++;await route.fulfill({status:403,json:{error:"access revoked"}});
+ });
  await page.evaluate(()=>(window as any).peers[0].fail());await page.clock.runFor(2000);
  await expect(page.getByTestId("viewer-recovery")).toContainText("Reconnect refused");
  await page.clock.runFor(120000);expect(attempts).toBe(1);

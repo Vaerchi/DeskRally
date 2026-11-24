@@ -1026,27 +1026,4 @@ func writeDenied(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 }
 
-// -------------------------------------------------------------------------------------
-// StubAuthenticator — a placeholder Authenticator so the skeleton runs end-to-end before
-// the Zitadel/OIDC integration exists. It returns a fixed Principal. DO NOT ship this.
-// -------------------------------------------------------------------------------------
-
-// StubAuthenticator returns the same Principal for every request. Wire it only in dev.
-type StubAuthenticator struct {
-	Principal *Principal
-}
-
-// Authenticate implements Authenticator. TODO(auth): replace with real OIDC/session — see
-// the authMiddleware TODO for the required steps.
-func (a StubAuthenticator) Authenticate(_ *http.Request) (*Principal, error) {
-	return a.Principal, nil
-}
-
-// NoopBinder is a TenantBinder that does nothing (no DB in DEV mode / pure-RBAC tests). The
-// real binder is PgBinder (binder.go), which pins app.current_tenant on a pooled connection.
-type NoopBinder struct{}
-
-// BindTenant implements TenantBinder.
-func (NoopBinder) BindTenant(ctx context.Context, _ string) (context.Context, func(), error) {
-	return ctx, nil, nil
-}
+// StubAuthenticator and NoopBinder are dev-only and live in devstubs.go (build tag cpdev).

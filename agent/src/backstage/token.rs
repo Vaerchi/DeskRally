@@ -79,6 +79,9 @@ impl Drop for EnvironmentBlock {
 pub enum TokenError {
     #[error("no user is logged into the active console session")]
     NoInteractiveUser,
+    /// The identity is not implemented yet. A typed refusal, never a panic (outside review, 2026-11-23).
+    #[error("launching as {0} is not supported")]
+    Unsupported(&'static str),
     #[error("windows API {api} failed: {source}")]
     Api { api: &'static str, source: windows::core::Error },
 }
@@ -95,14 +98,14 @@ pub fn acquire(identity: &Identity) -> Result<LaunchToken, TokenError> {
             // The service already holds a LocalSystem token; duplicate the current process
             // token to a primary token the child can use.
             // Left as a focused follow-up: OpenProcessToken(GetCurrentProcess()) + DuplicateTokenEx.
-            unimplemented!("duplicate current process (LocalSystem) token — see acquire() docs")
+            Err(TokenError::Unsupported("LocalSystem"))
         }
         Identity::LoggedInUser => acquire_logged_in_user(),
         Identity::Credential { .. } => {
             // TODO(security-review): LogonUserW(LOGON32_LOGON_BATCH) -> DuplicateTokenEx.
             // Gate behind Capability::ShellAsCredential + typed confirmation + CredentialUse
             // audit event. Zeroize the password buffer immediately after LogonUserW returns.
-            unimplemented!("supplied-credential logon — deliberately unimplemented pending review")
+            Err(TokenError::Unsupported("supplied credentials"))
         }
     }
 }

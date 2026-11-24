@@ -1,3 +1,5 @@
+//go:build cpdev
+
 // Command cptestfixture is a TEST-ONLY control-plane HTTP server for e2e tests that
 // require real authentication (SessionAuthenticator + AuthService) instead of the dev-mode
 // StubAuthenticator.

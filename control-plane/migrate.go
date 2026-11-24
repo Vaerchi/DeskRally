@@ -481,7 +481,7 @@ func migrate(ctx context.Context, pool migrateDB, dir string, opts MigrateOption
 	// base. Checked across the whole set first so the error names the problem rather than appearing
 	// halfway through a run.
 	for _, f := range files {
-		if want, ok := applied[f.Name]; ok && want != f.SHA256 {
+		if want, ok := applied[f.Name]; ok && want != f.SHA256 && !isReviewedCommentOnlyEdit(f.Name, want, f.SHA256) {
 			return rep, fmt.Errorf(
 				"migration %s has CHANGED since it was applied (recorded sha256 %s, on disk %s). "+
 					"The database and this checkout disagree about what has run; applying more on "+

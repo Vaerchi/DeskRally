@@ -272,7 +272,7 @@ jobs:
 
       - name: Build authenticated control-plane fixture for signaling tests
         working-directory: control-plane
-        run: go build -o cptestfixture ./cmd/cptestfixture
+        run: go build -tags cpdev -o cptestfixture ./cmd/cptestfixture
 
       - name: Test signaling
         working-directory: server/signaling

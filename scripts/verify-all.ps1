@@ -468,7 +468,9 @@ if (-not $SkipBuild) {
   foreach ($b in $goBuilds) {
     Write-Host ("  go build {0}..." -f $b.Name) -ForegroundColor DarkGray
     Push-Location $b.Dir
-    & go build -o $b.Out $b.Target
+    # -tags cpdev: the gate runs the control plane in insecure dev mode, which only tagged builds contain
+    # (control-plane/devstubs.go). Production builds (Dockerfile, build-release, native packages) omit it.
+    & go build -tags cpdev -o $b.Out $b.Target
     $bc = $LASTEXITCODE
     Pop-Location
     if ($bc -ne 0) { throw ("go build {0} failed (exit {1})" -f $b.Name, $bc) }

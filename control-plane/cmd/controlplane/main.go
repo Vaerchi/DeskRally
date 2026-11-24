@@ -704,6 +704,11 @@ func main() {
 	if derr != nil {
 		log.Fatalf("startup: %v", derr)
 	}
+	if decision.Mode == controlplane.ModeInsecureDev && !insecureDevCompiled {
+		log.Fatalf("startup: %s=1, but this is a production build: the stub authenticator and no-op binder "+
+			"are compiled only with `go build -tags cpdev`. Build a dev binary for local demos and tests",
+			controlplane.EnvInsecureDev)
+	}
 	for _, w := range decision.Warnings {
 		log.Printf("%s", w)
 	}
@@ -1112,9 +1117,9 @@ func main() {
 		srv = controlplane.NewServer(
 			&controlplane.APITokenAuthenticator{
 				Tokens: devAPITokens,
-				Next:   controlplane.StubAuthenticator{Principal: principal},
+				Next:   devStubAuthenticator(principal),
 			},
-			controlplane.NoopBinder{})
+			devNoopBinder())
 		srv.APITokens = devAPITokens
 		srv.Audit = controlplane.NewInMemoryAuditStore()
 		srv.Grants = grants
@@ -1434,6 +1439,11 @@ func main() {
 	})
 
 	log.Printf("control-plane: grant_issuer_pubkey=%s", grants.PublicKeyHex())
+
+	// Last check before serving: judge what was WIRED, not just what was declared (devstub_guard.go).
+	if werr := controlplane.CheckServingWiring(srv, decision.Mode == controlplane.ModeInsecureDev, dbURL); werr != nil {
+		log.Fatalf("startup: %v", werr)
+	}
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

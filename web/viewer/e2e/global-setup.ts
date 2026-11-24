@@ -65,7 +65,9 @@ export default function globalSetup(): void {
     // UNCONDITIONAL. `go build` is incremental and content-addressed, so this is a no-op when nothing
     // changed and a real rebuild when something did — which is the entire point. Do not reintroduce an
     // existsSync guard here: "the file is present" says nothing about which source produced it.
-    execFileSync("go", ["build", "-o", exe, target], { cwd: dir, stdio: "inherit" });
+    // -tags cpdev: the e2e servers run in insecure dev mode, whose stub authenticator and no-op binder are compiled only
+    // into tagged builds (control-plane/devstubs.go); production builds leave them out. Harmless for signaling.
+    execFileSync("go", ["build", "-tags", "cpdev", "-o", exe, target], { cwd: dir, stdio: "inherit" });
     const after = statSync(exe).mtimeMs;
     const ms = Date.now() - started;
     // Log whether the binary actually CHANGED. On a run that is meant to exercise a Go change, seeing
