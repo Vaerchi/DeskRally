@@ -27,7 +27,15 @@ export interface LocalFolderPaneProps {
 }
 
 export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshKey = 0, folderAccess, pick }: LocalFolderPaneProps) {
-  const supported = folderAccess ?? supportsFolderAccess();
+  // The window this pane is drawn in. In the Under the Hood POP-OUT that is not `globalThis` (the opener): the picker
+  // must be asked of the window the click happened in, or it is refused for lack of user activation (live bug
+  // 2026-11-25: NotAllowedError from "Choose a folder").
+  const sectionRef = useRef<HTMLElement>(null);
+  const ownerWindow = () => sectionRef.current?.ownerDocument.defaultView ?? globalThis;
+  // A window that refuses folder access (the pop-out in some browsers, an embedded browser such as the desktop app)
+  // falls back to the file picker for the rest of this pane's life.
+  const [refused, setRefused] = useState(false);
+  const supported = !refused && (folderAccess ?? supportsFolderAccess());
   const navRef = useRef<LocalFolderNav | null>(null);
   const [label, setLabel] = useState<string | null>(null);
   const [atRoot, setAtRoot] = useState(true);
@@ -58,11 +66,16 @@ export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshK
 
   const choose = async () => {
     try {
-      const root = await (pick ?? (() => pickLocalFolder()))();
+      const root = await (pick ?? (() => pickLocalFolder(ownerWindow())))();
       navRef.current = new LocalFolderNav(root);
       await relist();
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return; // the technician cancelled
+      if (e instanceof DOMException && (e.name === "NotAllowedError" || e.name === "SecurityError")) {
+        setRefused(true); // this window will not open folders: offer the file picker instead, with the reason
+        setError(null);
+        return;
+      }
       setError(e instanceof Error ? e.message : String(e));
     }
   };
@@ -103,11 +116,12 @@ export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshK
 
   if (!supported) {
     return (
-      <section className="explorer__pane" data-testid="local-pane" aria-label="This computer">
+      <section ref={sectionRef} className="explorer__pane" data-testid="local-pane" aria-label="This computer">
         <h4 className="explorer__title">This computer</h4>
-        <p className="panel__hint">
-          This browser cannot open a folder on your computer (Chrome and Edge can). Send picks files here, and Get
-          saves through the browser&apos;s download.
+        <p className="panel__hint" data-testid="local-no-folder-access">
+          {refused
+            ? "This window is not allowed to open a folder on your computer (this happens in the Under the Hood pop-out and in some embedded browsers). You can still send files with Choose files, and Get saves through the download. To use a folder, open Under the Hood in the main Chrome or Edge window."
+            : "This browser cannot open a folder on your computer (Chrome and Edge can). Send picks files here, and Get saves through the browser's download."}
         </p>
         {onSend && (
           <>
@@ -128,7 +142,7 @@ export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshK
   }
 
   return (
-    <section className="explorer__pane" data-testid="local-pane" aria-label="This computer">
+    <section ref={sectionRef} className="explorer__pane" data-testid="local-pane" aria-label="This computer">
       <h4 className="explorer__title">This computer</h4>
       <div className="explorer__bar">
         <button type="button" className="panel__action" onClick={() => void choose()} data-testid="local-choose">

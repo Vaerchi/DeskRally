@@ -84,6 +84,9 @@ static constexpr UINT WM_APP_BROWSER_DIED  = WM_APP + 6;
 // WM_APP+7: a tab's creation failed (wParam = tab id, lParam = TabFailure). Handled in the window
 // procedure, never inside the controller-creation callback.
 static constexpr UINT WM_APP_TAB_CREATE_FAILED = WM_APP + 7;
+// WM_APP+8: Esc / Shift+Esc caught by the full-screen keyboard hook (wParam = drtabs::EscAction, lParam bit 0 =
+// key down, bit 1 = repeat). Acted on here, never inside the hook (which must return at once).
+static constexpr UINT WM_APP_FS_ESC = WM_APP + 8;
 enum TabFailure : LPARAM { kFailController = 1, kFailInterface, kFailSecurity, kFailDisplay };
 enum TabCommand : WPARAM { kTabNew = 1, kTabCloseActive, kTabCloseId, kTabNext, kTabPrev, kTabSelect, kTabLast };
 // Timer that looks for this organization's sign-in cookie until it is recorded.
@@ -150,7 +153,7 @@ static constexpr wchar_t kSmokeVirtualHost[] = L"deskrally-smoke.test";
 static constexpr wchar_t kSmokeTestUrl[]     = L"https://deskrally-smoke.test/index.html";
 // 7 fixture tests + 4 tab tests + 10 lifetime/failure tests + 2 remembered-consent tests
 // + 5 full-screen tests (SmokeTabTick).
-static constexpr int     kSmokeExpectedTests = 28;
+static constexpr int     kSmokeExpectedTests = 30;
 static int               g_smokeLateControllersClosed = 0;
 static constexpr int     kSmokeFixtureTests = 7;
 static constexpr UINT_PTR kSmokeTabTimerId = 30;
@@ -239,11 +242,15 @@ struct WindowState {
     EventRegistrationToken tok_web_msg{};
 #endif
 
-    bool ShowClipboardConsentDialog(const std::wstring& origin) const {
-        const std::wstring text = L"The DeskRally web app at " + origin +
-            L" is requesting clipboard read access.\n\nAllow this clipboard read?";
+    bool ShowClipboardConsentDialog(const std::wstring& origin, bool files = false) const {
+        const std::wstring text = files
+            ? L"The DeskRally web app at " + origin +
+              L" is asking to read and change files in a folder or file on this computer (Under the Hood file"
+              L" transfer). If you did not just choose a folder, answer No.\n\nAllow read and write access to it?"
+            : L"The DeskRally web app at " + origin +
+              L" is requesting clipboard read access.\n\nAllow this clipboard read?";
         int r = MessageBoxW(hwnd, text.c_str(),
-            L"DeskRally \x2013 Clipboard Access",
+            files ? L"DeskRally \x2013 Folder Access" : L"DeskRally \x2013 Clipboard Access",
             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
         return r == IDYES;
     }
@@ -256,6 +263,7 @@ struct ClipboardConsentCtx {
     ComPtr<ICoreWebView2Deferral>                        deferral;
     uint64_t                                            generation;
     std::wstring                                        origin;  // validated requesting origin, shown in the dialog
+    bool                                                files = false;   // File System Access read/write, not clipboard
     bool                                                settled = false; // the deferral has been completed
 };
 // The process's ONE consent manager (docs-tabs-design.md v2 + Codex impl review): every clipboard
@@ -968,6 +976,19 @@ static void CreateChildPopupWindow(std::shared_ptr<WindowState> parent,
                                    ComPtr<ICoreWebView2NewWindowRequestedEventArgs> args,
                                    uint64_t openerTabId);
 
+// WebView2's permission kind -> the policy's (client_policy.h decides; anything unlisted is Other = Deny).
+static drpolicy::PermKind PermKindOf(COREWEBVIEW2_PERMISSION_KIND kind) {
+    switch (kind) {
+    case COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ:   return drpolicy::PermKind::ClipboardRead;
+    case COREWEBVIEW2_PERMISSION_KIND_MICROPHONE:       return drpolicy::PermKind::Microphone;
+    case COREWEBVIEW2_PERMISSION_KIND_CAMERA:           return drpolicy::PermKind::Camera;
+    case COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION:      return drpolicy::PermKind::Geolocation;
+    case COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS:    return drpolicy::PermKind::Notifications;
+    case COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE:  return drpolicy::PermKind::FileReadWrite;
+    default:                                            return drpolicy::PermKind::Other;
+    }
+}
+
 // ── Clipboard consent – deferred dispatch to avoid WebView2 reentrancy ─────
 // Takes the request BY VALUE: Complete() can re-enter (WebView2 runs callbacks that queue, pump or
 // tear down), so nothing here may refer into g_consentQueue or g_consentActive across the COM calls.
@@ -1018,7 +1039,11 @@ static void PumpConsents() {
         g_consentQueue.pop_front();
         if (!req || req->settled) continue;
         if (!ConsentStillValid(req)) { SettleConsent(req, false); continue; }
-        if (const auto known = g_consentAnswers.find(req->origin); known != g_consentAnswers.end()) {
+        // Clipboard: one answer per origin per run. Folder read/write is NEVER remembered: each request (in
+        // practice one per "Choose a folder") asks, so a Yes covers only the folder just picked (review
+        // 2026-11-25: a remembered Yes would also cover dropped files and restored handles).
+        const std::wstring answerKey = L"clipboard|" + req->origin;
+        if (const auto known = g_consentAnswers.find(answerKey); !req->files && known != g_consentAnswers.end()) {
             SettleConsent(req, known->second);
             continue;
         }
@@ -1027,12 +1052,12 @@ static void PumpConsents() {
 #ifdef SMOKE_TEST
         granted = g_smokeConsentAnswer ? g_smokeConsentAnswer(req) : false;
 #else
-        granted = req->state->ShowClipboardConsentDialog(req->origin);
+        granted = req->state->ShowClipboardConsentDialog(req->origin, req->files);
 #endif
         // Still the active request while it settles (a teardown re-entering from Complete() finds it
         // settled); `req` owns it whatever the callbacks do to the globals.
         const bool stillValid = ConsentStillValid(req);
-        if (stillValid) g_consentAnswers[req->origin] = granted;
+        if (stillValid && !req->files) g_consentAnswers[answerKey] = granted;
         SettleConsent(req, granted && stillValid);
         g_consentActive.reset();
     }
@@ -1280,6 +1305,111 @@ static void ReleaseDetachedMenu(WindowState& frame) {
     frame.restore_menu = nullptr;
 }
 
+// Esc in full screen (tab_policy.h fullscreen_escape). WebView2 has no keyboard lock and leaves full screen on a
+// hardware Esc BEFORE AcceleratorKeyPressed can stop it (measured on the smoke VM 2026-11-25: neither Handled nor
+// IsBrowserAcceleratorKeyEnabled(FALSE) keeps it full screen). So while a main window is full screen on a trusted
+// page, a low-level keyboard hook takes Esc - and only Esc, and only while that window is in the foreground - before
+// the browser sees it: plain Esc is handed to the page (the viewer sends it to the remote), Shift+Esc leaves full
+// screen. Every other key passes untouched; the hook exists only while full screen.
+static HHOOK g_escHook = nullptr;
+static HWND  g_escHookHwnd = nullptr;
+static bool  g_escHeld = false;
+// An Esc key-down handed to the page: its key-up is handed over too, whatever the modifiers are by then (review
+// SEC-004: no Esc left held on the remote).
+static bool  g_escDelivered = false;
+// Shift+Esc pressed: the hook stays OFF until this full screen ends, so if the page does not let go (hung renderer,
+// a page that overrides exitFullscreen) a plain Esc exits natively - the app never depends on the page (SEC-001).
+static bool  g_escSuspended = false;
+
+static LRESULT CALLBACK FullscreenEscHook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && g_escHookHwnd) {
+        const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+       if (kb->vkCode == VK_ESCAPE && GetForegroundWindow() == g_escHookHwnd) {
+            drtabs::KeyInput k;
+            k.vk = VK_ESCAPE;
+            k.key_down = wp == WM_KEYDOWN;
+            k.system_key = wp == WM_SYSKEYDOWN || wp == WM_SYSKEYUP;
+            k.repeat = k.key_down && g_escHeld;
+            k.ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            k.shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            k.alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 || (kb->flags & LLKHF_ALTDOWN) != 0;
+            k.win = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+            if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) g_escHeld = true; else g_escHeld = false;
+            drtabs::EscAction act = drtabs::fullscreen_escape(k, true);
+            const bool isUp = wp == WM_KEYUP || wp == WM_SYSKEYUP;
+            if (isUp && g_escDelivered) act = drtabs::EscAction::ToPage;
+            if (act == drtabs::EscAction::ToPage) g_escDelivered = k.key_down;
+            if (act != drtabs::EscAction::None &&
+                PostMessageW(g_escHookHwnd, WM_APP_FS_ESC, static_cast<WPARAM>(act),
+                             (k.key_down ? 1 : 0) | (k.repeat ? 2 : 0)))
+                return 1;  // swallowed: the browser never sees it
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+static void StopEscHook(HWND hwnd) {
+    if (g_escHook && (hwnd == nullptr || hwnd == g_escHookHwnd)) {
+        // An Esc the page saw go down gets its release now (Shift pressed while held, focus lost, full screen
+        // ended): never leave Esc held on the remote. Bit 2 = a release on stop, delivered even out of full screen.
+        if (g_escDelivered && g_escHookHwnd)
+            PostMessageW(g_escHookHwnd, WM_APP_FS_ESC, static_cast<WPARAM>(drtabs::EscAction::ToPage), 4);
+        UnhookWindowsHookEx(g_escHook);
+        g_escHook = nullptr;
+        g_escHookHwnd = nullptr;
+        g_escHeld = false;
+        g_escDelivered = false;
+    }
+}
+
+// Is the page shown in this full-screen main window our own console (the selected tenant)?
+static bool ShownPageTrusted(const std::shared_ptr<WindowState>& frame) {
+    auto shown = ActiveTab(frame);
+    if (!shown || !shown->webview) return false;
+    LPWSTR src = nullptr;
+    if (FAILED(shown->webview->get_Source(&src)) || !src) return false;
+    const bool ok = drpolicy::check_navigation(WideToUtf8(src), shown->selectedTenant) == drpolicy::NavResult::Allow;
+    CoTaskMemFree(src);
+    return ok;
+}
+
+static void UpdateEscHook(const std::shared_ptr<WindowState>& frame) {
+    if (!frame || frame->is_popup) return;
+    if (!frame->fullscreen) g_escSuspended = false;  // the next full screen gets the hook again
+    const bool want = frame->fullscreen && !frame->closing && frame->hwnd && !g_escSuspended && ShownPageTrusted(frame);
+    if (!want) { StopEscHook(frame->hwnd); return; }
+    if (g_escHook && g_escHookHwnd == frame->hwnd) return;
+    StopEscHook(nullptr);  // one hook, for the one full-screen window
+    g_escHook = SetWindowsHookExW(WH_KEYBOARD_LL, FullscreenEscHook, GetModuleHandleW(nullptr), 0);
+    if (g_escHook) g_escHookHwnd = frame->hwnd;
+}
+
+// The hook's key, acted on from the message loop.
+static void HandleFullscreenEsc(const std::shared_ptr<WindowState>& frame, WPARAM act, LPARAM flags) {
+#ifdef SMOKE_TEST
+    SmokeLog("[smoke] esc hook -> act=%d flags=%d fullscreen=%d\n", (int)act, (int)flags, (int)(frame && frame->fullscreen));
+#endif
+    if (!frame || (!frame->fullscreen && !(flags & 4))) return;
+    if (act != static_cast<WPARAM>(drtabs::EscAction::ToPage) &&
+        act != static_cast<WPARAM>(drtabs::EscAction::ExitFullscreen)) return;  // SEC-006: only the hook's values
+    auto t = ActiveTab(frame);
+    if (!t || !t->webview) return;
+    // The page may have changed since the hook was installed (SEC-002): never hand a key to an untrusted page.
+    if (!ShownPageTrusted(frame)) { StopEscHook(frame->hwnd); return; }
+    if (static_cast<drtabs::EscAction>(act) == drtabs::EscAction::ExitFullscreen) {
+        if (!(flags & 1)) return;
+        g_escSuspended = true;
+        StopEscHook(frame->hwnd);  // from here a real Esc exits natively, whatever the page does (SEC-001)
+        t->webview->ExecuteScript(L"document.exitFullscreen()", nullptr);
+        return;
+    }
+    const std::wstring script = std::wstring(
+        L"(function(){var t=document.activeElement||document.body;if(t)t.dispatchEvent(new KeyboardEvent('") +
+        ((flags & 1) ? L"keydown" : L"keyup") + L"',{key:'Escape',code:'Escape',keyCode:27,which:27,repeat:" +
+        ((flags & 2) ? L"true" : L"false") + L",bubbles:true,cancelable:true,composed:true,view:window}));})()";
+    t->webview->ExecuteScript(script.c_str(), nullptr);
+}
+
 static void SyncFullscreen(const std::shared_ptr<WindowState>& frame) {
     if (!frame || frame->closing || !frame->hwnd || frame->is_tab) return;
     auto shown = frame->is_popup ? frame : ActiveTab(frame);
@@ -1288,7 +1418,7 @@ static void SyncFullscreen(const std::shared_ptr<WindowState>& frame) {
         (frame->is_popup || shown->phase == WindowState::Phase::Live))
         shown->webview->get_ContainsFullScreenElement(&contains);
     const bool want = contains != FALSE;
-    if (want == frame->fullscreen) return;
+    if (want == frame->fullscreen) { UpdateEscHook(frame); return; }
     if (want) {
         frame->restore_placement.length = sizeof(WINDOWPLACEMENT);
         if (!GetWindowPlacement(frame->hwnd, &frame->restore_placement)) return;
@@ -1297,6 +1427,7 @@ static void SyncFullscreen(const std::shared_ptr<WindowState>& frame) {
         if (IsZoomed(frame->hwnd)) ShowWindow(frame->hwnd, SW_RESTORE);
         frame->restore_style = GetWindowLongPtrW(frame->hwnd, GWL_STYLE);
         frame->fullscreen = true;  // before resizing: the layout it triggers must drop the strip
+        StopEscHook(nullptr);      // a fresh keyboard hook per full screen (Windows may drop one silently: SEC-003)
         if (frame->tab_ctrl) ShowWindow(frame->tab_ctrl, SW_HIDE);
         // The menu bar is non-client area that survives losing the frame (measured: it kept 20 px of a
         // full-screen window). SetMenu(nullptr) detaches without destroying; exit reattaches it.
@@ -1320,6 +1451,7 @@ static void SyncFullscreen(const std::shared_ptr<WindowState>& frame) {
     } else {
         LayoutTabs(frame);
     }
+    UpdateEscHook(frame);
 }
 
 static std::wstring TabStripLabel(const std::shared_ptr<WindowState>& t) {
@@ -1589,7 +1721,7 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
     std::wstring ua(uaW);
     CoTaskMemFree(uaW);
     if (ua.find(L"DeskRallyDesktop/") == std::wstring::npos)
-        ua += L" DeskRallyDesktop/0.8.6";
+        ua += L" DeskRallyDesktop/0.8.8";
     if (g_helloVerifiedAtStartup) ua += L" DeskRallyHello/1";
     ua += L" DeskRallySSO/1";
     // The clipboard answer is remembered for the run (g_consentAnswers), so the console may read the
@@ -1884,8 +2016,9 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
             }).Get(), &state->tok_window_close);
     if (FAILED(registration)) return false;
 
-    // PermissionRequested – deny all except clipboard-read, which requires
-    // verified user gesture, trusted URI for the selected tenant, and explicit user consent.
+    // PermissionRequested – drpolicy::check_permission decides. Clipboard-read and file read/write (the
+    // explorer's folder) each require a verified user gesture, the trusted URI for the selected tenant,
+    // and explicit user consent (clipboard remembered per run; folders asked every time). All else is denied.
     // Never persist permission to profile.
     registration = wv->add_PermissionRequested(
         Callback<ICoreWebView2PermissionRequestedEventHandler>(
@@ -1897,8 +2030,8 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
 
                 COREWEBVIEW2_PERMISSION_KIND kind{};
                 rawArgs->get_PermissionKind(&kind);
-
-                if (kind != COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ) {
+                const drpolicy::PermResult verdict = drpolicy::check_permission(PermKindOf(kind));
+                if (verdict == drpolicy::PermResult::Deny) {
                     rawArgs->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
                     return S_OK;
                 }
@@ -1910,6 +2043,12 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
                 CoTaskMemFree(uriW);
                 bool uriOk = (drpolicy::check_navigation(WideToUtf8(uriWstr), state->selectedTenant)
                               == drpolicy::NavResult::Allow);
+
+                // File System Access read/write (explorer folder) takes the same path as clipboard: trusted
+                // URI, user gesture, never saved, and the operator's consent (asked on every request, never
+                // remembered). Review 2026-11-25: the OS pick alone is not enough, a page can hold other
+                // read-only handles (drops, open pickers) and ask to upgrade them.
+                const bool files = (kind == COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE);
 
                 // Verify actual user gesture and disable profile persistence.
                 bool isUserInitiated = false;
@@ -1925,6 +2064,7 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
 #ifdef SMOKE_TEST
                 // Exercise the real permission event but NEVER read the operator's clipboard.
                 rawArgs->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                if (files) return S_OK;  // the smoke page never asks for folders
                 SmokeLog("[smoke] clipboard origin=%ls gesture=%d\n", uriWstr.c_str(), (int)isUserInitiated);
                 SmokeHandleMessage(uriOk && isUserInitiated
                     ? L"{\"test\":\"native_clipboard\",\"result\":\"PASS\"}"
@@ -1952,6 +2092,7 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
                 req->deferral = deferral;
                 req->generation = state->navigation_generation;
                 req->origin = Utf8ToWide("https://" + drpolicy::tenant_host(state->selectedTenant));
+                req->files = files;
                 g_consentQueue.push_back(req);
                 // The dialog runs from the main window's message loop, never inside this callback.
                 if (!g_mainState || !PostMessageW(g_mainState->hwnd, WM_CLIPBOARD_CONSENT, 0, 0))
@@ -2461,6 +2602,27 @@ static bool SmokeFsCoversMonitor(const std::shared_ptr<WindowState>& win) {
         !IsWindowVisible(win->tab_ctrl) && EqualRect(&bounds, &cr) &&
         cr.right == mi.rcMonitor.right - mi.rcMonitor.left && cr.bottom == mi.rcMonitor.bottom - mi.rcMonitor.top;
 }
+// A real Esc (or Shift+Esc) through the keyboard input queue, into the shown tab's WebView.
+static bool g_smokeFlag = false;
+static void SmokeSendEscape(const std::shared_ptr<WindowState>& win, bool shift) {
+    SetForegroundWindow(win->hwnd);
+    if (auto t = ActiveTab(win); t && t->controller) t->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    INPUT in[4] = {};
+    UINT n = 0;
+    auto key = [&](WORD vk, bool up) {
+        in[n].type = INPUT_KEYBOARD;
+        in[n].ki.wVk = vk;
+        in[n].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+        ++n;
+    };
+    if (shift) key(VK_SHIFT, false);
+    key(VK_ESCAPE, false);
+    key(VK_ESCAPE, true);
+    if (shift) key(VK_SHIFT, true);
+    const UINT sent = SendInput(n, in, sizeof(INPUT));
+    SmokeLog("[smoke] SendInput %s: %u/%u, foreground=%d\n", shift ? "Shift+Esc" : "Esc", sent, n,
+             (int)(GetForegroundWindow() == win->hwnd));
+}
 // Back to the window it was before full screen: same style, maximized state and rect; the strip
 // shown and the WebView below it.
 static bool SmokeFsRestored(const std::shared_ptr<WindowState>& win) {
@@ -2808,21 +2970,82 @@ static void SmokeTabTick() {
         // Back on the tab whose page is still full screen: the window resumes full screen.
         SmokeReport("fullscreen_resumes_on_return",
             win->active_tab == g_smokeTabMark && win->fullscreen && SmokeFsCoversMonitor(win));
-        // Esc, delivered as a key to the page, leaves full screen (WebView2 does this itself; the host
-        // relies on it, so a runtime that stopped would fail here).
-        if (auto t = ActiveTab(win); t && t->webview)
-            t->webview->CallDevToolsProtocolMethod(L"Input.dispatchKeyEvent",
-                LR"json({"type":"rawKeyDown","key":"Escape","code":"Escape","windowsVirtualKeyCode":27,"nativeVirtualKeyCode":27})json",
-                Callback<ICoreWebView2CallDevToolsProtocolMethodCompletedHandler>(
-                    [](HRESULT, LPCWSTR) -> HRESULT { return S_OK; }).Get());
+        // A REAL Esc (SendInput, so it takes the AcceleratorKeyPressed path a keyboard does): in full screen
+        // it reaches the PAGE (which marks its title) and the window STAYS full screen (tab_policy.h
+        // fullscreen_escape). Focus first, then send on a later tick.
+        if (auto t = ActiveTab(win))
+            SmokeEval(t, L"document.title='fs'; window.addEventListener('keydown', function(e){ if (e.key === 'Escape' && !e.shiftKey) document.title = 'esc-seen'; })");
+        SetForegroundWindow(win->hwnd);
+        if (auto t = ActiveTab(win); t && t->controller) t->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        g_smokeTicks = 0;
+        g_smokeTabStep = 41;
+        return;
+    }
+    case 41:
+        if (g_smokeTicks < 5) return;
+        SmokeSendEscape(win, false);
         g_smokeTicks = 0;
         g_smokeTabStep = 26;
         return;
+    case 26: {
+        if (g_smokeTicks < 15) return;  // give a wrongful exit time to happen
+        std::wstring title;
+        if (auto t = ActiveTab(win); t && t->webview) {
+            LPWSTR s = nullptr;
+            if (SUCCEEDED(t->webview->get_DocumentTitle(&s)) && s) { title = s; CoTaskMemFree(s); }
+        }
+        SmokeLog("[smoke] after Esc: title=%ls fullscreen=%d\n", title.c_str(), (int)win->fullscreen);
+        SmokeReport("fullscreen_esc_to_page", title == L"esc-seen" && win->fullscreen && SmokeFsCoversMonitor(win));
+        // Shift+Esc: the app leaves full screen itself.
+        SmokeSendEscape(win, true);
+        g_smokeTicks = 0;
+        g_smokeTabStep = 40;
+        return;
     }
-    case 26:
-        if (win->fullscreen && g_smokeTicks < 15) return;
-        SmokeReport("fullscreen_esc_exits", !win->fullscreen && SmokeFsRestored(win));
+    case 40:
+        if (win->fullscreen && g_smokeTicks < 40) return;
+        SmokeLog("[smoke] after Shift+Esc: hook=%d\n", (int)(g_escHook != nullptr));
+        // Left full screen, window restored, and the keyboard hook is gone with it.
+        SmokeReport("fullscreen_shift_esc_exits", !win->fullscreen && SmokeFsRestored(win) && g_escHook == nullptr);
         if (win->fullscreen) if (auto t = ActiveTab(win)) SmokeEval(t, L"document.exitFullscreen()");
+        g_smokeTicks = 0;
+        g_smokeTabStep = 42;
+        return;
+    case 42:
+        // A page that will NOT leave full screen (review SEC-001): Shift+Esc must still give the operator a way out.
+        if (win->fullscreen && g_smokeTicks < 40) return;
+        if (auto t = ActiveTab(win))
+            SmokeEval(t, L"document.exitFullscreen = function(){ return Promise.resolve(); }; document.documentElement.requestFullscreen()");
+        g_smokeTicks = 0;
+        g_smokeTabStep = 43;
+        return;
+    case 43:
+        if (!win->fullscreen && g_smokeTicks < 40) return;
+        SmokeLog("[smoke] refusing page entered: fullscreen=%d hook=%d\n", (int)win->fullscreen, (int)(g_escHook != nullptr));
+        SetForegroundWindow(win->hwnd);
+        if (auto t = ActiveTab(win); t && t->controller) t->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        g_smokeTicks = 0;
+        g_smokeTabStep = 44;
+        return;
+    case 44:
+        if (g_smokeTicks < 5) return;
+        SmokeSendEscape(win, true);  // the page ignores it...
+        g_smokeTicks = 0;
+        g_smokeTabStep = 45;
+        return;
+    case 45:
+        if (g_smokeTicks < 15) return;
+        SmokeLog("[smoke] refusing page after Shift+Esc: fullscreen=%d hook=%d\n", (int)win->fullscreen, (int)(g_escHook != nullptr));
+        // The app stopped taking Esc. (Measured: the window may already be out - the Esc RELEASE then reaches the
+        // browser - which is itself a way out.) If it is still full screen, a plain Esc must now exit natively.
+        g_smokeFlag = g_escHook == nullptr;
+        if (win->fullscreen) SmokeSendEscape(win, false);
+        g_smokeTicks = 0;
+        g_smokeTabStep = 46;
+        return;
+    case 46:
+        if (win->fullscreen && g_smokeTicks < 40) return;
+        SmokeReport("fullscreen_refusing_page_esc_exits", g_smokeFlag && !win->fullscreen && SmokeFsRestored(win));
         g_smokeTicks = 0;
         g_smokeTabStep = 27;
         return;
@@ -2949,6 +3172,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ExecuteTabCommand(state, wp, lp);
         return 0;
 
+    case WM_APP_FS_ESC:
+        HandleFullscreenEsc(state, wp, lp);
+        return 0;
+
     case WM_APP_TAB_CREATE_FAILED: {
         auto t = FindTab(state, static_cast<uint64_t>(wp));
         if (!state || state->closing || !t || t->failure_pending) return 0;  // already removed or handled
@@ -3045,6 +3272,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // The process must not outlive this window, even if WM_DESTROY's quit is lost (a 0.8.1
         // client sat in GetMessageW for a day and blocked every update): see lifetime_policy.h.
         g_mainWindowGone = true;
+        StopEscHook(hwnd);
         SettleAllConsents();
         CancelQueuedSpawn(hwnd);
         // Free the heap-allocated shared_ptr after the window is fully destroyed.

@@ -105,6 +105,14 @@ the console.
 
 ## ADR-004: End-to-end encryption, relay-blind
 
+> **STATUS UPDATE (2026-11-25): point 5 is ADDRESSED by [docs/69 session binding](69-session-device-binding.md).**
+> Both ends sign a transcript that binds the LIVE DTLS fingerprints (each side reads its own and its peer's from the
+> association it actually holds) to device keys the control plane vouches for. Agents since 1.3.31 refuse to send a
+> picture or accept input until the console has proved that binding, so a signaling server that substitutes
+> fingerprints gets a session that never starts. A per-tenant `warn` / `require` setting governs the console side
+> (every tenant starts at `warn`). Points 2 and 3 (an app-level encryption layer independent of the transport) are
+> still design. The 2026-08-30 note below is kept for history.
+>
 > **STATUS (2026-08-30): points 2, 3 and 5 below are DESIGN, NOT SHIPPED.** Verified by audit, not
 > assumed — `crates/crypto`'s `Handshake`/`SessionKeys` are real code that **no shipping binary
 > instantiates** (`Session::new` appears only in tests), and `peer_pubkey` arrives on `brokered` and

@@ -79,4 +79,22 @@ inline bool on_close_mark(int x, int tab_right, unsigned dpi) {
     return x <= tab_right && x >= tab_right - hot;
 }
 
+// Escape while the shown page of a trusted console is full screen (2026-11-25). In Chrome/Edge the viewer holds
+// navigator.keyboard.lock, so plain Esc reaches the page (and the remote machine) and Shift+Esc is the way out;
+// WebView2 has no keyboard lock and leaves full screen on Esc itself. The app restores the same rule:
+//   ToPage         - plain Esc (down, repeat or up): the page gets it, the browser does not act on it;
+//   ExitFullscreen - Shift+Esc key-down: the app asks the page to leave AND stops taking Esc, so a plain Esc then
+//                    exits natively if the page does not let go;
+//   None           - anything else, or not full screen / not trusted: untouched.
+// Ctrl, Alt or Win with Esc stay the system's (Ctrl+Shift+Esc is Task Manager).
+enum class EscAction { None, ToPage, ExitFullscreen };
+
+inline EscAction fullscreen_escape(const KeyInput& k, bool shown_fullscreen_trusted) {
+    const unsigned kVkEscape = 0x1B;
+    if (!shown_fullscreen_trusted || k.vk != kVkEscape) return EscAction::None;
+    if (k.system_key || k.ctrl || k.alt || k.win) return EscAction::None;
+    if (k.shift) return k.key_down ? EscAction::ExitFullscreen : EscAction::None;
+    return EscAction::ToPage;
+}
+
 } // namespace drtabs

@@ -341,6 +341,8 @@ int main() {
     // ── Permission: positive ─────────────────────────────────────────────────
     perm_consent("perm:clipboard read requires consent",
                  PermKind::ClipboardRead);
+    perm_consent("perm:file read/write requires consent (explorer folder)",
+                 PermKind::FileReadWrite);
 
     // ── Permission: negative ─────────────────────────────────────────────────
     perm_deny("perm:microphone denied",       PermKind::Microphone);
@@ -792,6 +794,30 @@ int main() {
         check("tabs:select beyond count does nothing", drtabs::select_index(drtabs::decode(key('5')), 3) == -1);
         check("tabs:select in range", drtabs::select_index(drtabs::decode(key('2')), 3) == 1);
         check("tabs:last of 3", drtabs::select_index(drtabs::decode(key('9')), 3) == 2);
+        {
+            using drtabs::EscAction;
+            auto esc = [](bool down = true) { KeyInput e; e.key_down = down; e.vk = 0x1B; return e; };
+            auto fe = [](KeyInput e, bool fs = true) { return drtabs::fullscreen_escape(e, fs); };
+            check("esc:full screen, plain Esc goes to the page", fe(esc()) == EscAction::ToPage);
+            check("esc:its key-up goes to the page too", fe(esc(false)) == EscAction::ToPage);
+            KeyInput e = esc(); e.repeat = true;
+            check("esc:held Esc goes to the page (no press-and-hold exit)", fe(e) == EscAction::ToPage);
+            e = esc(); e.shift = true;
+            check("esc:Shift+Esc leaves full screen", fe(e) == EscAction::ExitFullscreen);
+            e = esc(false); e.shift = true;
+            check("esc:Shift+Esc key-up untouched", fe(e) == EscAction::None);
+            e = esc(); e.shift = true; e.ctrl = true;
+            check("esc:Ctrl+Shift+Esc stays the system's", fe(e) == EscAction::None);
+            e = esc(); e.alt = true;
+            check("esc:Alt+Esc stays the system's", fe(e) == EscAction::None);
+            e = esc(); e.system_key = true;
+            check("esc:system key untouched", fe(e) == EscAction::None);
+            e = esc(); e.win = true;
+            check("esc:Win+Esc untouched", fe(e) == EscAction::None);
+            check("esc:not full screen (or untrusted page): untouched", fe(esc(), false) == EscAction::None);
+            e = esc(); e.vk = 'A';
+            check("esc:other keys untouched", fe(e) == EscAction::None);
+        }
         check("tabs:close mark hit at the right edge", drtabs::on_close_mark(199, 200, 96));
         check("tabs:close mark hit 22 px in at 96 DPI", drtabs::on_close_mark(178, 200, 96));
         check("tabs:close mark miss on the label", !drtabs::on_close_mark(170, 200, 96));

@@ -192,16 +192,21 @@ enum class PermKind {
     Camera,
     Geolocation,
     Notifications,
+    // File System Access read/write (Under the Hood explorer, "Choose a folder"). WebView2 raises it for
+    // showDirectoryPicker({mode:"readwrite"}) and handle.requestPermission. Same rule as clipboard: trusted
+    // URI + gesture + the operator's consent (asked on every request), never saved.
+    FileReadWrite,
     Other,
 };
 
 enum class PermResult {
-    AllowWithConsent,
+    AllowWithConsent,     // trusted tenant origin + user gesture + the app's consent dialog; never saved
     Deny,
 };
 
 inline PermResult check_permission(PermKind kind) {
     if (kind == PermKind::ClipboardRead) return PermResult::AllowWithConsent;
+    if (kind == PermKind::FileReadWrite) return PermResult::AllowWithConsent;
     return PermResult::Deny;
 }
 
