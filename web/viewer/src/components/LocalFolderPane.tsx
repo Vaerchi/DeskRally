@@ -21,12 +21,14 @@ export interface LocalFolderPaneProps {
   onFolderChange?: (dir: LocalDirHandle | null) => void;
   /** Bump to re-list the folder (after a Get wrote into it). */
   refreshKey?: number;
+  /** Why Send is not offered right now (e.g. the remote side shows the drive list), shown in its place. */
+  sendHint?: string;
   /** For tests: whether folder access exists, and the picker. */
   folderAccess?: boolean;
   pick?: () => Promise<LocalDirHandle>;
 }
 
-export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshKey = 0, folderAccess, pick }: LocalFolderPaneProps) {
+export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshKey = 0, sendHint, folderAccess, pick }: LocalFolderPaneProps) {
   // The window this pane is drawn in. In the Under the Hood POP-OUT that is not `globalThis` (the opener): the picker
   // must be asked of the window the click happened in, or it is refused for lack of user activation (live bug
   // 2026-11-25: NotAllowedError from "Choose a folder").
@@ -123,6 +125,7 @@ export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshK
             ? "This window is not allowed to open a folder on your computer (this happens in the Under the Hood pop-out and in some embedded browsers). You can still send files with Choose files, and Get saves through the download. To use a folder, open Under the Hood in the main Chrome or Edge window."
             : "This browser cannot open a folder on your computer (Chrome and Edge can). Send picks files here, and Get saves through the browser's download."}
         </p>
+        {!onSend && sendHint && <p className="panel__hint" data-testid="local-send-hint">{sendHint}</p>}
         {onSend && (
           <>
             <button type="button" className="panel__action" onClick={() => fileInput.current?.click()}
@@ -203,6 +206,7 @@ export function LocalFolderPane({ onSend, onSendFolder, onFolderChange, refreshK
               ))}
             </tbody>
           </table>
+          {!onSend && sendHint && <p className="panel__hint" data-testid="local-send-hint">{sendHint}</p>}
           {onSend && (
             <button type="button" className="panel__action" disabled={selected.size === 0} onClick={() => void send()}
               data-testid="local-send">

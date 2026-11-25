@@ -26,6 +26,16 @@ static void test_version_parsing() {
     };
     auto bad = [](const char* s) { return !parse_version(s).valid; };
 
+    // Check cadence: launch after an hour, a running app every 6 hours; never checked or a clock moved back = due.
+    {
+        const unsigned long long h = drupdate::kFiletimeHour, t0 = 134000000000000000ULL;
+        check("cadence:never checked is due", drupdate::check_due(t0, 0, drupdate::kCheckAtLaunchAfter));
+        check("cadence:launch 59 min after a check is not due", !drupdate::check_due(t0 + h - 1, t0, drupdate::kCheckAtLaunchAfter));
+        check("cadence:launch an hour after a check is due", drupdate::check_due(t0 + h, t0, drupdate::kCheckAtLaunchAfter));
+        check("cadence:running 5 h after is not due", !drupdate::check_due(t0 + 5 * h, t0, drupdate::kCheckWhileRunningEvery));
+        check("cadence:running 6 h after is due", drupdate::check_due(t0 + 6 * h, t0, drupdate::kCheckWhileRunningEvery));
+        check("cadence:clock moved backwards is due", drupdate::check_due(t0 - 1, t0, drupdate::kCheckWhileRunningEvery));
+    }
     check("ver:0.5.0",    ok("0.5.0",    0,     5,     0));
     check("ver:1.0.0",    ok("1.0.0",    1,     0,     0));
     check("ver:1.2.3",    ok("1.2.3",    1,     2,     3));

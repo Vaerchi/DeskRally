@@ -139,6 +139,20 @@ function controlToJson(msg: Exclude<Message, { t: "Chunk" }>): unknown {
 
 // --- helpers -----------------------------------------------------------------------------------
 
+/**
+ * An agent-supplied reason made safe to show as plain text: control and bidirectional-override characters removed,
+ * whitespace collapsed, at most 160 characters. Null when nothing usable is left.
+ */
+export function peerReason(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const clean = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return null;
+  return clean.length > 160 ? `${clean.slice(0, 159)}…` : clean;
+}
+
 /** Lowercase-hex SHA-256 of `data` (via Web Crypto). Matches Rust `file_transfer::sha256_hex`. */
 export async function sha256Hex(data: Uint8Array): Promise<string> {
   // Copy into a fresh ArrayBuffer-backed view so the BufferSource type is unambiguous (a view over
@@ -726,7 +740,10 @@ export class FileTransferClient {
         const resolveUpload = this.pendingAcks.get(id);
         if (resolveUpload) {
           this.pendingAcks.delete(id);
-          resolveUpload({ ok: false, message: "upload refused or aborted by the remote machine" });
+          // 2026-11-25: the generic text hid an actionable reason ("uploads are disabled: the transfer folder could not
+          // be verified"). The agent's reason is shown, cleaned and bounded (peerReason), never as markup.
+          const why = peerReason(msg.c?.message);
+          resolveUpload({ ok: false, message: why ? `the remote machine refused it: ${why}` : "upload refused or aborted by the remote machine" });
         }
         return;
       }

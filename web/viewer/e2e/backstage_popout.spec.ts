@@ -141,6 +141,8 @@ test("Under the Hood opens in its own window from the Session menu and the conso
   if (!browser) test.skip(true, "no browser");
 
   const page = await browser!.newPage();
+  // 2026-11-25: the pop-out ignored an explicit Light choice (dark window, illegible text). Run this one on Light.
+  await page.addInitScript(() => localStorage.setItem("deskrally.theme", "light"));
   await page.goto(APP_URL);
   await openManualConnect(page);
   await page.getByTestId("signaling-url").fill(SIGNALING_WS);
@@ -159,6 +161,13 @@ test("Under the Hood opens in its own window from the Session menu and the conso
   await popup.getByRole("tab", { name: "Processes", exact: true }).click();
   const procRows = popup.locator(".panel--process tbody tr .panel__name");
   await expect(procRows.first()).not.toHaveText("", { timeout: 15_000 });
+  // The window is on the console's theme: Light here, with the page ground the opener has; and it follows a change.
+  await expect(popup.locator("html")).toHaveAttribute("data-theme", "light");
+  const ground = (p: typeof page) => p.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  expect(await ground(popup)).toBe(await ground(page));
+  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+  await expect(popup.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
   // ...while the console tab keeps the screen.
   await expect(page.getByRole("combobox", { name: "Session view", exact: true })).toHaveValue("screen");
 

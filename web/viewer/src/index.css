@@ -15,6 +15,20 @@
   --fs-xl: 16px;
   --fs-2xl: 18px;
   --fs-3xl: 20px;
+  /* Spacing scale (Loam review, 2026-11-25): --space-N = N x 2px. Padding/margin/gap use these; odd and negative
+     values stay literal. Introduced as an identity change (no rendering difference). */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-7: 14px;
+  --space-8: 16px;
+  --space-9: 18px;
+  --space-10: 20px;
+  --space-12: 24px;
+  --space-16: 32px;
 }
 
 /* ---- Colour tokens ---------------------------------------------------------------------------
@@ -153,7 +167,7 @@ button {
   background: var(--bg-elev-2);
   color: var(--text);
   border-radius: 6px;
-  padding: 5px 12px;
+  padding: 5px var(--space-6);
 }
 
 button:hover:not(:disabled) {
@@ -172,7 +186,7 @@ select {
   background: var(--input-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 4px 8px;
+  padding: var(--space-2) var(--space-4);
 }
 
 /* --- App shell --- */
@@ -185,8 +199,8 @@ select {
 .app__topbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
+  gap: var(--space-6);
+  padding: var(--space-5) var(--space-8);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -200,7 +214,7 @@ select {
   color: var(--text-dim);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: var(--space-1) var(--space-4);
 }
 
 .app__body {
@@ -238,7 +252,7 @@ select {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  padding: 14px 16px 8px;
+  padding: var(--space-7) var(--space-8) var(--space-4);
 }
 
 .access__header h2 {
@@ -252,10 +266,10 @@ select {
 }
 
 .access__controls {
-  padding: 0 16px 10px;
+  padding: 0 var(--space-8) var(--space-5);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 
@@ -266,7 +280,7 @@ select {
 .access__filter {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   font-size: var(--fs-sm);
   color: var(--text-dim);
 }
@@ -274,8 +288,8 @@ select {
 .access__manual {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px 16px;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-8);
   border-bottom: 1px solid var(--border);
 }
 
@@ -292,13 +306,13 @@ select {
 }
 
 .access__manual button {
-  margin-top: 2px;
+  margin-top: var(--space-1);
   align-self: flex-start;
 }
 
 .access__manual-toggle {
   align-self: flex-start;
-  margin: 2px 16px 6px;
+  margin: var(--space-1) var(--space-8) var(--space-3);
   padding: 0;
   border: 0;
   background: none;
@@ -331,7 +345,7 @@ select {
 .access__list {
   overflow-y: auto;
   flex: 1;
-  padding: 8px 0;
+  padding: var(--space-4) 0;
 }
 
 .access__group-title {
@@ -339,7 +353,7 @@ select {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--text-dim);
-  margin: 8px 16px 4px;
+  margin: var(--space-4) var(--space-8) var(--space-2);
 }
 
 .access__group ul {
@@ -352,8 +366,8 @@ select {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 10px;
-  padding: 8px 16px;
+  gap: var(--space-3) var(--space-5);
+  padding: var(--space-4) var(--space-8);
 }
 
 /* Badge + End + Connect + Observe + new tab: kept together, right-aligned, and moved onto their
@@ -362,7 +376,7 @@ select {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   margin-left: auto;
 }
 /* Menu redesign wave 8b: the row's "⋯" (View only, Open in new tab, End session). */
@@ -448,12 +462,12 @@ select {
 .access__session-end-error {
   font-size: 0.72rem;
   color: var(--bad);
-  margin-left: 4px;
+  margin-left: var(--space-2);
 }
 
 .access__empty {
   color: var(--text-dim);
-  padding: 16px;
+  padding: var(--space-8);
 }
 
 /* --- Viewer --- */
@@ -465,7 +479,7 @@ select {
   transform: translateX(-50%);
   z-index: 50;
   pointer-events: none;
-  padding: 8px 16px;
+  padding: var(--space-4) var(--space-8);
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.78);
   color: #fff;
@@ -476,7 +490,7 @@ select {
 .viewer__fshint kbd {
   font: inherit;
   font-weight: 600;
-  padding: 1px 6px;
+  padding: 1px var(--space-3);
   border: 1px solid rgba(255, 255, 255, 0.5);
   border-radius: 4px;
 }
@@ -594,8 +608,8 @@ select {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 8px 14px;
+  gap: var(--space-7);
+  padding: var(--space-4) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   font-size: var(--fs-md);
@@ -609,7 +623,7 @@ select {
 .viewer__status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 .viewer__dot {
@@ -638,7 +652,7 @@ select {
 .viewer__toggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   color: var(--text-dim);
 }
 
@@ -686,8 +700,8 @@ select {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 14px;
-  padding: 6px 14px;
+  gap: var(--space-7);
+  padding: var(--space-3) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev-2);
   font-size: var(--fs-sm);
@@ -696,12 +710,12 @@ select {
 .viewer__qualityfield {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   color: var(--text-dim);
 }
 
 .viewer__qualityfield--check {
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .viewer__qualityhint {
@@ -716,7 +730,7 @@ select {
   background: var(--border-strong);
   align-self: center;
   flex-shrink: 0;
-  margin: 0 2px;
+  margin: 0 var(--space-1);
 }
 
 .viewer__menupanel {
@@ -724,8 +738,8 @@ select {
   z-index: 200;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px;
+  gap: var(--space-3);
+  padding: var(--space-5);
   background: var(--menu-bg);
   border: 1px solid var(--border-strong);
   border-radius: 4px;
@@ -742,7 +756,7 @@ select {
 .viewer__menupanel-field {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .viewer__menupanel-label {
@@ -752,14 +766,14 @@ select {
 .viewer__menusep {
   height: 1px;
   background: var(--border-strong);
-  margin: 2px 0;
+  margin: var(--space-1) 0;
 }
 
 .viewer__qualitypanel--inline {
   position: static;
   border: none;
   padding: 0;
-  margin-top: 4px;
+  margin-top: var(--space-2);
 }
 
 .viewer__spacer {
@@ -776,12 +790,12 @@ select {
 .viewer__zoom {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .viewer__zoombtn {
   font-size: var(--fs-sm);
-  padding: 3px 8px;
+  padding: 3px var(--space-4);
   border: 1px solid var(--border);
   background: var(--bg-elev-2);
   color: var(--text-dim);
@@ -822,7 +836,7 @@ select {
   color: var(--danger);
   border: 1px solid var(--danger);
   border-radius: 4px;
-  padding: 2px 6px;
+  padding: var(--space-1) var(--space-3);
   max-width: 42ch;
   white-space: normal;
 }
@@ -832,7 +846,7 @@ select {
 .viewer__reboot {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .viewer__reboot-label {
@@ -852,7 +866,7 @@ select {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 /* The expanded tool list wraps so every button stays reachable at narrow widths (280/412px).
@@ -860,14 +874,14 @@ select {
 .viewer__tools-menu {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 /* Session recording (loop 89): the toggle plus its live badge / last-result line. */
 .viewer__record {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 /* A running recording is tinted like the destructive controls, deliberately: it is the one control
@@ -881,7 +895,7 @@ select {
 .viewer__endsession {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 /* Destructive action (the "Remove client" uninstall) — a red tint so it can't be fired absent-mindedly. */
@@ -894,8 +908,8 @@ select {
 .viewer__command {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 14px;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -904,7 +918,7 @@ select {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .viewer__command-input {
@@ -912,7 +926,7 @@ select {
   min-width: 160px;
   font-family: var(--mono, ui-monospace, monospace);
   font-size: var(--fs-sm);
-  padding: 5px 8px;
+  padding: 5px var(--space-4);
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--border);
@@ -925,7 +939,7 @@ select {
   resize: vertical;
   font: inherit;
   font-size: var(--fs-sm);
-  padding: 5px 8px;
+  padding: 5px var(--space-4);
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--border);
@@ -934,7 +948,7 @@ select {
 
 .viewer__command-shell {
   font-size: var(--fs-sm);
-  padding: 4px 6px;
+  padding: var(--space-2) var(--space-3);
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--border);
@@ -944,7 +958,7 @@ select {
 .viewer__command-asuser {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   font-size: var(--fs-sm);
   color: var(--text-dim);
   white-space: nowrap;
@@ -973,7 +987,7 @@ select {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 8px 10px;
+  padding: var(--space-4) var(--space-5);
 }
 
 /* Reused for the "pan mode — input not sent" banner: a legible, non-alarming warning tint. */
@@ -989,8 +1003,8 @@ select {
 .viewer__files {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px 14px;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   max-height: 260px;
@@ -1000,7 +1014,7 @@ select {
 .viewer__files-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   flex-wrap: wrap;
 }
 
@@ -1022,7 +1036,7 @@ select {
 .viewer__files-error {
   font-size: var(--fs-sm);
   color: var(--bad);
-  padding: 2px 0;
+  padding: var(--space-1) 0;
 }
 
 .viewer__files-list {
@@ -1031,13 +1045,13 @@ select {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .viewer__files-empty {
   font-size: var(--fs-sm);
   color: var(--text-dim);
-  padding: 4px 0;
+  padding: var(--space-2) 0;
 }
 
 /* Directory entries are full-width clickable buttons; file entries are static rows. */
@@ -1045,7 +1059,7 @@ select {
   display: block;
   width: 100%;
   text-align: left;
-  padding: 3px 4px;
+  padding: 3px var(--space-2);
   font-size: var(--fs-sm);
   background: transparent;
   color: inherit;
@@ -1067,8 +1081,8 @@ select {
 .viewer__files-entry {
   display: flex;
   align-items: baseline;
-  gap: 6px;
-  padding: 3px 4px;
+  gap: var(--space-3);
+  padding: 3px var(--space-2);
   font-size: var(--fs-sm);
 }
 
@@ -1110,7 +1124,7 @@ select {
 .viewer__files-saved {
   font-size: var(--fs-xs);
   color: var(--good);
-  margin-left: 4px;
+  margin-left: var(--space-2);
   flex-shrink: 0;
   white-space: nowrap;
 }
@@ -1118,7 +1132,7 @@ select {
 .viewer__files-truncated {
   font-size: var(--fs-xs);
   color: var(--text-dim);
-  padding: 2px 0;
+  padding: var(--space-1) 0;
 }
 
 /* Special-key send bar (Ctrl+Alt+Del, Windows key, common chords). */
@@ -1126,8 +1140,8 @@ select {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 14px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -1137,7 +1151,7 @@ select {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-dim);
-  margin-right: 4px;
+  margin-right: var(--space-2);
 }
 
 .viewer__key {
@@ -1163,8 +1177,8 @@ select {
 .viewer__typing {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 6px 14px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -1174,7 +1188,7 @@ select {
   box-sizing: border-box;
   /* 16px or larger: a smaller font makes mobile browsers zoom the whole page on focus. */
   font-size: var(--fs-xl);
-  padding: 6px 8px;
+  padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
   border-radius: 5px;
   background: var(--bg-elev-2);
@@ -1192,7 +1206,7 @@ select {
 .viewer__typing-nav {
   display: flex;
   flex-wrap: nowrap;
-  gap: 6px;
+  gap: var(--space-3);
   overflow-x: auto;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
@@ -1229,15 +1243,15 @@ select {
 .viewer__osk {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px 14px;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
 
 .viewer__oskrow {
   display: flex;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .viewer__oskkey {
@@ -1337,9 +1351,9 @@ select {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: var(--space-5);
   text-align: center;
-  padding: 24px;
+  padding: var(--space-12);
   color: var(--text-dim);
   background: var(--bg);
 }
@@ -1351,7 +1365,7 @@ select {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: var(--space-3);
   color: var(--text-dim);
   pointer-events: none;
 }
@@ -1377,7 +1391,7 @@ select {
 .panel__table th,
 .panel__table td {
   text-align: left;
-  padding: 6px 12px;
+  padding: var(--space-3) var(--space-6);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
@@ -1401,7 +1415,7 @@ select {
   font-weight: 500;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 /* Presence dot in the fleet table Name column. Mirrors .access__dot; data-online="true" = green,
@@ -1450,10 +1464,10 @@ td.panel__name {
 td.panel__name > .panel__dot {
   display: inline-block;
   vertical-align: middle;
-  margin-right: 6px;
+  margin-right: var(--space-3);
 }
 td.panel__name > * + * {
-  margin-left: 6px;
+  margin-left: var(--space-3);
 }
 
 .panel__mono {
@@ -1472,7 +1486,7 @@ td.panel__name > * + * {
 .panel__note-view {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .panel__note-view .panel__ellipsis {
@@ -1483,7 +1497,7 @@ td.panel__name > * + * {
 .panel__note-edit {
   display: flex;
   align-items: flex-start;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 .panel__note-input {
@@ -1494,7 +1508,7 @@ td.panel__name > * + * {
 
 .panel__empty {
   color: var(--text-dim);
-  padding: 20px 12px;
+  padding: var(--space-10) var(--space-6);
   text-align: center;
 }
 
@@ -1514,7 +1528,7 @@ td.panel__name > * + * {
   font: inherit;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .panel__sort:hover:not(:disabled) {
@@ -1530,7 +1544,7 @@ td.panel__name > * + * {
 /* Service state badge. */
 .panel__badge {
   display: inline-block;
-  padding: 1px 8px;
+  padding: 1px var(--space-4);
   border-radius: 999px;
   font-size: var(--fs-xs);
   border: 1px solid var(--border);
@@ -1557,8 +1571,8 @@ td.panel__name > * + * {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 2px;
-  padding: 8px 12px;
+  gap: var(--space-1);
+  padding: var(--space-4) var(--space-6);
   background: var(--bg-elev);
   border-bottom: 1px solid var(--border);
   font-size: var(--fs-sm);
@@ -1568,7 +1582,7 @@ td.panel__name > * + * {
 .panel__crumb-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .panel__crumb-sep {
@@ -1578,7 +1592,7 @@ td.panel__name > * + * {
 .panel__crumb {
   border: none;
   background: none;
-  padding: 1px 4px;
+  padding: 1px var(--space-2);
   color: var(--accent);
   font: inherit;
 }
@@ -1592,7 +1606,7 @@ td.panel__name > * + * {
 .panel__filelabel {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 .panel__filelink {
@@ -1632,9 +1646,9 @@ td.panel__name > * + * {
 }
 
 .panel__action {
-  padding: 2px 8px;
+  padding: var(--space-1) var(--space-4);
   font-size: var(--fs-sm);
-  margin-left: 6px;
+  margin-left: var(--space-3);
 }
 
 .panel__action--danger {
@@ -1650,10 +1664,10 @@ td.panel__name > * + * {
 /* --- System info panel --- */
 .sysinfo__grid {
   margin: 0;
-  padding: 12px 16px;
+  padding: var(--space-6) var(--space-8);
   display: grid;
   grid-template-columns: max-content 1fr;
-  gap: 6px 20px;
+  gap: var(--space-3) var(--space-10);
 }
 
 .sysinfo__row {
@@ -1676,13 +1690,13 @@ td.panel__name > * + * {
   min-width: 0;
   max-height: min(240px, 40vh);
   overflow: auto;
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
 
 .incoming-download-prompt__hint {
-  margin: 0 0 8px;
+  margin: 0 0 var(--space-4);
   color: var(--text-dim);
   font-size: var(--fs-sm);
 }
@@ -1697,8 +1711,8 @@ td.panel__name > * + * {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: start;
-  gap: 8px;
-  padding: 4px 0;
+  gap: var(--space-4);
+  padding: var(--space-2) 0;
 }
 
 .incoming-download-prompt__name {
@@ -1720,10 +1734,10 @@ td.panel__name > * + * {
   min-width: 0;
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: var(--space-6);
   max-height: min(240px, 40vh);
   overflow: auto;
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-6);
   border-top: 1px solid var(--border);
   border-left: 3px solid var(--pending);
   background: var(--bg-elev);
@@ -1742,7 +1756,7 @@ td.panel__name > * + * {
 }
 
 .relay-notice__text p + p {
-  margin-top: 4px;
+  margin-top: var(--space-2);
 }
 
 .relay-notice__server {
@@ -1776,8 +1790,8 @@ td.panel__name > * + * {
 
 .app__viewswitch {
   display: flex;
-  gap: 4px;
-  padding: 8px 12px;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -1799,8 +1813,8 @@ td.panel__name > * + * {
 .backstage__bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -1809,7 +1823,7 @@ td.panel__name > * + * {
 .explorer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
-  gap: 12px;
+  gap: var(--space-6);
   align-items: start;
 }
 @media (max-width: 900px) {
@@ -1819,19 +1833,19 @@ td.panel__name > * + * {
   min-width: 0;
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 8px;
+  padding: var(--space-4);
 }
 .explorer__title {
-  margin: 0 0 6px;
+  margin: 0 0 var(--space-3);
   font-size: var(--fs-sm);
   color: var(--text-dim);
 }
 .explorer__bar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   flex-wrap: wrap;
-  margin-bottom: 6px;
+  margin-bottom: var(--space-3);
 }
 .explorer__loc {
   font-family: var(--font-mono, monospace);
@@ -1845,7 +1859,7 @@ td.panel__name > * + * {
 }
 
 .backstage__filtercount {
-  margin: 4px 12px;
+  margin: var(--space-2) var(--space-6);
   color: var(--text-dim);
   font-size: var(--fs-sm);
 }
@@ -1853,8 +1867,8 @@ td.panel__name > * + * {
 .backstage__filesnav {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
   border-bottom: 1px solid var(--border);
 }
 
@@ -1867,7 +1881,7 @@ td.panel__name > * + * {
 
 .backstage__tabs {
   display: flex;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .backstage__tab[data-active="true"] {
@@ -1897,7 +1911,7 @@ td.panel__name > * + * {
 }
 
 .backstage__error {
-  padding: 8px 14px;
+  padding: var(--space-4) var(--space-7);
   font-size: var(--fs-md);
   border-bottom: 1px solid var(--bad);
   background: color-mix(in srgb, var(--bad) 12%, var(--bg));
@@ -1912,8 +1926,8 @@ td.panel__name > * + * {
 .backstage__grant {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: var(--space-4);
+  padding: var(--space-6) var(--space-7);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -1928,7 +1942,7 @@ td.panel__name > * + * {
   width: 100%;
   font-family: var(--mono, monospace);
   font-size: var(--fs-sm);
-  padding: 8px;
+  padding: var(--space-4);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
@@ -1946,8 +1960,8 @@ td.panel__name > * + * {
 .backstage__audit {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 5px 14px;
+  gap: var(--space-5);
+  padding: 5px var(--space-7);
   border-top: 1px solid var(--border);
   background: var(--bg-elev);
   font-size: var(--fs-xs);
@@ -1960,7 +1974,7 @@ td.panel__name > * + * {
 }
 
 .backstage__audit-outcome {
-  padding: 0 6px;
+  padding: 0 var(--space-3);
   border-radius: 999px;
   border: 1px solid var(--border);
 }
@@ -1992,10 +2006,10 @@ td.panel__name > * + * {
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 18px;
+  padding: var(--space-9);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-5);
 }
 
 .backstage__confirm-desc {
@@ -2016,7 +2030,7 @@ td.panel__name > * + * {
 .backstage__confirm-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 /* --- View-switch chrome extras (V3): push the clipboard control to the right --- */
@@ -2029,7 +2043,7 @@ td.panel__name > * + * {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-5);
   min-width: 0;
 }
 
@@ -2045,7 +2059,7 @@ td.panel__name > * + * {
 .clipctl__receive {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   font-size: var(--fs-sm);
   color: var(--text-dim);
   white-space: nowrap;
@@ -2058,14 +2072,14 @@ td.panel__name > * + * {
   overflow: auto;
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  padding: 18px;
+  gap: var(--space-9);
+  padding: var(--space-9);
 }
 
 .filepanel__section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-5);
 }
 
 .filepanel__title {
@@ -2082,7 +2096,7 @@ td.panel__name > * + * {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: var(--space-4);
   padding: 26px;
   border: 1px dashed var(--border);
   border-radius: 10px;
@@ -2107,14 +2121,14 @@ td.panel__name > * + * {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .filepanel__row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
+  gap: var(--space-6);
+  padding: var(--space-4) var(--space-6);
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-elev);
@@ -2138,7 +2152,7 @@ td.panel__name > * + * {
 .filepanel__phase {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   color: var(--text-dim);
 }
 
@@ -2167,13 +2181,13 @@ td.panel__name > * + * {
 
 .filepanel__downloadrow {
   display: flex;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .filepanel__pathinput {
   flex: 1;
   min-width: 0;
-  padding: 8px 10px;
+  padding: var(--space-4) var(--space-5);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
@@ -2192,8 +2206,8 @@ td.panel__name > * + * {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 18px;
+  gap: var(--space-6);
+  padding: var(--space-9);
 }
 
 /* The transcript scrolls; the composer below it does not. `min-height: 0` is what lets the log
@@ -2204,8 +2218,8 @@ td.panel__name > * + * {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 12px;
+  gap: var(--space-3);
+  padding: var(--space-6);
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-elev);
@@ -2220,8 +2234,8 @@ td.panel__name > * + * {
 .chatpanel__line {
   display: flex;
   align-items: baseline;
-  gap: 10px;
-  padding: 6px 10px;
+  gap: var(--space-5);
+  padding: var(--space-3) var(--space-5);
   border-radius: 8px;
   background: var(--bg-elev-2);
   font-size: var(--fs-md);
@@ -2265,7 +2279,7 @@ td.panel__name > * + * {
    they are reading the whole conversation will act on a partial one. */
 .chatpanel__truncated {
   margin: 0;
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-6);
   border: 1px solid var(--pending);
   border-radius: 8px;
   background: color-mix(in srgb, var(--pending) 12%, var(--bg-elev));
@@ -2276,7 +2290,7 @@ td.panel__name > * + * {
 .chatpanel__composer {
   display: flex;
   align-items: flex-end;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .chatpanel__input {
@@ -2288,7 +2302,7 @@ td.panel__name > * + * {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: var(--space-4) var(--space-5);
 }
 
 .chatpanel__input:disabled {
@@ -2298,7 +2312,7 @@ td.panel__name > * + * {
 
 .chatpanel__send {
   flex: none;
-  padding: 8px 16px;
+  padding: var(--space-4) var(--space-8);
 }
 
 /* --- M3: management-console panels (machines / sessions / audit / tenants) --- */
@@ -2484,8 +2498,8 @@ td.panel__name > * + * {
 .panel__form {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   flex-wrap: wrap;
@@ -2499,14 +2513,14 @@ td.panel__name > * + * {
 .panel__toolbar-field {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   font-size: var(--fs-sm);
   color: var(--text-dim);
 }
 
 .panel__toolbar-field input,
 .panel__toolbar-field select {
-  padding: 4px 8px;
+  padding: var(--space-2) var(--space-4);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
@@ -2536,17 +2550,17 @@ td.panel__name > * + * {
 /* --- Attended sessions (docs/12 §9) + /join guest landing page --- */
 
 .panel__detail {
-  padding: 12px 16px;
+  padding: var(--space-6) var(--space-8);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-3);
   font-size: var(--fs-md);
 }
 
 .panel__code {
   font-size: var(--fs-3xl);
   letter-spacing: 2px;
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-6);
   border: 1px dashed var(--border);
   border-radius: 8px;
   align-self: flex-start;
@@ -2555,35 +2569,35 @@ td.panel__name > * + * {
 
 .panel__actions-row {
   display: flex;
-  gap: 10px;
-  margin-top: 6px;
+  gap: var(--space-5);
+  margin-top: var(--space-3);
 }
 
 /* Credential-setup link section in the Users panel (docs/01 §5): a delineated block that appears when
    an admin is minting a first-password / reset link for one user. */
 .panel__setup {
-  margin: 8px 0 12px;
-  padding: 12px;
+  margin: var(--space-4) 0 var(--space-6);
+  padding: var(--space-6);
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-2);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .panel__setup-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-5);
 }
 
 .panel__setup-form,
 .panel__setup-result {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 /* A small, non-alarming explanatory line used by the setup section and the /set-password page. */
@@ -2597,13 +2611,13 @@ td.panel__name > * + * {
 .panel--sites > .panel__note,
 .panel--groups > .panel__note,
 .panel--machinegroups > .panel__note {
-  padding: 6px 12px;
+  padding: var(--space-3) var(--space-6);
 }
 .dynamic-groups__conditions {
   flex-basis: 100%;
   min-width: 0;
   margin: 0;
-  padding: 8px;
+  padding: var(--space-4);
   border: 1px solid var(--border);
   border-radius: 6px;
 }
@@ -2611,12 +2625,12 @@ td.panel__name > * + * {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
 .sites__search {
   flex-wrap: wrap;
-  padding: 6px 12px;
+  padding: var(--space-3) var(--space-6);
 }
 .sites__search .panel__search {
   min-width: 0;
@@ -2625,7 +2639,7 @@ td.panel__name > * + * {
 .sites__state {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   min-width: 0;
 }
 .sites__state select {
@@ -2639,15 +2653,15 @@ td.panel__name > * + * {
 .sites__bulk {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
   min-width: 0;
 }
 .sites__bulk-row {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-3);
   min-width: 0;
 }
 .sites__bulk-site {
@@ -2667,24 +2681,24 @@ td.panel__name > * + * {
 .sites__result {
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 8px;
+  padding: var(--space-4);
   min-width: 0;
   overflow-wrap: anywhere;
 }
 .sites__confirm-title {
-  margin: 0 0 4px;
+  margin: 0 0 var(--space-2);
   font-weight: 600;
 }
 .sites__confirm-list {
-  margin: 0 0 6px;
-  padding-left: 18px;
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-9);
   max-height: 12rem;
   overflow-y: auto;
 }
 .sites__pick {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   min-height: 32px;
 }
 .sites__pick input {
@@ -2698,7 +2712,7 @@ td.panel__name > * + * {
 .sites__edit {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 /* Stacked (phone) mode: each machine becomes a wrapped block — name and site on one line, the editor
@@ -2732,10 +2746,10 @@ td.panel__name > * + * {
 .join__main {
   max-width: 640px;
   margin: 40px auto;
-  padding: 0 16px;
+  padding: 0 var(--space-8);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-5);
   font-size: var(--fs-base);
 }
 
@@ -2793,8 +2807,8 @@ td.panel__name > * + * {
 .join__topbar {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  padding: 16px 24px;
+  gap: var(--space-4);
+  padding: var(--space-8) var(--space-12);
   background: var(--dr-navy);
   color: var(--dr-paper);
 }
@@ -2812,17 +2826,17 @@ td.panel__name > * + * {
 .join__main {
   max-width: 680px;
   margin: 0 auto;
-  padding: 28px 20px 64px;
+  padding: 28px var(--space-10) 64px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: var(--space-7);
   font-size: var(--fs-lg);
 }
 
 .join__title {
   font-size: 26px;
   color: var(--dr-navy);
-  margin: 4px 0 0;
+  margin: var(--space-2) 0 0;
 }
 
 /* Public support page: the route artwork and primary actions share the same grid. */
@@ -2834,7 +2848,7 @@ td.panel__name > * + * {
   align-items: start;
 }
 .join__welcome {
-  margin: 32px 12px 32px 32px;
+  margin: var(--space-16) var(--space-6) var(--space-16) var(--space-16);
   overflow: hidden;
   border-radius: 18px;
 }
@@ -2847,7 +2861,7 @@ td.panel__name > * + * {
 /* The load-bearing safety sentence. Given weight, not buried. */
 .join__lede {
   margin: 0;
-  padding: 12px 14px;
+  padding: var(--space-6) var(--space-7);
   border-left: 4px solid var(--dr-navy);
   background: #ffffff;
   border-radius: 0 8px 8px 0;
@@ -2856,15 +2870,15 @@ td.panel__name > * + * {
 
 .join__step {
   border-top: 1px solid var(--dr-line);
-  padding-top: 14px;
+  padding-top: var(--space-7);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .join__stephead {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-5);
   font-size: var(--fs-2xl);
   color: var(--dr-navy);
   margin: 0;
@@ -2886,12 +2900,12 @@ td.panel__name > * + * {
 .join__download {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .join__downloadbtn {
   display: inline-block;
   align-self: flex-start;
-  padding: 12px 22px;
+  padding: var(--space-6) 22px;
   /* A tenant's accent (docs/66): one of the TWO things it may colour. The label stays white (4.5:1 is gated). */
   background: var(--join-accent, var(--dr-forest));
   color: var(--dr-on-forest);
@@ -2917,7 +2931,7 @@ td.panel__name > * + * {
 .join__code {
   font-size: var(--fs-3xl);
   letter-spacing: 2px;
-  padding: 10px 14px;
+  padding: var(--space-5) var(--space-7);
   background: #ffffff;
   border: 1px dashed var(--dr-navy);
   border-radius: 8px;
@@ -2943,7 +2957,7 @@ td.panel__name > * + * {
   background: #ffffff;
   border: 1px solid var(--dr-line);
   border-radius: 8px;
-  padding: 10px 14px;
+  padding: var(--space-5) var(--space-7);
 }
 .join__details summary,
 .join__advanced summary {
@@ -2952,18 +2966,18 @@ td.panel__name > * + * {
   color: var(--dr-navy);
 }
 .join__helplist {
-  margin: 10px 0 0;
-  padding-left: 18px;
+  margin: var(--space-5) 0 0;
+  padding-left: var(--space-9);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
   font-size: var(--fs-base);
 }
 
 .join__action {
   display: inline-block;
   align-self: flex-start;
-  padding: 8px 16px;
+  padding: var(--space-4) var(--space-8);
   background: var(--dr-navy);
   color: var(--dr-paper);
   border: none;
@@ -2993,7 +3007,7 @@ td.panel__name > * + * {
   background: var(--dr-navy);
   color: var(--dr-paper);
   align-items: baseline;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .app--signin .app__brand {
   color: var(--dr-paper);
@@ -3006,7 +3020,7 @@ td.panel__name > * + * {
 }
 .app__signin-hero {
   min-width: 0;
-  margin: 32px 0 32px 32px;
+  margin: var(--space-16) 0 var(--space-16) var(--space-16);
   border-radius: 18px;
   overflow: hidden;
 }
@@ -3014,7 +3028,7 @@ td.panel__name > * + * {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px;
+  padding: var(--space-16);
 }
 
 /* ---- LoginForm identity (used by the sign-in AND the mid-session overlay) ---- */
@@ -3025,12 +3039,12 @@ td.panel__name > * + * {
 .login__form {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-6);
   background: #ffffff;
   color: var(--dr-ink, #101d2c);
   border: 1px solid var(--dr-line, #d8d2c4);
   border-radius: 12px;
-  padding: 24px;
+  padding: var(--space-12);
   box-shadow: 0 10px 30px rgba(16, 29, 44, 0.12);
 }
 .login__title {
@@ -3046,13 +3060,13 @@ td.panel__name > * + * {
 .login__label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-2);
   font-size: var(--fs-md);
   font-weight: 600;
   color: var(--dr-ink, #101d2c);
 }
 .login__label input {
-  padding: 10px 12px;
+  padding: var(--space-5) var(--space-6);
   border: 1px solid var(--dr-line, #d8d2c4);
   border-radius: 8px;
   font-size: var(--fs-lg);
@@ -3065,7 +3079,7 @@ td.panel__name > * + * {
   border-color: var(--dr-navy, #13283e);
 }
 .login__error {
-  padding: 10px 12px;
+  padding: var(--space-5) var(--space-6);
   border-radius: 8px;
   background: #fdecec;
   color: #8a1f1f;
@@ -3073,12 +3087,12 @@ td.panel__name > * + * {
 }
 .login__actions {
   display: flex;
-  gap: 10px;
+  gap: var(--space-5);
   justify-content: flex-end;
-  margin-top: 4px;
+  margin-top: var(--space-2);
 }
 .login__actions button {
-  padding: 10px 18px;
+  padding: var(--space-5) var(--space-9);
   border-radius: 8px;
   font-size: var(--fs-lg);
   font-weight: 700;
@@ -3103,7 +3117,7 @@ td.panel__name > * + * {
     grid-template-columns: 1fr;
   }
   .app__signin-hero {
-    margin: 0 20px 24px;
+    margin: 0 var(--space-10) var(--space-12);
     order: 2;
   }
 }
@@ -3169,8 +3183,8 @@ td.panel__name > * + * {
    it was working as designed — the unfolded inner screen is ~700px, which is split-narrow, so it
    correctly kept two panes. A width threshold cannot know somebody wants the screen back anyway. */
 .app[data-pane-mode="stacked"] .app__topbar {
-	gap: 8px;
-	padding: 8px 10px;
+	gap: var(--space-4);
+	padding: var(--space-4) var(--space-5);
 	overflow-x: auto;
 	scrollbar-width: none;
 }
@@ -3321,8 +3335,8 @@ td.panel__name > * + * {
   flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
   background: var(--bg-elev);
   color: var(--text);
 }
@@ -3331,7 +3345,7 @@ td.panel__name > * + * {
   color: inherit;
   border: 1px solid var(--border);
   border-radius: 5px;
-  padding: 5px 10px;
+  padding: 5px var(--space-5);
   cursor: pointer;
 }
 .viewer__popout-controls .viewer__monitor { max-width: 100%; min-width: 0; }
@@ -3361,8 +3375,8 @@ td.panel__name > * + * {
   min-height: 46px;
   box-sizing: border-box;
   flex-wrap: nowrap;
-  gap: 6px;
-  padding: 4px 8px;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
 }
 .app__topbar > * { flex-shrink: 0; }
 .app__session-select { max-width: 105px; height: 32px; }
@@ -3374,7 +3388,7 @@ td.panel__name > * + * {
   min-width: 100%;
   box-sizing: border-box;
   height: 36px;
-  gap: 8px;
+  gap: var(--space-4);
   padding: 0;
   border: 0;
 }
@@ -3392,7 +3406,7 @@ td.panel__name > * + * {
 .app__input-control {
   align-self: center;
   width: fit-content;
-  padding: 2px 6px;
+  padding: var(--space-1) var(--space-3);
   border: 1px solid currentColor;
   border-radius: 999px;
   font-size: var(--fs-xs);
@@ -3400,14 +3414,14 @@ td.panel__name > * + * {
 }
 .app__main > .app__input-control {
   align-self: flex-start;
-  margin: 4px 8px;
+  margin: var(--space-2) var(--space-4);
 }
 .session-participant-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   overflow-wrap: anywhere;
 }
 .session-participant-list li > span { font-weight: 600; }
@@ -3427,11 +3441,11 @@ td.panel__name > * + * {
   max-height: calc(100dvh - 64px);
   overflow: auto;
   box-sizing: border-box;
-  padding: 12px;
+  padding: var(--space-6);
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 12px;
+  gap: var(--space-6);
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-elev);
@@ -3531,7 +3545,7 @@ td.panel__name > * + * {
   left: 8px;
   max-width: min(600px, calc(100vw - 32px));
   z-index: 100;
-  padding: 6px 10px;
+  padding: var(--space-3) var(--space-5);
   border: 1px solid currentColor;
   border-radius: 5px;
   background: var(--bg-elev);
@@ -3549,7 +3563,7 @@ td.panel__name > * + * {
 .app__input-control {
   align-self: center;
   width: fit-content;
-  padding: 2px 6px;
+  padding: var(--space-1) var(--space-3);
   border: 1px solid currentColor;
   border-radius: 999px;
   font-size: var(--fs-xs);
@@ -3557,14 +3571,14 @@ td.panel__name > * + * {
 }
 .app__main > .app__input-control {
   align-self: flex-start;
-  margin: 4px 8px;
+  margin: var(--space-2) var(--space-4);
 }
 .session-participant-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   overflow-wrap: anywhere;
 }
 .session-participant-list li > span { font-weight: 600; }
@@ -3731,7 +3745,7 @@ td.panel__name > * + * {
   align-items: center;
   gap: 0.35rem;
   margin-left: auto;
-  padding: 4px 10px;
+  padding: var(--space-2) var(--space-5);
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--bg-elev-2);
@@ -3762,8 +3776,8 @@ td.panel__name > * + * {
 }
 .app__helpdrawer-close {
   align-self: flex-end;
-  margin: 8px 12px 0;
-  padding: 4px 10px;
+  margin: var(--space-4) var(--space-6) 0;
+  padding: var(--space-2) var(--space-5);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg-elev);
@@ -3847,7 +3861,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .app__chrome-btn {
   flex: none;
   font-size: var(--fs-sm);
-  padding: 3px 8px;
+  padding: 3px var(--space-4);
   border: 1px solid var(--border);
   background: var(--bg-elev-2);
   color: var(--text-dim);
@@ -3867,8 +3881,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   z-index: 61;
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px 3px;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3) 3px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-top: none;
@@ -3888,7 +3902,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .session-tab__slot {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
 }
 .session-tab__slot:empty {
   display: none;
@@ -3896,7 +3910,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .session-tab__dot {
   width: 8px;
   height: 8px;
-  margin: 0 2px;
+  margin: 0 var(--space-1);
   border-radius: 50%;
   background: var(--neutral);
 }
@@ -3909,7 +3923,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   min-width: 24px;
   font-size: var(--fs-sm);
   line-height: 1.4;
-  padding: 1px 6px;
+  padding: 1px var(--space-3);
   border: 1px solid var(--border);
   background: var(--bg-elev-2);
   color: var(--text-dim);
@@ -3952,8 +3966,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   left: 50%;
   transform: translateX(-50%);
   display: flex;
-  gap: 4px;
-  padding: 2px 6px 3px;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3) 3px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-top: none;
@@ -3965,7 +3979,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .panel__expiry {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   font-size: var(--fs-sm);
   color: var(--text-dim);
 }
@@ -3974,8 +3988,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .panel__window {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin: 6px 0 0;
+  gap: var(--space-3);
+  margin: var(--space-3) 0 0;
   padding: 0;
   border: none;
   font-size: var(--fs-sm);
@@ -3985,7 +3999,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .panel__window-label {
   font-size: var(--fs-sm);
@@ -4153,8 +4167,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   transform: translateX(-50%);
   z-index: 5;
   display: flex;
-  gap: 8px;
-  padding: 6px;
+  gap: var(--space-4);
+  padding: var(--space-3);
   border-radius: 14px;
   background: rgba(16, 18, 24, 0.82);
   border: 1px solid rgba(255, 255, 255, 0.18);
@@ -4167,7 +4181,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .viewer__tpbtn {
   min-width: 64px;
   min-height: 48px;
-  padding: 0 14px;
+  padding: 0 var(--space-7);
   font: inherit;
   font-size: var(--fs-lg);
   font-weight: 600;
@@ -4216,7 +4230,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .viewer__tpsens {
   display: inline-flex;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 /* Platform operator: hostnames and the public join-page review (docs/66 2k). The frames are real documents of a fixed
@@ -4254,8 +4268,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 6px;
+  gap: var(--space-3);
+  padding: var(--space-3);
   border-radius: 14px;
   background: rgba(16, 18, 24, 0.82);
   border: 1px solid rgba(255, 255, 255, 0.18);
@@ -4267,7 +4281,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 /* The Pan badge is a button here (it turns Pan off): a full touch target, still styled as a badge. */
 .viewer__mfspan {
   min-height: 44px;
-  padding: 0 10px;
+  padding: 0 var(--space-5);
   font-size: var(--fs-md);
   border: 1px solid rgba(255, 255, 255, 0.28);
   cursor: pointer;
@@ -4276,7 +4290,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .viewer__mfsbtn {
   min-width: 44px;
   min-height: 44px;
-  padding: 0 12px;
+  padding: 0 var(--space-6);
   font: inherit;
   font-size: var(--fs-lg);
   font-weight: 600;
@@ -4313,7 +4327,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 /* Platform Reach tab and tenant Adoption card (docs/68). Tokens only, so light and dark follow the console. */
 .reach__windows {
   display: inline-flex;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .reach__windows [aria-pressed="true"],
 .panel--platform [role="tab"][aria-selected="true"] {
@@ -4321,10 +4335,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   color: var(--accent);
 }
 .reach__section {
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-6);
 }
 .reach__title {
-  margin: 4px 0 8px;
+  margin: var(--space-2) 0 var(--space-4);
   font-size: var(--fs-md);
   font-weight: 600;
 }
@@ -4337,8 +4351,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   display: block;
 }
 .reach__caveats {
-  margin: 8px 12px 16px;
-  padding: 10px 12px;
+  margin: var(--space-4) var(--space-6) var(--space-8);
+  padding: var(--space-5) var(--space-6);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg-elev);
@@ -4347,8 +4361,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   line-height: 1.45;
 }
 .reach__caveats ul {
-  margin: 6px 0 0;
-  padding-left: 18px;
+  margin: var(--space-3) 0 0;
+  padding-left: var(--space-9);
 }
 .adoption {
   border-bottom: 1px solid var(--border);
@@ -4360,12 +4374,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .adoption__grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 10px;
-  padding: 8px 12px 12px;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-6) var(--space-6);
 }
 .adoption__card {
   min-width: 0;
-  padding: 10px 12px;
+  padding: var(--space-5) var(--space-6);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg-elev);
@@ -4377,20 +4391,20 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .adoption__cap {
   color: var(--text-dim);
   font-size: var(--fs-sm);
-  margin-bottom: 6px;
+  margin-bottom: var(--space-3);
 }
 .adoption__bars {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 4px;
+  gap: var(--space-2);
   font-size: var(--fs-sm);
 }
 .adoption__bars li {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   min-width: 0;
 }
 .adoption__bars li > :first-child {
@@ -4419,30 +4433,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 /* Menu redesign wave 6: the machine-group policy editor, opened under its group's row. */
 .mgroup-policy {
   display: grid;
-  gap: 8px;
-  margin: 4px 0 8px;
-  padding: 10px 12px;
+  gap: var(--space-4);
+  margin: var(--space-2) 0 var(--space-4);
+  padding: var(--space-5) var(--space-6);
   border: 1px solid var(--border);
   border-radius: 6px;
   max-width: 44rem;
 }
 
 .mgroup-policy legend {
-  padding: 0 4px;
+  padding: 0 var(--space-2);
   font-weight: 600;
 }
 
 .mgroup-policy__check {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .mgroup-policy__field {
   display: grid;
   grid-template-columns: 14rem 8rem 1fr;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .mgroup-policy__field select {
@@ -4452,7 +4466,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .mgroup-policy__actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   flex-wrap: wrap;
 }
 
@@ -4471,7 +4485,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .app__areabar {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-1);
   flex: 1 1 auto;
   min-width: 0;
   overflow-x: auto;
@@ -4482,7 +4496,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   flex: none;
   white-space: nowrap;
   height: 32px;
-  padding: 4px 10px;
+  padding: var(--space-2) var(--space-5);
   border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
@@ -4508,25 +4522,25 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .app__barend {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   flex: none;
   margin-left: auto;
 }
 .app__barend .app__whoami {
   display: block;
   max-width: 18rem;
-  padding: 4px 0 6px;
+  padding: var(--space-2) 0 var(--space-3);
   color: var(--text-dim);
 }
 .app__subtabs {
   display: flex;
-  gap: 4px;
+  gap: var(--space-2);
   flex-wrap: wrap;
-  padding: 6px 12px 0;
+  padding: var(--space-3) var(--space-6) 0;
   border-bottom: 1px solid var(--border);
 }
 .app__subtab {
-  padding: 6px 12px;
+  padding: var(--space-3) var(--space-6);
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: 6px 6px 0 0;
@@ -4553,10 +4567,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .viewer__cpicker {
   display: inline-flex;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .viewer__cmore {
-  padding: 0 14px;
+  padding: 0 var(--space-7);
 }
 .viewer__cselect {
   min-height: 44px;
@@ -4572,12 +4586,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   top: 104px;
 }
 .viewer__morepanel {
-  gap: 8px;
+  gap: var(--space-4);
 }
 .viewer__morepanel-id {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   font-size: var(--fs-md);
   color: var(--text-dim);
   overflow-wrap: anywhere;
@@ -4586,7 +4600,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   min-height: 44px;
   font-size: var(--fs-lg);
   text-align: left;
-  padding: 0 12px;
+  padding: 0 var(--space-6);
 }
 /* Transient notices: invisible wrapper on wide layouts. */
 .viewer__statuslines {
@@ -4600,7 +4614,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   position: fixed;
   top: 118px;
   left: 8px;
@@ -4611,7 +4625,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .viewer__statusbar--compact .viewer__statuslines > * {
   white-space: normal;
   max-width: 100%;
-  padding: 4px 10px;
+  padding: var(--space-2) var(--space-5);
   border-radius: 8px;
   background: var(--bg-elev);
   border: 1px solid var(--border);

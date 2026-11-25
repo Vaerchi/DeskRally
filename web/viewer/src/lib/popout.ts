@@ -56,9 +56,32 @@ function cloneStyles(src: Document, dst: Document): void {
   }
 }
 
-/** Base layout for the child document: the surface should fill it edge to edge, on the app's ground. */
+/**
+ * Keep the child document on the opener's theme. The colour tokens are chosen by `data-theme` on the ROOT element
+ * (absent = follow the system); a copied stylesheet without it followed the system only, so an operator on Light got
+ * a dark window (2026-11-25: "only dark mode, some text illegible"). Mirrored now and on every later change.
+ * Returns the stop function.
+ */
+export function mirrorTheme(src: Document, dst: Document): () => void {
+  const copy = () => {
+    const v = src.documentElement.getAttribute("data-theme");
+    if (v === null) dst.documentElement.removeAttribute("data-theme");
+    else dst.documentElement.setAttribute("data-theme", v);
+  };
+  copy();
+  if (typeof MutationObserver === "undefined") return () => undefined;
+  const obs = new MutationObserver(copy);
+  obs.observe(src.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  return () => obs.disconnect();
+}
+
+/**
+ * Base layout for the child document: the surface should fill it edge to edge, on the app's ground. The ground and
+ * text come from the theme tokens (a fixed dark ground under light-theme text made Under the Hood illegible); the
+ * remote picture keeps its own black surround.
+ */
 const CHILD_BASE_CSS = `
-  html, body { height: 100%; margin: 0; background: #0b0d10; overflow: hidden; }
+  html, body { height: 100%; margin: 0; background: var(--bg, #0b0d10); color: var(--text, #e6e6e6); overflow: hidden; }
   #rmt-popout-root { height: 100%; display: flex; flex-direction: column; min-height: 0; }
   /* The surface is the whole window here — there is no toolbar in this document to share with. */
   #rmt-popout-root .viewer__surface { flex: 1; min-height: 0; }
@@ -84,6 +107,8 @@ export async function openPopout(title: string, windowName = "rmt-remote-desktop
   doc.title = title;
 
   cloneStyles(document, doc);
+  const stopTheme = mirrorTheme(document, doc);
+  win.addEventListener("pagehide", stopTheme);
   const base = doc.createElement("style");
   base.textContent = CHILD_BASE_CSS;
   doc.head.appendChild(base);

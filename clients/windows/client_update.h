@@ -103,7 +103,7 @@ public:
 
     // True if 24 hours have elapsed since the last successful check (or
     // if no check has ever been recorded).
-    static bool IsDailyCheckDue();
+    static bool IsCheckDue(unsigned long long interval);  // drupdate::check_due against the recorded last check
 
     // Record that a check was performed now.  Call after CheckForUpdate
     // initiates (regardless of outcome).

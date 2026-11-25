@@ -992,7 +992,8 @@ export function BackstagePanels({
             // docs/77: two panes. Left, a folder on this computer; right, the remote machine. Send is "Upload here"
             // into the remote folder on screen.
             <div className="explorer" data-testid="explorer">
-              <LocalFolderPane onSend={fileManage && uploadToAgent ? handleUploadHere : undefined}
+              <LocalFolderPane onSend={fileManage && uploadToAgent && path !== "" ? handleUploadHere : undefined}
+                    sendHint={fileManage && uploadToAgent && path === "" ? "Open a folder on the remote machine (right) to send files there." : undefined}
                 onSendFolder={fileManage && uploadToAgent && path !== "" ? handleSendFolder : undefined}
                 onFolderChange={setLocalDir} refreshKey={localRefresh} />
               <section className="explorer__pane" aria-label={`Remote: ${machineName}`}>

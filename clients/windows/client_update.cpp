@@ -590,16 +590,13 @@ UpdateState Updater::GetState() const {
     return impl_->GetState();
 }
 
-bool Updater::IsDailyCheckDue() {
+bool Updater::IsCheckDue(unsigned long long interval) {
     if (!updates_configured()) return false;
     uint64_t last = RegReadQWord(HKEY_CURRENT_USER, kRegPath, kRegLastCheck);
-    if (last == 0) return true;
     FILETIME now_ft{};
     GetSystemTimeAsFileTime(&now_ft);
     uint64_t now64 = (static_cast<uint64_t>(now_ft.dwHighDateTime) << 32) | now_ft.dwLowDateTime;
-    // 24 hours in 100ns intervals.
-    static constexpr uint64_t k24h = 24ULL * 3600ULL * 10000000ULL;
-    return now64 < last || now64 - last >= k24h;
+    return drupdate::check_due(now64, last, interval);
 }
 
 void Updater::RecordCheckTime() {

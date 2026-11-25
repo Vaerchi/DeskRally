@@ -76,6 +76,16 @@ inline Version parse_version(const std::string& s) {
 }
 
 // True iff candidate is strictly greater than installed (both must be valid).
+// Update check cadence (2026-11-25: a daily check left two machines a day behind three releases). `now` and `last` are
+// FILETIME values (100 ns); `last` 0 = never checked. A clock that went BACKWARDS counts as due (never stuck).
+inline constexpr unsigned long long kFiletimeHour = 3600ULL * 10000000ULL;
+inline constexpr unsigned long long kCheckAtLaunchAfter = 1 * kFiletimeHour;   // launch: unless checked in the last hour
+inline constexpr unsigned long long kCheckWhileRunningEvery = 6 * kFiletimeHour; // a long-running app: every 6 hours
+inline bool check_due(unsigned long long now, unsigned long long last, unsigned long long interval) {
+    if (last == 0) return true;
+    return now < last || now - last >= interval;
+}
+
 inline bool version_newer_than(const Version& candidate, const Version& installed) {
     if (!candidate.valid || !installed.valid) return false;
     if (candidate.major != installed.major) return candidate.major > installed.major;

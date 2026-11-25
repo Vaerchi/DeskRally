@@ -158,7 +158,9 @@ test("a window that refuses folder access falls back to Choose files with a plai
   await page.getByRole("tab", { name: "Files", exact: true }).click();
   await page.getByTestId("local-choose").click();
   await expect(page.getByTestId("local-no-folder-access")).toContainText("not allowed to open a folder", { timeout: 10_000 });
-  await expect(page.getByTestId("local-pick-files")).toBeVisible();
+  // On the drive list there is no remote folder to send into: Send is replaced by a hint (2026-11-25 "-> :" fix).
+  await expect(page.getByTestId("local-send-hint")).toContainText("Open a folder on the remote machine");
+  await expect(page.getByTestId("local-pick-files")).toHaveCount(0);
   await expect(page.getByText("The request is not allowed by the user agent")).toHaveCount(0);
   await page.close();
 });

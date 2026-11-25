@@ -53,6 +53,7 @@
 #include "tab_policy.h"
 #include "lifetime_policy.h"
 #include "client_update.h"
+#include "update_policy.h"  // drupdate::kCheckAtLaunchAfter / kCheckWhileRunningEvery
 
 using Microsoft::WRL::ComPtr;
 using Microsoft::WRL::Callback;
@@ -1721,7 +1722,7 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
     std::wstring ua(uaW);
     CoTaskMemFree(uaW);
     if (ua.find(L"DeskRallyDesktop/") == std::wstring::npos)
-        ua += L" DeskRallyDesktop/0.8.8";
+        ua += L" DeskRallyDesktop/0.8.9";
     if (g_helloVerifiedAtStartup) ua += L" DeskRallyHello/1";
     ua += L" DeskRallySSO/1";
     // The clipboard answer is remembered for the run (g_consentAnswers), so the console may read the
@@ -3478,7 +3479,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CheckSignedIn(state);
             return 0;
         }
-        if (wp == 20 && state && !state->closing && g_updater && drupdate::Updater::IsDailyCheckDue()) {
+        if (wp == 20 && state && !state->closing && g_updater &&
+            drupdate::Updater::IsCheckDue(drupdate::kCheckWhileRunningEvery)) {
             if (g_updater->CheckForUpdate()) {
                 drupdate::Updater::RecordCheckTime();
             }
@@ -3774,7 +3776,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 #ifndef SMOKE_TEST
     g_updater = std::make_unique<drupdate::Updater>(hwnd);
     SetTimer(hwnd, 20, 60 * 60 * 1000, nullptr);
-    if (drupdate::Updater::IsDailyCheckDue()) {
+    if (drupdate::Updater::IsCheckDue(drupdate::kCheckAtLaunchAfter)) {
         if (g_updater->CheckForUpdate()) drupdate::Updater::RecordCheckTime();
     }
 #endif

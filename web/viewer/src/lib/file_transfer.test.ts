@@ -15,6 +15,7 @@ import {
   CONTROL_TAG,
   MAX_CHUNK_DATA,
   FileTransferClient,
+  peerReason,
   type Message,
 } from "./file_transfer";
 
@@ -140,7 +141,7 @@ describe("FileTransferClient", () => {
     await expect(ackPromise).resolves.toEqual({ ok: true, message: "" });
   });
 
-  it("an upload the agent answers with an Error (no Ack) settles as failed, without echoing the peer's text", async () => {
+  it("an upload the agent answers with an Error (no Ack) settles as failed, with the reason as cleaned plain text", async () => {
     const sent: Message[] = [];
     const client = new FileTransferClient((payload) => sent.push(decodeMessage(payload)));
     const ackPromise = client.upload("big.bin", new Uint8Array([1, 2, 3]));
@@ -149,10 +150,12 @@ describe("FileTransferClient", () => {
     const id = offer.t === "Offer" ? offer.c.id : "";
 
     // The agent refuses at Offer time (limit, disk, .part creation) with an Error, never an Ack.
-    client.handleMessage(encodeMessage({ t: "Error", c: { id, message: "<b>peer-controlled text</b>" } }));
+    // 2026-11-25: the reason is shown (it was hidden, and hid "uploads are disabled: the transfer folder could not be
+    // verified"), cleaned of control/bidi characters and bounded; React renders it as text, never markup.
+    client.handleMessage(encodeMessage({ t: "Error", c: { id, message: "uploads are\u0000 disabled\u202E here" } }));
     const res = await ackPromise;
     expect(res.ok).toBe(false);
-    expect(res.message).not.toContain("peer-controlled");
+    expect(res.message).toBe("the remote machine refused it: uploads are disabled here");
 
     // A late Ack for the same id changes nothing (the promise already settled; no throw).
     client.handleMessage(encodeMessage({ t: "Ack", c: { id, ok: true, message: "" } }));
@@ -300,5 +303,21 @@ describe("a request the agent never fulfils is reported, never left waiting", ()
     await new Promise((r) => setTimeout(r, 80));
     expect(errors).toEqual([]);
     client.dispose();
+  });
+});
+
+describe("peerReason (2026-11-25: show why an upload was refused)", () => {
+  it("passes a plain reason through", () => {
+    expect(peerReason("uploads are disabled: the transfer folder could not be verified")).toBe(
+      "uploads are disabled: the transfer folder could not be verified",
+    );
+  });
+  it("removes control and bidi-override characters and collapses whitespace", () => {
+    expect(peerReason("a\u0000b\nc\u202Ed  e")).toBe("a b c d e");
+  });
+  it("bounds the length and refuses non-strings and empties", () => {
+    expect(peerReason("x".repeat(500))!.length).toBe(160);
+    expect(peerReason(42)).toBeNull();
+    expect(peerReason("\u0000 \n")).toBeNull();
   });
 });
