@@ -60,7 +60,7 @@ fn download_failure_is_audited(path: &str, want_reason: &str) {
     let mut disp = dispatcher_on(&chain, vec![Capability::FileDownload]);
     let id = uuid::Uuid::new_v4();
 
-    let out = serve_download(&chain, id, path, &dir, Some(&mut disp), 1);
+    let out = serve_download(&chain, id, path, &dir, Some(&mut disp), 1, None);
 
     assert!(
         matches!(out.first(), Some(FtMessage::Error { .. })),
@@ -108,7 +108,7 @@ fn unauthorized_download_is_audited_as_denied_and_reads_nothing() {
     std::fs::write(dir.join("secret.bin"), b"top secret").unwrap();
     let chain = session_chain();
     let mut disp = dispatcher_on(&chain, vec![Capability::FileBrowse]); // no FileDownload
-    let out = serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, Some(&mut disp), 1);
+    let out = serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, Some(&mut disp), 1, None);
 
     let evs = audits(&out);
     assert_eq!(evs.len(), 1);
@@ -137,7 +137,7 @@ fn download_without_a_grant_is_refused_and_audited_into_the_session_chain() {
     let chain = session_chain();
     std::fs::write(dir.join("secret.bin"), b"top secret").unwrap();
 
-    let out = serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, None, 1);
+    let out = serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, None, 1, None);
 
     assert!(matches!(out.first(), Some(FtMessage::Error { .. })));
     let evs = audits(&out);
@@ -177,14 +177,14 @@ fn a_grant_installed_mid_session_continues_the_chain_rather_than_forking_it() {
     std::fs::write(dir.join("secret.bin"), b"top secret").unwrap();
 
     // Before any grant: the refused download seals seq 0.
-    let pre = audits(&serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, None, 1));
+    let pre = audits(&serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, None, 1, None));
     assert_eq!(pre[0]["seq"], 0);
     let seq0_hash = pre[0]["hash"].as_str().unwrap().to_string();
 
     // First grant arrives.
     let mut disp = dispatcher_on(&chain, vec![Capability::FileDownload]);
     let one =
-        audits(&serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, Some(&mut disp), 2));
+        audits(&serve_download(&chain, uuid::Uuid::new_v4(), "secret.bin", &dir, Some(&mut disp), 2, None));
     assert_eq!(one[0]["seq"], 1, "the first grant must continue at seq 1");
     assert_eq!(one[0]["prev_hash"], seq0_hash, "and link to the pre-grant event");
     let seq1_hash = one[0]["hash"].as_str().unwrap().to_string();
@@ -197,7 +197,7 @@ fn a_grant_installed_mid_session_continues_the_chain_rather_than_forking_it() {
         "secret.bin",
         &dir,
         Some(&mut disp2),
-        3,
+        3, None
     ));
     assert_eq!(two[0]["seq"], 2, "a re-grant must NOT restart the chain at seq 0");
     assert_eq!(two[0]["prev_hash"], seq1_hash);
@@ -850,4 +850,34 @@ fn a_junction_planted_as_the_staging_folder_is_refused_and_its_target_untouched(
     let _ = std::fs::remove_dir(&link); // removes the junction, not its target
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&target);
+}
+
+/// docs/77 release review M2: a staged download is decided on the file OPENED. Another session (no ledger entry) is
+/// refused and audited; the owning session is served even when it spells the name differently, and the staged file
+/// is then deleted.
+#[test]
+fn a_staged_file_is_served_only_to_its_owner_whatever_the_spelling() {
+    let dir = temp_dir("dlstaged");
+    let id = uuid::Uuid::new_v4();
+    let name = crate::fs_manage::staged_name(id);
+    std::fs::write(dir.join(&name), b"staged bytes").unwrap();
+    let chain = session_chain();
+
+    // Not ours: refused, audited, nothing leaves, the file stays.
+    let mut disp = dispatcher_on(&chain, vec![Capability::FileDownload]);
+    let other = crate::fs_manage::StagedLedger::default();
+    let out = serve_download(&chain, uuid::Uuid::new_v4(), &name, &dir, Some(&mut disp), 1, Some(&other));
+    assert!(matches!(out.first(), Some(FtMessage::Error { .. })), "{out:?}");
+    assert!(!out.iter().any(|m| matches!(m, FtMessage::Chunk(_))));
+    assert_eq!(audits(&out).len(), 1, "the refusal is audited");
+    assert!(dir.join(&name).exists());
+
+    // Ours, requested in upper case: served, then deleted.
+    let ours = crate::fs_manage::StagedLedger::default();
+    ours.add_for_test(name.clone(), 12);
+    let out = serve_download(&chain, uuid::Uuid::new_v4(), &name.to_uppercase(), &dir, Some(&mut disp), 2, Some(&ours));
+    assert!(out.iter().any(|m| matches!(m, FtMessage::Done { .. })), "{out:?}");
+    assert!(!dir.join(&name).exists(), "a served staged file is deleted");
+    assert!(!ours.owns(&name));
+    let _ = std::fs::remove_dir_all(&dir);
 }

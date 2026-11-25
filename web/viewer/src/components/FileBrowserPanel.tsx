@@ -31,6 +31,10 @@ export interface FileManageActions {
   busy?: boolean;
   /** docs/58 §12: upload files and place them in THIS folder (the agent advertised `file_place`). */
   onUploadHere?: (files: File[]) => void;
+  /** docs/77: copy this file to the technician's side (the agent advertised `file_stage_v1`). Files only. */
+  onGet?: (entryName: string) => void;
+  /** docs/77 phase 2: copy this whole folder to the technician's chosen local folder. Folders only. */
+  onGetFolder?: (entryName: string) => void;
 }
 
 export interface FileBrowserPanelProps {
@@ -208,6 +212,34 @@ export function FileBrowserPanel({ listing, onNavigate, manage }: FileBrowserPan
                       </form>
                     ) : (
                       <>
+                        {actions.onGetFolder && e.is_dir && (
+                          <>
+                            <button
+                              type="button"
+                              className="panel__action"
+                              disabled={actions.busy}
+                              onClick={() => actions.onGetFolder?.(e.name)}
+                              aria-label={`Get folder ${e.name}`}
+                              data-testid={`files-get-folder-${e.name}`}
+                            >
+                              ← Get folder
+                            </button>{" "}
+                          </>
+                        )}
+                        {actions.onGet && !e.is_dir && (
+                          <>
+                            <button
+                              type="button"
+                              className="panel__action"
+                              disabled={actions.busy}
+                              onClick={() => actions.onGet?.(e.name)}
+                              aria-label={`Get ${e.name}`}
+                              data-testid={`files-get-${e.name}`}
+                            >
+                              ← Get
+                            </button>{" "}
+                          </>
+                        )}
                         <button
                           type="button"
                           className="panel__action"

@@ -25,10 +25,17 @@ export function parseSessionChrome(stored: string | null | undefined): SessionCh
  */
 export type ChromeMode = "normal" | "pinned" | "collapsed" | "overlay";
 
-export function chromeMode(sessionLive: boolean, pref: SessionChromePref, open: boolean): ChromeMode {
+/**
+ * `screenShown` is false while the session shows Under the Hood, Files or Chat instead of the remote screen. The
+ * overlay exists to give the SCREEN the whole window; over a tools view it only hides that view's own tab row
+ * (2026-11-24: Processes/Services/Files/Event log were invisible until the bar was minimized). There an opened bar
+ * takes its own row instead, as if pinned.
+ */
+export function chromeMode(sessionLive: boolean, pref: SessionChromePref, open: boolean, screenShown = true): ChromeMode {
   if (!sessionLive) return "normal";
   if (pref === "pinned") return "pinned";
-  return open ? "overlay" : "collapsed";
+  if (!open) return "collapsed";
+  return screenShown ? "overlay" : "pinned";
 }
 
 /** A one-click monitor button for the tab. */

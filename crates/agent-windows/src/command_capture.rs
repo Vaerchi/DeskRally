@@ -458,6 +458,17 @@ mod tests {
             .flat_map(|stream| [stream.pipe.raw(), stream.event.raw()])
             .collect();
 
+        use windows::Win32::Foundation::{CloseHandle, CompareObjectHandles, DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let witnesses: Vec<HANDLE> = handles
+            .iter()
+            .map(|&h| {
+                let mut dup = HANDLE::default();
+                unsafe { DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &mut dup, 0, false, DUPLICATE_SAME_ACCESS) }
+                    .expect("duplicate a capture handle as its identity witness");
+                dup
+            })
+            .collect();
         let started = Instant::now();
         let (_, _, truncated) = capture.finish(None);
         let drained = started.elapsed();
@@ -467,17 +478,26 @@ mod tests {
 
         // The production reaper (not `reap_with` called by hand) completes the cancelled reads and
         // only then closes every handle.
+        //
+        // "Closed" is judged by IDENTITY, not by the handle number: Windows reuses handle values, and a handle another
+        // test opens meanwhile can take a closed one's value and look "still open" (an intermittent failure under the
+        // parallel suite). A duplicate keeps each original object alive; an original handle is open only while its
+        // value is valid AND still names that same object.
         let closed_by = Instant::now() + Duration::from_secs(2);
         loop {
-            let open = handles.iter().filter(|&&handle| {
+            let open = handles.iter().zip(&witnesses).filter(|(&handle, &witness)| {
                 let mut flags = 0;
                 unsafe { GetHandleInformation(handle, &mut flags) }.is_ok()
+                    && unsafe { CompareObjectHandles(handle, witness) }.as_bool()
             }).count();
             if open == 0 {
                 break;
             }
             assert!(Instant::now() < closed_by, "{open} capture handles still open: the reaper never ran");
             std::thread::sleep(Duration::from_millis(10));
+        }
+        for w in witnesses {
+            let _ = unsafe { CloseHandle(w) };
         }
     }
 }

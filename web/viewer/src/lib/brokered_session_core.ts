@@ -546,7 +546,7 @@ export class BrokeredSessionCore {
       } else {
         const grant = await this.wait(
           task.kind === "toolbox"
-            ? runToolboxScript(task.item, authDeps)
+            ? runToolboxScript(task.item, authDeps, task.params ?? {})
             : runAdhocCommand({ shell: task.shell, runAs: task.runAs, body: task.body }, authDeps),
           "authorization", 15000);
         if (!grant.sent) this.finish({ kind: "not_run", reason: this.refusal ?? (grant.stale ? "Cancelled or session changed before dispatch" : grant.error) });

@@ -8,7 +8,9 @@ import (
 	"testing"
 )
 
-// Every reviewed edit must name the file exactly as it is on disk now, so the allowance cannot outlive the file.
+// Every reviewed edit must name the file as it is on disk: either version. The private tree keeps the ORIGINAL
+// bytes (production applied them; decision 2026-11-24) and the public export carries the edited text through
+// packaging/public-overlay, so a database migrated from either tree passes the drift check.
 func TestReviewedCommentOnlyEditsMatchDisk(t *testing.T) {
 	for name, e := range reviewedCommentOnlyEdits {
 		b, err := os.ReadFile(filepath.Join("migrations", name))
@@ -16,8 +18,15 @@ func TestReviewedCommentOnlyEditsMatchDisk(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 		sum := sha256.Sum256(b)
-		if got := hex.EncodeToString(sum[:]); got != e.to {
-			t.Errorf("%s is %s on disk, but the reviewed edit allows only %s: a further edit needs its own review", name, got, e.to)
+		if got := hex.EncodeToString(sum[:]); got != e.from && got != e.to {
+			t.Errorf("%s is %s on disk, but the reviewed edit covers only %s and %s: a further edit needs its own review", name, got, e.from, e.to)
+		}
+		// The public overlay, if present, must be the reviewed edited version.
+		if b, err := os.ReadFile(filepath.Join("..", "packaging", "public-overlay", "control-plane", "migrations", name)); err == nil {
+			sum := sha256.Sum256(b)
+			if got := hex.EncodeToString(sum[:]); got != e.to {
+				t.Errorf("public overlay of %s is %s, want the reviewed %s", name, got, e.to)
+			}
 		}
 	}
 }

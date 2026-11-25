@@ -19,6 +19,9 @@ pub enum FileOp<'a> {
     Delete { path: &'a str },
     Place { transfer_id: uuid::Uuid, dest_dir: &'a str },
     Discard { transfer_id: uuid::Uuid },
+    /// docs/77 (agent 1.3.38): copy one regular file into the transfer folder as `dr-stage-<stage_id>.bin`, so the
+    /// existing verified download can fetch it from there.
+    Stage { path: &'a str, stage_id: uuid::Uuid },
 }
 
 /// Admission, checked by a commit immediately before its irreversible system call.

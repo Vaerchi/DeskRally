@@ -305,6 +305,18 @@ export class WebRTCTransport implements Transport {
    * Tell the transport the session entered or left background mode (see `ControlClient.setBackground`). While
    * in it, an idle screen legitimately sends no frames, so "Video stopped responding" must not fire.
    */
+  /**
+   * docs/76: open this session's one `shell` data channel (the Under the Hood terminal's byte stream), separate from
+   * the ordered session channel so terminal output can never delay input or control. The agent accepts exactly one,
+   * after the session channel; null when there is no live peer connection.
+   */
+  openShellChannel(): RTCDataChannel | null {
+    if (!this.pc) return null;
+    const dc = this.pc.createDataChannel("shell", { ordered: true });
+    dc.binaryType = "arraybuffer";
+    return dc;
+  }
+
   setBackground(hidden: boolean): void {
     this.background = hidden;
   }

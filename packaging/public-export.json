@@ -134,7 +134,8 @@
     "scripts/prepare_update_feed.py",
     "scripts/test_prepare_update_feed.py",
     "scripts/test-agent-staging-acl.ps1",
-    "scripts/test-update-agent-path.ps1"
+    "scripts/test-update-agent-path.ps1",
+    "packaging/public-overlay/"
   ],
   "exclude_exceptions": [
     "deploy/.env.example",

@@ -107,6 +107,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_Power",
     "Win32_System_Services",
+    "Win32_System_SystemInformation", # GetSystemDirectoryW (system_shell: absolute powershell.exe path)
     # Reboot guest (crate::reboot): InitiateSystemShutdownExW + the SHTDN_REASON_* codes, after
     # enabling SeShutdownPrivilege on this process token.
     "Win32_System_Shutdown",

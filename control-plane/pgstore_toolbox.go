@@ -114,6 +114,9 @@ func (s *PgToolboxStore) Create(ctx context.Context, tenantID, callerID string, 
 			}
 			return err
 		}
+		if err := insertToolboxVersionTx(ctx, tx, tenantID, callerID, it); err != nil {
+			return err
+		}
 		ev = &MgmtAuditEvent{ActorUserID: callerID, Action: "toolbox.item.create", TargetKind: "toolbox_item",
 			TargetID: it.ID, Metadata: toolboxAuditMeta(it, nil)}
 		return s.Audit.appendTx(ctx, tx, tenantID, ev)
@@ -178,6 +181,9 @@ func (s *PgToolboxStore) Update(ctx context.Context, tenantID, callerID string, 
 			}
 			return err
 		}
+		if err := insertToolboxVersionTx(ctx, tx, tenantID, callerID, it); err != nil {
+			return err
+		}
 		ev = &MgmtAuditEvent{ActorUserID: callerID, Action: "toolbox.item.update", TargetKind: "toolbox_item",
 			TargetID: it.ID, Metadata: toolboxAuditMeta(it, nil)}
 		return s.Audit.appendTx(ctx, tx, tenantID, ev)
@@ -214,7 +220,7 @@ func (s *PgToolboxStore) Delete(ctx context.Context, tenantID, callerID string, 
 	return ev, nil
 }
 
-func (s *PgToolboxStore) RecordRun(ctx context.Context, tenantID, callerID, id string, expectedVersion int64, sessionID, machineID, requestID string) (*ToolboxRunRequest, *MgmtAuditEvent, error) {
+func (s *PgToolboxStore) RecordRun(ctx context.Context, tenantID, callerID, id string, expectedVersion int64, sessionID, machineID, requestID string, params map[string]string) (*ToolboxRunRequest, *MgmtAuditEvent, error) {
 	if !isUUID(id) {
 		return nil, nil, ErrToolboxNotFound
 	}
@@ -238,20 +244,75 @@ func (s *PgToolboxStore) RecordRun(ctx context.Context, tenantID, callerID, id s
 		if err := tx.QueryRow(ctx, `SELECT email FROM app_user WHERE id = $1::uuid`, callerID).Scan(&actorEmail); err != nil {
 			return err
 		}
+		// docs/75: parameters are judged against THIS snapshot's shell, and the hashed command includes them.
+		command, err := ToolboxCommandWithParams(it.Shell, it.Body, params)
+		if err != nil {
+			return err
+		}
 		run = &ToolboxRunRequest{RequestID: requestID, Item: *it, SessionID: sessionID, MachineID: machineID,
-			Command: ToolboxCommand(it.Shell, it.Body)}
+			Command: command}
 		if err := insertRunRecordTx(ctx, tx, tenantID, requestID, sessionID, machineID, it.Shell, it.RunAs, run.Command, it); err != nil {
 			return err
 		}
+		extra := map[string]any{
+			"request_id": requestID, "session_id": sessionID, "machine_id": machineID,
+			"actor_email": actorEmail, "outcome": "unknown",
+		}
+		if len(params) > 0 {
+			extra["param_names"] = toolboxParamNames(params) // names only, never values (docs/75 D6)
+		}
 		ev = &MgmtAuditEvent{ActorUserID: callerID, Action: "toolbox.run_requested", TargetKind: "session",
-			TargetID: sessionID, Metadata: toolboxAuditMeta(it, map[string]any{
-				"request_id": requestID, "session_id": sessionID, "machine_id": machineID,
-				"actor_email": actorEmail, "outcome": "unknown",
-			})}
+			TargetID: sessionID, Metadata: toolboxAuditMeta(it, extra)}
+
 		return s.Audit.appendTx(ctx, tx, tenantID, ev)
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return run, ev, nil
+}
+
+// Versions lists an item's saved versions, newest first, if the caller can see the item (shared, or their own
+// personal item). A hidden or missing item is ErrToolboxNotFound.
+func (s *PgToolboxStore) Versions(ctx context.Context, tenantID, callerID, id string) ([]ToolboxVersion, error) {
+	if !isUUID(id) {
+		return nil, ErrToolboxNotFound
+	}
+	var out []ToolboxVersion
+	err := withTenant(ctx, s.Pool, tenantID, func(tx pgx.Tx) error {
+		var one int
+		err := tx.QueryRow(ctx, `SELECT 1 FROM toolbox_item WHERE tenant_id = $1::uuid AND `+toolboxVisible+` AND id = $3::uuid`,
+			tenantID, callerID, id).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrToolboxNotFound
+		}
+		if err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT v.version, v.name, v.description, v.shell, v.run_as, v.body, v.body_sha256,
+				COALESCE(u.email, ''), v.saved_at
+			FROM toolbox_item_version v
+			LEFT JOIN app_user u ON u.tenant_id = v.tenant_id AND u.id = v.saved_by
+			WHERE v.tenant_id = $1::uuid AND v.item_id = $2::uuid
+			ORDER BY v.version DESC`, tenantID, id)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v ToolboxVersion
+			if err := rows.Scan(&v.Version, &v.Name, &v.Description, &v.Shell, &v.RunAs, &v.Body, &v.BodySHA256, &v.SavedBy, &v.SavedAt); err != nil {
+				return err
+			}
+			out = append(out, v)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []ToolboxVersion{}
+	}
+	return out, nil
 }

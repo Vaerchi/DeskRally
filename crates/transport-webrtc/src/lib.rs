@@ -474,9 +474,156 @@ pub(crate) fn brokered_identities(msg: &ServerToClient) -> BrokeredIdentities {
     }
 }
 
+/// docs/76: the label of the ONE extra data channel an agent accepts, the Under the Hood terminal's byte stream. Any
+/// other extra channel is still refused (security audit 2026-10-18), and so is a second `shell` channel.
+pub const SHELL_CHANNEL_LABEL: &str = "shell";
+/// The largest single message accepted on the shell channel; a bigger one closes the channel.
+pub const MAX_SHELL_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_SHELL_INBOUND: usize = 64;
+
+/// One message on the shell channel: text carries a JSON control message, binary carries terminal bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellMessage {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// The terminal's own data channel (docs/76 requirement 4): separate from the ordered `frames` channel, so a flood of
+/// shell output cannot delay input, control or hand-off messages.
+pub struct ShellChannel {
+    dc: Arc<RTCDataChannel>,
+    rx: mpsc::Receiver<ShellMessage>,
+    /// Set when the channel closes (either side). The relay must notice: a closed channel with a live shell behind it
+    /// would leave a SYSTEM process nobody can reach (security review H1).
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    closed_notify: Arc<Notify>,
+}
+
+impl ShellChannel {
+    fn wire(dc: Arc<RTCDataChannel>, busy: Arc<std::sync::atomic::AtomicU64>, generation: u64) -> Self {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed_notify = Arc::new(Notify::new());
+        {
+            let closed = closed.clone();
+            let closed_notify = closed_notify.clone();
+            dc.on_close(Box::new(move || {
+                closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = busy.compare_exchange(generation, 0, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+                closed_notify.notify_waiters();
+                Box::pin(async {})
+            }));
+        }
+        let (tx, rx) = mpsc::channel::<ShellMessage>(MAX_SHELL_INBOUND);
+        let dc_close = dc.clone();
+        dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            let tx = tx.clone();
+            let dc_close = dc_close.clone();
+            Box::pin(async move {
+                if msg.data.len() > MAX_SHELL_MESSAGE_BYTES {
+                    tracing::warn!(len = msg.data.len(), "shell channel: oversized message; closing the channel");
+                    let _ = dc_close.close().await;
+                    return;
+                }
+                let m = if msg.is_string {
+                    ShellMessage::Text(String::from_utf8_lossy(&msg.data).into_owned())
+                } else {
+                    ShellMessage::Binary(msg.data.to_vec())
+                };
+                // Awaited, never dropped: a dropped keystroke corrupts the terminal. A slow consumer slows the
+                // peer (SCTP flow control) instead.
+                let _ = tx.send(m).await;
+            })
+        }));
+        Self { dc, rx, closed, closed_notify }
+    }
+
+    /// The next message from the console; `None` once the channel is closed (and its queue drained).
+    pub async fn recv(&mut self) -> Option<ShellMessage> {
+        use std::sync::atomic::Ordering;
+        loop {
+            if let Ok(m) = self.rx.try_recv() {
+                return Some(m);
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return None;
+            }
+            let notified = self.closed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.closed.load(Ordering::SeqCst) {
+                continue;
+            }
+            tokio::select! {
+                m = self.rx.recv() => return m,
+                _ = &mut notified => {}
+            }
+        }
+    }
+
+    /// Whether the channel is still open (the relay checks this while it waits for output to drain).
+    pub fn is_open(&self) -> bool {
+        !self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn send_text(&self, text: &str) -> Result<(), String> {
+        self.dc.send_text(text.to_owned()).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    pub async fn send_binary(&self, bytes: &[u8]) -> Result<(), String> {
+        self.dc.send(&bytes::Bytes::copy_from_slice(bytes)).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Bytes queued for sending but not yet on the wire: the output pump stops reading the shell when this is high.
+    pub async fn buffered_amount(&self) -> usize {
+        self.dc.buffered_amount().await
+    }
+
+    pub async fn close(&self) {
+        let _ = self.dc.close().await;
+    }
+}
+
+/// docs/76: route an incoming `shell`-labelled channel. Accepted only once, and only after the session (`frames`)
+/// channel has been claimed; otherwise closed, like any other extra channel. Shared by both agent-side paths.
+/// Where the agent's accepted shell channels go. `busy` is true while one is open: the console may open a NEW shell
+/// channel after the previous one closed (security review H1: a closed channel must not strand the terminal), but
+/// never two at once.
+struct ShellSlot {
+    tx: mpsc::Sender<ShellChannel>,
+    /// 0 = free; otherwise the generation of the ONE channel holding the slot. Only that channel's close frees it
+    /// (re-review N3: a refused channel closing later must not free the slot under a live one).
+    busy: Arc<std::sync::atomic::AtomicU64>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+async fn accept_shell_channel(
+    dc: Arc<RTCDataChannel>,
+    dc_slot: &tokio::sync::Mutex<Option<oneshot::Sender<Arc<RTCDataChannel>>>>,
+    shell_slot: &ShellSlot,
+) {
+    use std::sync::atomic::Ordering;
+    let first_exists = dc_slot.lock().await.is_none();
+    let generation = shell_slot.next.fetch_add(1, Ordering::SeqCst) + 1;
+    let claimed = first_exists && shell_slot.busy.compare_exchange(0, generation, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+    if !claimed {
+        tracing::warn!(role = "agent", first_exists, "refused a shell data channel (one is already open, or before the session channel)");
+        let _ = dc.close().await;
+        return;
+    }
+    if let Err(e) = shell_slot.tx.try_send(ShellChannel::wire(dc, shell_slot.busy.clone(), generation)) {
+        // Nothing will serve it (the session loop ended, or its queue is full): close it and free the slot it held.
+        let chan = match e {
+            mpsc::error::TrySendError::Full(c) | mpsc::error::TrySendError::Closed(c) => c,
+        };
+        let _ = shell_slot.busy.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = chan.close().await;
+    }
+}
 pub struct WebRtcTransport {
     pc: Arc<RTCPeerConnection>,
     dc: Arc<RTCDataChannel>,
+    /// Agent side: the shell channel, if the console opens one (docs/76). Taken once by the session loop.
+    shell_rx: Option<mpsc::Receiver<ShellChannel>>,
     inbound: mpsc::Receiver<Frame>,
     /// Frames handed back by the session loop to be delivered BEFORE anything new (docs/69: frames
     /// an enforcing agent held while unbound, released in arrival order once the session is bound).
@@ -942,6 +1089,9 @@ impl WebRtcTransport {
         // Data channel: controller creates it; agent receives it via on_data_channel.
         let (dc_tx, dc_rx) = oneshot::channel::<Arc<RTCDataChannel>>();
         let dc_slot = Arc::new(Mutex::new(Some(dc_tx)));
+        // docs/76: the agent side also accepts one `shell` channel (same rule as the brokered path).
+        let (shell_tx, shell_rx) = mpsc::channel::<ShellChannel>(2);
+        let shell_slot = Arc::new(ShellSlot { tx: shell_tx, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
 
         let ready_dc: Option<Arc<RTCDataChannel>> = if is_controller {
             let dc = pc
@@ -960,15 +1110,22 @@ impl WebRtcTransport {
             let inbound_tx = inbound_tx.clone();
             let open = open.clone();
             let dc_slot = dc_slot.clone();
+            let shell_slot = shell_slot.clone();
             let peer_gone = peer_gone.clone();
             let peer_gone_notify = peer_gone_notify.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let inbound_tx = inbound_tx.clone();
                 let open = open.clone();
                 let dc_slot = dc_slot.clone();
+                let shell_slot = shell_slot.clone();
                 let peer_gone = peer_gone.clone();
                 let peer_gone_notify = peer_gone_notify.clone();
                 Box::pin(async move {
+                    if dc.label() == SHELL_CHANNEL_LABEL {
+                        accept_shell_channel(dc, &dc_slot, &shell_slot).await;
+                        return;
+                    }
+
                     // Exactly ONE data channel per peer connection (security audit 2026-10-18). A
                     // second channel used to be wired anyway, each with its own 4 MiB reassembler, so
                     // a brokered peer could open hundreds of them, park a near-complete frame in each
@@ -1089,6 +1246,8 @@ impl WebRtcTransport {
         Ok(Self {
             pc,
             dc,
+            // Agent side only: a controller opens a shell channel, it never accepts one.
+            shell_rx: if is_controller { None } else { Some(shell_rx) },
             inbound: inbound_rx,
             replay: std::collections::VecDeque::new(),
             video_in,
@@ -1289,21 +1448,32 @@ impl WebRtcTransport {
         let open = Arc::new(Notify::new());
         let (dc_tx, dc_rx) = oneshot::channel::<Arc<RTCDataChannel>>();
         let dc_slot = Arc::new(tokio::sync::Mutex::new(Some(dc_tx)));
+        let (shell_tx, shell_rx) = mpsc::channel::<ShellChannel>(2);
+        let shell_slot = Arc::new(ShellSlot { tx: shell_tx, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
 
         // Agent receives the data channel via on_data_channel.
         let inbound_tx_dc = inbound_tx.clone();
         let open_dc = open.clone();
         let dc_slot_dc = dc_slot.clone();
+        let shell_slot_dc = shell_slot.clone();
         let peer_gone_dc = peer_gone.clone();
         let peer_gone_notify_dc = peer_gone_notify.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let inbound_tx = inbound_tx_dc.clone();
             let open = open_dc.clone();
             let dc_slot = dc_slot_dc.clone();
+            let shell_slot = shell_slot_dc.clone();
             let peer_gone = peer_gone_dc.clone();
             let peer_gone_notify = peer_gone_notify_dc.clone();
             Box::pin(async move {
-                // One data channel per peer connection; see the twin in `connect` above.
+                // docs/76: exactly one channel labelled `shell`, and only once the session channel exists. It carries
+                // terminal bytes only; the session loop decides whether a shell may open at all.
+                if dc.label() == SHELL_CHANNEL_LABEL {
+                    accept_shell_channel(dc, &dc_slot, &shell_slot).await;
+                    return;
+                }
+
+                // One session data channel per peer connection; see the twin in `connect` above.
                 let Some(tx) = dc_slot.lock().await.take() else {
                     tracing::warn!(role = "agent", "refused an extra data channel from the peer");
                     let _ = dc.close().await;
@@ -1419,6 +1589,7 @@ impl WebRtcTransport {
         Ok(Self {
             pc,
             dc,
+            shell_rx: Some(shell_rx),
             inbound: inbound_rx,
             replay: std::collections::VecDeque::new(),
             video_in,
@@ -1565,6 +1736,12 @@ impl WebRtcTransport {
         for f in frames.into_iter().rev() {
             self.replay.push_front(f);
         }
+    }
+
+    /// Agent side: the console's shell channel (docs/76), taken once. `None` on the controller side or once taken. The
+    /// receiver resolves when the console opens the channel; it never resolves if the console never does.
+    pub fn take_shell_channel(&mut self) -> Option<mpsc::Receiver<ShellChannel>> {
+        self.shell_rx.take()
     }
 
     /// TEST HOOK: open an ADDITIONAL data channel from this side of an established connection.
@@ -5400,9 +5577,24 @@ impl ExtraDataChannel {
         let _ = self.dc.send(&frame.to_bytes()).await;
     }
 
+    /// Send raw bytes (binary message), as the console's terminal does on the shell channel.
+    pub async fn send_raw(&self, bytes: &[u8]) {
+        let _ = self.dc.send(&bytes::Bytes::copy_from_slice(bytes)).await;
+    }
+
+    /// Send a text message, as the console's terminal does for its control messages.
+    pub async fn send_text(&self, text: &str) {
+        let _ = self.dc.send_text(text.to_owned()).await;
+    }
+
     /// The channel's current ready state, for test diagnostics.
     pub fn state(&self) -> String {
         format!("{:?}", self.dc.ready_state())
+    }
+
+    /// Close this channel, as the console does when the technician leaves the Command prompt tab.
+    pub async fn close(&self) {
+        let _ = self.dc.close().await;
     }
 }
 

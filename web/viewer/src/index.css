@@ -1439,6 +1439,23 @@ select {
   cursor: default;
 }
 
+/* 2026-11-24: `.panel__name` is display:flex (for the fleet table's presence dot). On a plain <td> that takes the cell
+   out of the table layout: its border and height stop matching the row, and the line under each row broke and
+   dropped a few pixels at the Services display name. Every table keeps real table cells. */
+td.panel__name {
+  display: table-cell;
+  vertical-align: middle;
+}
+/* What the flex gap used to space inside a name cell. */
+td.panel__name > .panel__dot {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+td.panel__name > * + * {
+  margin-left: 6px;
+}
+
 .panel__mono {
   font-family: ui-monospace, "Cascadia Code", monospace;
   font-size: var(--fs-sm);
@@ -1786,6 +1803,66 @@ select {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
+}
+
+/* docs/77 two-pane explorer: side by side on a desktop, stacked on a narrow window. */
+.explorer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .explorer { grid-template-columns: minmax(0, 1fr); }
+}
+.explorer__pane {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+}
+.explorer__title {
+  margin: 0 0 6px;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+.explorer__bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.explorer__loc {
+  font-family: var(--font-mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backstage__filter {
+  width: min(240px, 40vw);
+}
+
+.backstage__filtercount {
+  margin: 4px 12px;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.backstage__filesnav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.backstage__filesnav-loc {
+  font-family: var(--font-mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .backstage__tabs {

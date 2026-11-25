@@ -10,7 +10,8 @@ export type { BulkRow, BulkRowOutcome, BulkRowState } from "./bulk_types";
  * Both run as an ordinary RunCommand on the agent; only the control-plane authorization differs.
  */
 export type BulkTask =
-  | { kind: "toolbox"; item: ToolboxItem }
+  /** `params` (docs/75): the script's param() values, the same for every machine (D8). */
+  | { kind: "toolbox"; item: ToolboxItem; params?: Record<string, string> }
   | { kind: "adhoc"; name: string; shell: ToolboxShell; runAs: ToolboxRunAs; body: string }
   | {
       kind: "upload";
@@ -120,7 +121,9 @@ export function runBulk(
   const budget = opts.aggregateBudgetBytes ?? 2 * 1024 * 1024;
   if (!Number.isSafeInteger(budget) || budget < 0) throw new Error("Invalid aggregate output budget");
   // The selected task must not change underneath queued rows (a toolbox item's version in particular).
-  const selected: BulkTask = task.kind === "toolbox" ? { kind: "toolbox", item: { ...task.item } } : { ...task };
+  const selected: BulkTask = task.kind === "toolbox"
+    ? { kind: "toolbox", item: { ...task.item }, ...(task.params ? { params: { ...task.params } } : {}) }
+    : { ...task };
   const rows: BulkRow[] = unique.map((deviceId) => ({ deviceId, machineName: deviceId, state: "queued" }));
   const aborts = new Set<AbortController>();
   let cancelled = false;

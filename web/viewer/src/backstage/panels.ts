@@ -62,6 +62,23 @@ export interface ServiceRow {
   state: ServiceState;
   /** Host process PID, or null when the service isn't running (no host process). */
   pid: number | null;
+  /** How it starts; absent from agents older than 1.3.38 or when its configuration could not be read. */
+  start_type?: ServiceStartType;
+}
+
+export type ServiceStartType = "boot" | "system" | "auto" | "auto_delayed" | "manual" | "disabled";
+
+/** services.msc wording. */
+export function serviceStartTypeLabel(t: ServiceStartType | undefined): string {
+  switch (t) {
+    case "auto": return "Automatic";
+    case "auto_delayed": return "Automatic (delayed start)";
+    case "manual": return "Manual";
+    case "disabled": return "Disabled";
+    case "boot": return "Boot";
+    case "system": return "System";
+    default: return "—";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,4 +422,28 @@ export function breadcrumbSegments(path: string): Breadcrumb[] {
     crumbs.push({ label: part, path: acc });
   }
   return crumbs;
+}
+
+// ---------------------------------------------------------------------------
+// Filter box (2026-11-24: Under the Hood had no way to find one process or service in hundreds)
+// ---------------------------------------------------------------------------
+
+/** Case-insensitive: every whitespace-separated word must appear in at least one of the row's fields. */
+export function matchesFilter(query: string, fields: readonly (string | number | null | undefined)[]): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  const hay = fields.filter((f) => f !== null && f !== undefined).map((f) => String(f).toLowerCase());
+  return words.every((w) => hay.some((h) => h.includes(w)));
+}
+
+export function filterProcesses(rows: readonly ProcessRow[], query: string): ProcessRow[] {
+  return rows.filter((r) => matchesFilter(query, [r.name, r.pid, r.user, r.command_line]));
+}
+
+export function filterServices(rows: readonly ServiceRow[], query: string): ServiceRow[] {
+  return rows.filter((r) => matchesFilter(query, [r.name, r.display_name, r.state]));
+}
+
+export function filterEventLog(rows: readonly EventLogRow[], query: string): EventLogRow[] {
+  return rows.filter((r) => matchesFilter(query, [r.provider, r.event_id, r.level, r.channel, r.time_created]));
 }

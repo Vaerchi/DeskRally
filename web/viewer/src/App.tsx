@@ -17,6 +17,8 @@ import type { MonitorCanvas } from "./lib/monitor_canvas";
 
 import { MenuSection, ToolbarMenu } from "./components/ToolbarMenu";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { openPopout } from "./lib/popout";
 import {
   AccessPanel,
   DEFAULT_SIGNALING_URL,
@@ -472,6 +474,9 @@ export default function App() {
   // the Offer, a refusal before any Offer, or a request that expired unanswered. Anything else
   // remains until session teardown (clear()). The map is bounded by maxPendingRequests (32).
   const pendingBrowseRelsRef = useRef<Map<string, string>>(new Map());
+  // docs/77 explorer "Get": downloads requested by Under the Hood, by request id. Delivered to their requester (which
+  // writes them into the technician's chosen folder), never to the Save dialog.
+  const directDownloadsRef = useRef<Map<string, { resolve: (bytes: Uint8Array) => void; reject: (e: Error) => void }>>(new Map());
   // Privacy: whether the guest's own keyboard/mouse are blocked. Sourced from the agent's
   // `InputBlockApplied` ack (the state actually in force), NOT optimistically from the request — the
   // block can fail to arm, and this must reflect reality.
@@ -1341,6 +1346,8 @@ export default function App() {
     setChatTruncated(false);
     setDownload(null);
     pendingBrowseRelsRef.current.clear();
+    for (const d of directDownloadsRef.current.values()) d.reject(new Error("the session ended"));
+    directDownloadsRef.current.clear();
     setCompletedBrowseRelPaths(new Set());
     setBrowseUploads([]);
     setPendingDownloads([]);
@@ -1443,7 +1450,11 @@ export default function App() {
       const isCurrent=()=> authSession.isCurrent(authEpoch) && sessionGeneration.current === generation;
       setSession({ device, name });
       setMachineAlias(pendingAlias);
-      setView("screen");
+      // "Under the Hood only" (2026-11-24) asks for the tools view; a recovery reconnect keeps whatever view
+      // the technician was on.
+      const wantView = connectViewRef.current ?? "screen";
+      connectViewRef.current = null;
+      setView((current) => (recovering ? current : wantView));
       setStream(null);
       setMonitors([]);
     setPinnedMonitorId(undefined);
@@ -2010,6 +2021,13 @@ export default function App() {
               }`,
             );
           } else {
+            const direct = file.id ? directDownloadsRef.current.get(file.id) : undefined;
+            if (direct && file.id) {
+              directDownloadsRef.current.delete(file.id);
+              if (file.verified) direct.resolve(file.bytes);
+              else direct.reject(new Error("the file arrived with a checksum mismatch; it was not saved"));
+              return;
+            }
             // Save the file immediately regardless of which tab is active (Bug 1 fix).
             saveBytesAsFile(file.name, file.bytes);
             // Update download state for status display in FileTransferPanel (when it's mounted).
@@ -2037,6 +2055,12 @@ export default function App() {
           // Also removes the stale map entry so a later same-basename manual download never
           // inherits a badge that belonged to the failed browse request.
           onDownloadError: ({ id, name, reason }) => {
+            const direct = id ? directDownloadsRef.current.get(id) : undefined;
+            if (direct && id) {
+              directDownloadsRef.current.delete(id);
+              direct.reject(new Error(reason));
+              return;
+            }
             const label = name ? `Download ${name}` : "Download";
             setError(`${label} rejected: ${reason}`);
             if (id) pendingBrowseRelsRef.current.delete(id);
@@ -2448,6 +2472,20 @@ export default function App() {
     // No session or credentials are minted in the browser. The app authenticates and authorizes itself.
     window.location.assign(uri);
   }, [authSession]);
+  // "Under the Hood only" (2026-11-24): connect in THIS window (never hand off to the desktop app) and land in
+  // Under the Hood. The remote still shows its normal connected indicator; nothing is covert.
+  const connectViewRef = useRef<ConsoleView | null>(null);
+  const handleToolsOnlyFromList = useCallback(
+    (device: DeviceId, name: string, signalingUrl: string, alias?: string) => {
+      setNavOpen(false);
+      setArea("live");
+      pendingMachineAliasRef.current = alias;
+      connectViewRef.current = "backstage";
+      handleConnect(device, name, signalingUrl, undefined, false, false);
+    },
+    [handleConnect],
+  );
+
   const handleConnectFromList = useCallback(
     (device: DeviceId, name: string, signalingUrl: string, alias?: string, observe = false) => {
       setNavOpen(false);
@@ -2711,6 +2749,25 @@ export default function App() {
 
   // File browser download: delegates to downloadFileFromBrowse() which enforces the no-fallback
   // safety contract — if the agent has not sent a TransferDir message the call is a no-op.
+  /** docs/77: fetch one file from the agent's transfer folder (a staged copy) as bytes, for the explorer's Get. */
+  const fetchFromAgent = useCallback(
+    (rel: string) =>
+      new Promise<Uint8Array>((resolve, reject) => {
+        const client = fileTransferRef.current;
+        if (!client) {
+          reject(new Error("the session is not connected"));
+          return;
+        }
+        try {
+          // The reply arrives asynchronously (over the network), so registering right after the request is in time.
+          directDownloadsRef.current.set(client.request(rel), { resolve, reject });
+        } catch (e) {
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      }),
+    [],
+  );
+
   const downloadFromBrowse = useCallback((absolutePath: string) => {
     const result = downloadFileFromBrowse(absolutePath, agentTransferDirRef.current, fileTransferRef.current);
     if (result !== null) {
@@ -2856,7 +2913,7 @@ export default function App() {
    * authorizes the run against the held session and commits the audit record FIRST, and returns the
    * exact command; only then is it sent as an ordinary RunCommand. A refusal sends nothing.
    */
-  const runToolboxItem = useCallback(async (item: ToolboxItem) => {
+  const runToolboxItem = useCallback(async (item: ToolboxItem, params: Record<string, string> = {}) => {
     const op = ++commandOpSeq.current;
     const sessionAtStart = brokeredSessionRef.current;
     setCommandResult(undefined);
@@ -2871,7 +2928,7 @@ export default function App() {
         if (control) runReceiptsRef.current?.dispatch(control, command, shell, asUser, requestId);
       },
       isCurrent: () => commandOpSeq.current === op && brokeredSessionRef.current === sessionAtStart,
-    });
+    }, params);
     if (!outcome.sent && !outcome.stale) {
       setCommandPending(false);
       setToolboxError(outcome.error);
@@ -3081,7 +3138,7 @@ export default function App() {
 
   // Session chrome mode. An app error forces the bar open: the error banner lives in it and must never
   // be hidden behind the collapsed tab.
-  const chrome = chromeMode(area === "live" && !!session, sessionChrome, chromeOpen || !!error);
+  const chrome = chromeMode(area === "live" && !!session, sessionChrome, chromeOpen || !!error, view === "screen");
   const minimalChrome = chrome === "collapsed" || chrome === "overlay";
   // Menu redesign wave 10b: outside a live session, on anything wider than a phone, the page bar is drawn and the
   // help-request and activity bells and an Account menu sit at its right end. Otherwise (a live session, or a phone,
@@ -3154,6 +3211,88 @@ export default function App() {
 
   // THE GATE. Nothing below this renders until the control plane says who you are.
   //
+  // Under the Hood (Backstage) as one element, shown in the session area or in its own window (2026-11-24: the operator wanted
+  // the SYSTEM tools "in a separate window" beside the screen). The window re-renders on every App render, like the
+  // screen pop-out, so it never shows stale panels.
+  const backstagePanelsEl = session ? (
+
+                <BackstagePanels
+                  machineName={session.name}
+                  serviceStartType={!observing && backstageFeatures.has("service_start_type_v1")}
+                  fetchFromAgent={!observing && backstageFeatures.has("file_stage_v1") ? fetchFromAgent : undefined}
+                  openShellChannel={!observing && backstageFeatures.has("system_shell_v1")
+                    ? () => transportRef.current?.openShellChannel() ?? null
+                    : undefined}
+                  client={backstageClient ?? undefined}
+                  // H1 secure-mode hook: when a backstage request is denied for lack of a grant, the
+                  // panel surfaces a paste-a-SignedGrant affordance and calls this to install it over
+                  // the Control channel. Dev/synthetic agents self-issue a demo grant, so this never
+                  // fires there. V3 replaces the pasted grant with a `POST /grant/mint` fetch.
+                  onInstallGrant={(signedGrant) => {
+                    setGrantCapabilities(parseGrantCapabilities(signedGrant));
+                    controlRef.current?.installGrant(signedGrant);
+                  }}
+                  // V4 primary path: one-click "Get access" mints a grant from the control plane and
+                  // installs it. Paste (onInstallGrant) stays as a manual fallback.
+                  onFetchGrant={handleFetchGrant}
+                  grantInstalled={grantInstalled}
+                  grantNotice={grantResumeNotice}
+                  fileManage={
+                    !observing &&
+                    // The AGENT advertises file_manage only when the grant it verified holds
+                    // file_delete (docs/58 §2); a grant the console minted must agree.
+                    backstageFeatures.has("file_manage") &&
+                    grantCapabilities?.has("file_delete") !== false
+                  }
+                  // docs/58 §12: "Upload here" only when the agent says it can place uploads.
+                  uploadToAgent={
+                    !observing && backstageFeatures.has("file_place") && fileTransferClient
+                      ? async (file: File) =>
+                          fileTransferClient.uploadWithId(file.name, new Uint8Array(await file.arrayBuffer()))
+                      : undefined
+                  }
+                />
+  ) : null;
+  const uthWindowRef = useRef<{ win: Window; root: Root } | null>(null);
+  const [uthPopped, setUthPopped] = useState(false);
+  const closeUthWindow = useCallback(() => {
+    const p = uthWindowRef.current;
+    uthWindowRef.current = null;
+    setUthPopped(false);
+    if (!p) return;
+    try { p.root.unmount(); } catch { /* window already gone */ }
+    try { p.win.close(); } catch { /* not ours to close */ }
+  }, []);
+  const openUthWindow = useCallback(async () => {
+    if (uthWindowRef.current && !uthWindowRef.current.win.closed) {
+      uthWindowRef.current.win.focus();
+      return;
+    }
+    const opened = await openPopout("Under the Hood - " + (session?.name ?? "DeskRally"), "rmt-under-the-hood");
+    if (!opened) {
+      setError("The browser blocked the Under the Hood window. Allow pop-ups for this site, then try again.");
+      return;
+    }
+    uthWindowRef.current = { win: opened.win, root: createRoot(opened.container) };
+    opened.win.addEventListener("pagehide", closeUthWindow);
+    setUthPopped(true);
+    // The point of the window: the screen stays in this tab while the tools are in the other.
+    setView("screen");
+  }, [session?.name, closeUthWindow]);
+  useEffect(() => {
+    const p = uthWindowRef.current;
+    if (!uthPopped || !p) return;
+    p.root.render(backstagePanelsEl ?? <p className="panel__empty">The session has ended.</p>);
+  });
+  useEffect(() => {
+    if (!uthPopped) return;
+    const t = setInterval(() => { if (uthWindowRef.current?.win.closed) closeUthWindow(); }, 1000);
+    return () => clearInterval(t);
+  }, [uthPopped, closeUthWindow]);
+  // A session ending (or switching machine) closes the window: it must never show another machine's tools.
+  useEffect(() => {
+    closeUthWindow();
+  }, [session?.device, closeUthWindow]);
   // Deliberately an early return rather than an overlay: an overlay still mounts the panels behind
   // it, and every one of them fires its own authenticated fetch. Returning here means an
   // unauthenticated browser makes exactly one request — the probe that produced the 401 — and shows
@@ -3292,6 +3431,20 @@ export default function App() {
             <MenuSection title="Participants" testId="session-menu-participants" focusable>
               <SessionParticipants participants={participants} ownSessionId={ownSignalingId} input={inputHandoff} />
             </MenuSection>
+            {/* 2026-11-24: Under the Hood was reachable only through the Session view select in the full top bar,
+                which the collapsed session tab hides. Offer it here too, plus its own window beside the screen. */}
+            <MenuSection title="Under the Hood" testId="session-menu-uth">
+              <button type="button" className="panel__action" data-testid="session-uth-show"
+                title="Processes, services, files and event log on the remote machine, as SYSTEM, without touching its screen"
+                onClick={() => setView(view === "backstage" ? "screen" : "backstage")}>
+                {view === "backstage" ? "Back to the screen" : "Show Under the Hood"}
+              </button>
+              <button type="button" className="panel__action" data-testid="session-uth-window"
+                title="Open Under the Hood in its own window so the screen stays visible here"
+                onClick={() => { if (uthPopped) closeUthWindow(); else void openUthWindow(); }}>
+                {uthPopped ? "Close the Under the Hood window" : "Open Under the Hood in a new window"}
+              </button>
+            </MenuSection>
             <MenuSection title="Clipboard" testId="session-menu-clipboard">
             {!viewerPoppedOut && <ClipboardControl client={observing ? undefined : clipboardClient ?? undefined} notice={clipboardNotice} />}
             </MenuSection>
@@ -3340,7 +3493,7 @@ export default function App() {
             {chrome === "pinned" && (
               <button type="button" className="panel__action" data-testid="session-chrome-unpin"
                 title="Hide the toolbar behind a small tab at the top edge"
-                onClick={() => { focusAfterChrome.current = "toggle"; setChromePref("minimal"); }}>
+                onClick={() => { focusAfterChrome.current = "toggle"; setChromePref("minimal"); setChromeOpen(false); }}>
                 Hide toolbar
               </button>
             )}
@@ -3418,6 +3571,7 @@ export default function App() {
           onObserve={(!desktopClient && preferDesktop) || (desktopClient && session && state !== "failed" && state !== "idle") ? undefined : (device, name, url, alias) => handleConnectFromList(device, name, url, alias, true)}
           activeDevice={session?.device ?? null}
           onEndSession={handleEndFleetSession}
+          onToolsOnly={handleToolsOnlyFromList}
           onPin={layoutPref === "compact" ? pinMachineList : undefined}
         />
 
@@ -3561,7 +3715,7 @@ export default function App() {
                   onElevatedRun={!observing && canElevate ? elevatedRun : undefined}
                   toolboxItems={toolboxItems}
                   onRefreshToolbox={!observing && canElevate ? refreshToolbox : undefined}
-                  onRunToolboxItem={!observing && canElevate ? (it) => void runToolboxItem(it) : undefined}
+                  onRunToolboxItem={!observing && canElevate ? (it, params) => void runToolboxItem(it, params) : undefined}
                   toolboxError={toolboxError}
                   toolboxListError={toolboxListError}
                   elevationError={elevationError}
@@ -3593,39 +3747,12 @@ export default function App() {
                   onWatchedMonitors={ids => controlRef.current?.watchedMonitors(ids)}
                 />
               )}
-              {view === "backstage" && (
-                <BackstagePanels
-                  machineName={session.name}
-                  client={backstageClient ?? undefined}
-                  // H1 secure-mode hook: when a backstage request is denied for lack of a grant, the
-                  // panel surfaces a paste-a-SignedGrant affordance and calls this to install it over
-                  // the Control channel. Dev/synthetic agents self-issue a demo grant, so this never
-                  // fires there. V3 replaces the pasted grant with a `POST /grant/mint` fetch.
-                  onInstallGrant={(signedGrant) => {
-                    setGrantCapabilities(parseGrantCapabilities(signedGrant));
-                    controlRef.current?.installGrant(signedGrant);
-                  }}
-                  // V4 primary path: one-click "Get access" mints a grant from the control plane and
-                  // installs it. Paste (onInstallGrant) stays as a manual fallback.
-                  onFetchGrant={handleFetchGrant}
-                  grantInstalled={grantInstalled}
-                  grantNotice={grantResumeNotice}
-                  fileManage={
-                    !observing &&
-                    // The AGENT advertises file_manage only when the grant it verified holds
-                    // file_delete (docs/58 §2); a grant the console minted must agree.
-                    backstageFeatures.has("file_manage") &&
-                    grantCapabilities?.has("file_delete") !== false
-                  }
-                  // docs/58 §12: "Upload here" only when the agent says it can place uploads.
-                  uploadToAgent={
-                    !observing && backstageFeatures.has("file_place") && fileTransferClient
-                      ? async (file: File) =>
-                          fileTransferClient.uploadWithId(file.name, new Uint8Array(await file.arrayBuffer()))
-                      : undefined
-                  }
-                />
-              )}
+              {view === "backstage" && (uthPopped ? (
+                <div className="panel" data-testid="uth-popped-notice">
+                  <p>Under the Hood is open in its own window.</p>
+                  <button type="button" className="panel__action" onClick={() => closeUthWindow()}>Bring it back here</button>
+                </div>
+              ) : backstagePanelsEl)}
               {view === "files" && (
                 <FileTransferPanel client={fileTransferClient ?? undefined} download={download} />
               )}

@@ -1,8 +1,9 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ConsoleApi, MachineRecord, ToolboxRunAs, ToolboxShell } from "../lib/console_api";
 import { runBulk, type BulkRow, type BulkRun, type BulkTask, type OpenBulkCore } from "../lib/bulk_run";
 import { buildActiveSessionMap } from "../lib/console_panels";
 import { bulkResultsToCsv } from "../lib/report_csv";
+import { paramValue, paramsForRun, paramsProblem, parseToolboxParams } from "../lib/toolbox_params";
 
 interface BulkRunDialogProps {
   api: ConsoleApi;
@@ -56,6 +57,13 @@ export function BulkRunDialog({ api, task, compose, openBulkCore, onClose }: Bul
   const [runArgs, setRunArgs] = useState("");
   const [runAsAfter, setRunAsAfter] = useState<ToolboxRunAs>("system");
   const [step, setStep] = useState<"compose" | "picker" | "confirm" | "results">(task ? "picker" : compose ? "compose" : "picker");
+  // Script parameters (docs/75 D8): one set of values for every machine.
+  const toolParse = useMemo(
+    () => (task?.kind === "toolbox" ? parseToolboxParams(task.item.shell, task.item.body) : { params: [], unsupported: false }),
+    [task],
+  );
+  const [paramValues, setParamValues] = useState<Record<string, string>>({});
+  const paramIssue = task?.kind === "toolbox" ? paramsProblem(paramValues, toolParse) : null;
   // The task actually being run: the saved one, or the ad-hoc one once composed.
   const activeTask: BulkTask | null = task ?? composed;
   const isUpload = activeTask?.kind === "upload";
@@ -144,6 +152,10 @@ export function BulkRunDialog({ api, task, compose, openBulkCore, onClose }: Bul
     if (handle.current || !t || selected.size === 0 || selected.size > 25) return;
     if (t.kind === "upload" && runAfter) {
       t = { ...t, run: { args: runArgs, runAs: runAsAfter } };
+    }
+    if (t.kind === "toolbox") {
+      if (paramIssue) return;
+      t = { ...t, params: paramsForRun(paramValues, toolParse.params) };
     }
     const label = t.kind === "toolbox" ? `${t.item.name} v${t.item.version}`
       : t.kind === "upload" ? (t.run ? `file+run: ${t.name}` : `file: ${t.name}`)
@@ -281,9 +293,26 @@ export function BulkRunDialog({ api, task, compose, openBulkCore, onClose }: Bul
             : <>
                 <p>Run {taskName} ({cmdSummary?.shell}, as {cmdSummary?.runAs === "system" ? "SYSTEM" : "signed-in user"}) on {selected.size} machines</p>
                 <pre className="panel__code" tabIndex={0} style={{ maxHeight: "35vh", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{cmdSummary?.body}</pre>
+                {toolParse.params.length > 0 && (
+                  <fieldset data-testid="bulk-params">
+                    <legend>Script parameters (the same on every machine)</legend>
+                    <p className="panel__hint">Values are not saved, but they reach each machine on the PowerShell command line, where endpoint logging can record them. Do not pass passwords or keys here.</p>
+                    {toolParse.params.map((p) => (
+                      <label key={p.name} style={{ display: "block" }}>
+                        {p.name}{p.mandatory ? " *" : ""}{" "}
+                        <input type={p.secretLooking ? "password" : "text"} autoComplete="off"
+                          data-testid={`bulk-param-${p.name}`} disabled={p.unsupported}
+                          placeholder={p.unsupported ? "not supported" : p.defaultText || p.type}
+                          value={paramValue(paramValues, p.name)}
+                          onChange={(e) => setParamValues((v) => ({ ...v, [p.name]: e.target.value }))} />
+                      </label>
+                    ))}
+                    {paramIssue && <p className="panel__hint" data-testid="bulk-param-issue">{paramIssue}</p>}
+                  </fieldset>
+                )}
               </>}
           <button className="panel__action" onClick={() => setStep("picker")}>Back</button>
-          <button className="panel__action" data-testid="bulk-run" onClick={start}>Run</button>
+          <button className="panel__action" data-testid="bulk-run" disabled={paramIssue !== null} onClick={start}>Run</button>
         </>}
         {step === "results" && <>
           <p role="status" aria-live="polite">{Object.entries(counts).map(([state, count]) => `${count} ${state}`).join("; ")}{!settled && " — cleanup remains active"}</p>

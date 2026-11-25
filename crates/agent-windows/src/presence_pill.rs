@@ -76,10 +76,12 @@ pub fn pill_text(view_only: bool) -> &'static str {
 
 /// The pill's label. With a connection code (docs/69 6.1) the code comes FIRST: the pill ends long text with an
 /// ellipsis, and the digits are what the person at the machine is asked to read (11-18).
-pub fn pill_label(view_only: bool, code: Option<&str>) -> String {
+pub fn pill_label(view_only: bool, shell_open: bool, code: Option<&str>) -> String {
+    // docs/76: an open SYSTEM command prompt is said right after the code, before the long text the ellipsis may cut.
+    let shell = if shell_open { "Command prompt open \u{00b7} " } else { "" };
     match code {
-        Some(code) => format!("Code {code} \u{00b7} {}", pill_text(view_only)),
-        None => pill_text(view_only).to_owned(),
+        Some(code) => format!("Code {code} \u{00b7} {shell}{}", pill_text(view_only)),
+        None => format!("{shell}{}", pill_text(view_only)),
     }
 }
 
@@ -288,7 +290,7 @@ extern "system" fn pill_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                         SetBkMode(hdc, TRANSPARENT);
                         SetTextColor(hdc, COLORREF(TEXT_COLOR));
                         let code = crate::guest_window::pill_code(HWND(st.guest as *mut _));
-                        let mut text: Vec<u16> = pill_label(view_only, code.as_deref()).encode_utf16().collect();
+                        let mut text: Vec<u16> = pill_label(view_only, crate::guest_window::pill_shell_open(HWND(st.guest as *mut _)), code.as_deref()).encode_utf16().collect();
                         let mut body = RECT { right: rc.right - COLLAPSE_W, ..rc };
                         DrawTextW(hdc, &mut text, &mut body, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
                         let mut collapse: Vec<u16> = "—".encode_utf16().collect();
@@ -332,11 +334,15 @@ mod tests {
     // 11-18: the connection code leads the pill, so the ellipsis can never hide it.
     #[test]
     fn pill_label_leads_with_the_connection_code() {
-        assert_eq!(pill_label(false, None), pill_text(false));
-        assert_eq!(pill_label(true, None), pill_text(true));
-        let l = pill_label(false, Some("697 670"));
+        assert_eq!(pill_label(false, false, None), pill_text(false));
+        assert_eq!(pill_label(true, false, None), pill_text(true));
+        let l = pill_label(false, false, Some("697 670"));
         assert!(l.starts_with("Code 697 670 \u{00b7} "), "{l}");
         assert!(l.ends_with(pill_text(false)), "{l}");
+        // docs/76: an open command prompt is named right after the code, before the text the ellipsis can cut.
+        let s = pill_label(false, true, Some("697 670"));
+        assert!(s.starts_with("Code 697 670 \u{00b7} Command prompt open \u{00b7} "), "{s}");
+        assert!(pill_label(true, true, None).starts_with("Command prompt open \u{00b7} "));
     }
     /// The slot table is process-global, and the test harness runs tests in parallel: a test that frees
     /// a slot and expects to get it back raced one taking twelve at once (a gate flake, 2026-10-30:

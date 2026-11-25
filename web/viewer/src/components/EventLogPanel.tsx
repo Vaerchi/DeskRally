@@ -36,7 +36,7 @@ export function EventLogPanel({ rows }: EventLogPanelProps) {
           {rows.length === 0 && (
             <tr>
               <td className="panel__empty" colSpan={6}>
-                No events.
+                No events. The log may be empty, may not exist on this machine, or may need more access to read.
               </td>
             </tr>
           )}

@@ -287,6 +287,8 @@ export interface AccessPanelProps {
    */
   onConnect: (device: DeviceId, name: string, signalingUrl: string, alias?: string) => void;
   onObserve?: (device: DeviceId, name: string, signalingUrl: string, alias?: string) => void;
+  /** "Under the Hood only": connect straight into the SYSTEM tools view without showing the screen. */
+  onToolsOnly?: (device: DeviceId, name: string, signalingUrl: string, alias?: string) => void;
   /** DeviceId of the machine currently being controlled, if any. */
   activeDevice?: DeviceId | null;
   /**
@@ -300,7 +302,7 @@ export interface AccessPanelProps {
   onPin?: () => void;
 }
 
-export function AccessPanel({ machines, onConnect, onObserve, activeDevice = null, onEndSession, onPin }: AccessPanelProps) {
+export function AccessPanel({ machines, onConnect, onObserve, onToolsOnly, activeDevice = null, onEndSession, onPin }: AccessPanelProps) {
   const [query, setQuery] = useState("");
   const [onlineOnly, setOnlineOnly] = useState(false);
   const [endingSessionIds, setEndingSessionIds] = useState<ReadonlySet<string>>(new Set());
@@ -553,6 +555,17 @@ export function AccessPanel({ machines, onConnect, onObserve, activeDevice = nul
                       onClick={() => onObserve(m.device, m.name, DEFAULT_SIGNALING_URL, m.alias)}
                     >
                       {VIEW_ONLY_LABEL}
+                    </button>
+                  )}
+                  {onToolsOnly && (
+                    <button
+                      className="panel__action"
+                      data-testid={`tools-only-${m.device}`}
+                      title="Connect for processes, services, files and the event log (as SYSTEM) without showing the screen. The machine still shows that a technician is connected."
+                      disabled={!connectState({ online: m.online, status: m.status, current: false }).enabled}
+                      onClick={() => onToolsOnly(m.device, m.name, DEFAULT_SIGNALING_URL, m.alias)}
+                    >
+                      Under the Hood only
                     </button>
                   )}
                   <a

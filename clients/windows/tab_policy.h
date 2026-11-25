@@ -70,4 +70,13 @@ inline long long replacement_after_close(std::size_t closed, std::size_t count_b
     return static_cast<long long>(remaining - 1);
 }
 
+// The close mark (U+2715) is the last thing in a tab's label. A left click within this many pixels (at 96 DPI) of the
+// tab's right edge closes the tab; anywhere else on the tab selects it.
+inline constexpr int kCloseHotPx = 22;
+
+inline bool on_close_mark(int x, int tab_right, unsigned dpi) {
+    const int hot = static_cast<int>(kCloseHotPx * (dpi ? dpi : 96) / 96);
+    return x <= tab_right && x >= tab_right - hot;
+}
+
 } // namespace drtabs

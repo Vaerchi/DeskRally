@@ -46,6 +46,7 @@ func oidcRaceNew(t *testing.T, credential, linked bool) *oidcRaceFixture {
 	applyTenantProvisionMigration(t, su)
 	applyMigrationFile(t, su, "migrations/0054_mfa_generation.sql")
 	applyMigrationFile(t, su, "migrations/0056_toolbox.sql")
+	applyMigrationFile(t, su, "migrations/0089_toolbox_item_version.sql") // toolbox version history
 	applyMigrationFile(t, su, "migrations/0057_oidc_sso.sql")
 	applyMigrationFile(t, su, "migrations/0080_oidc_remember.sql") // the remember choice on the attempt
 	f := &oidcRaceFixture{ctx: ctx, su: su}

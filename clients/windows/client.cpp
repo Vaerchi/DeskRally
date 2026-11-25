@@ -1336,7 +1336,9 @@ static void RefreshTabStrip(const std::shared_ptr<WindowState>& win) {
     int i = 0, activeIndex = -1;
     for (auto& t : win->tabs) {
         if (!t || t->phase == WindowState::Phase::Closing) continue;
-        std::wstring label = TabStripLabel(t);
+        // A visible close mark on every tab (2026-11-25: tabs could only be closed by Ctrl+W, middle-click or the menu).
+        // A click on it is caught in TabStripSubclass by position (drtabs::kCloseHotPx from the tab's right edge).
+        std::wstring label = TabStripLabel(t) + L"   \u2715";
         TCITEMW item{}; item.mask = TCIF_TEXT | TCIF_PARAM;
         item.pszText = label.data(); item.lParam = static_cast<LPARAM>(t->tab_id);
         TabCtrl_InsertItem(win->tab_ctrl, i, &item);
@@ -1537,8 +1539,21 @@ static drtabs::KeyInput KeyModifiersNow(drtabs::KeyInput k) {
     return k;
 }
 
-// Middle-click on a tab closes it (posted, by id).
+// Middle-click on a tab closes it (posted, by id), and so does a left click on its close mark at the right end.
 static LRESULT CALLBACK TabStripSubclass(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+    if (msg == WM_LBUTTONDOWN) {
+        TCHITTESTINFO hit{}; hit.pt.x = GET_X_LPARAM(lp); hit.pt.y = GET_Y_LPARAM(lp);
+        const int idx = TabCtrl_HitTest(h, &hit);
+        RECT rc{};
+        TCITEMW item{}; item.mask = TCIF_PARAM;
+        if (idx >= 0 && TabCtrl_GetItemRect(h, idx, &rc) && TabCtrl_GetItem(h, idx, &item) && item.lParam != 0) {
+            const UINT dpi = GetDpiForWindow(h);
+            if (drtabs::on_close_mark(hit.pt.x, rc.right, dpi ? dpi : 96)) {
+                PostMessageW(reinterpret_cast<HWND>(ref), WM_APP_TAB_COMMAND, kTabCloseId, item.lParam);
+                return 0;  // the close mark does not select the tab first
+            }
+        }
+    }
     if (msg == WM_MBUTTONUP) {
         TCHITTESTINFO hit{}; hit.pt.x = GET_X_LPARAM(lp); hit.pt.y = GET_Y_LPARAM(lp);
         const int idx = TabCtrl_HitTest(h, &hit);
@@ -1574,7 +1589,7 @@ static bool RegisterHandlers(std::shared_ptr<WindowState> state) {
     std::wstring ua(uaW);
     CoTaskMemFree(uaW);
     if (ua.find(L"DeskRallyDesktop/") == std::wstring::npos)
-        ua += L" DeskRallyDesktop/0.8.5";
+        ua += L" DeskRallyDesktop/0.8.6";
     if (g_helloVerifiedAtStartup) ua += L" DeskRallyHello/1";
     ua += L" DeskRallySSO/1";
     // The clipboard answer is remembered for the run (g_consentAnswers), so the console may read the

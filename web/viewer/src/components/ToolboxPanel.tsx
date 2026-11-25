@@ -11,10 +11,11 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RunHistory } from "./RunHistory";
 import { formatIsoUtc } from "../backstage/panels";
-import type { ConsoleApi, ToolboxItem, ToolboxItemInput, ToolboxListing, ToolboxRunAs, ToolboxScope, ToolboxShell } from "../lib/console_api";
+import type { ConsoleApi, ToolboxItem, ToolboxItemInput, ToolboxListing, ToolboxRunAs, ToolboxScope, ToolboxShell, ToolboxVersion } from "../lib/console_api";
 import { createLatestWins } from "../lib/latest_wins";
 import type { BulkTask, OpenBulkCore } from "../lib/bulk_run";
 import { BulkRunDialog } from "./BulkRunDialog";
+import { groupToolboxItems, splitToolboxName } from "../lib/toolbox_folders";
 
 export interface ToolboxPanelProps {
   api: ConsoleApi;
@@ -179,6 +180,9 @@ export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
   }, [api, confirmDelete, refresh]);
 
   const items = useMemo(() => filterToolboxItems(listing?.items ?? [], query), [listing, query]);
+  // Folders (a "Folder/Name" prefix) start open; a search shows every match regardless of collapsed folders.
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const searching = query.trim() !== "";
   const size = toolboxBodySize(draft.shell, draft.body);
   const sizeLimit = draft.shell === "powershell" ? limits.maxPowerShellBytes : limits.maxCmdUnits;
   const sizeUnit = draft.shell === "powershell" ? "bytes" : "characters (UTF-16 units)";
@@ -191,7 +195,8 @@ export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
           <span className="panel__toolbar-title">{editing ? `Edit ${editing.name}` : "New script"}</span>
           <label className="panel__toolbar-field">
             Name
-            <input value={draft.name} maxLength={120} onChange={(e) => setDraft({ ...draft, name: e.target.value })} data-testid="toolbox-name" disabled={saving} />
+            <input value={draft.name} maxLength={120} onChange={(e) => setDraft({ ...draft, name: e.target.value })} data-testid="toolbox-name" disabled={saving}
+              placeholder="e.g. Maintenance/Clear temp files" title="Put a folder name and / before the name to file it in a folder" />
           </label>
           <label className="panel__toolbar-field">
             Description
@@ -245,6 +250,10 @@ export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
             <span className="panel__toolbar-error" role="alert" data-testid="toolbox-form-error">
               {formError}
             </span>
+          )}
+          {editing && (
+            <ToolboxVersions api={api} item={editing} disabled={saving}
+              onLoad={(v) => setDraft((d) => ({ ...d, name: v.name, description: v.description, shell: v.shell, run_as: v.run_as, body: v.body }))} />
           )}
         </form>
       )}
@@ -328,11 +337,29 @@ export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
               </td>
             </tr>
           )}
-          {items.map((it) => (
+          {groupToolboxItems(items).map((group) => (
+            <Fragment key={`folder:${group.folder.toLowerCase()}`}>
+              {group.folder !== "" && (
+                <tr className="toolbox__folder" data-testid={`toolbox-folder-${group.folder}`}>
+                  <td colSpan={6}>
+                    <button type="button" className="panel__action" aria-expanded={searching || !collapsed.has(group.folder.toLowerCase())}
+                      data-testid={`toolbox-folder-toggle-${group.folder}`}
+                      onClick={() => setCollapsed((prev) => {
+                        const next = new Set(prev);
+                        const key = group.folder.toLowerCase();
+                        if (next.has(key)) next.delete(key); else next.add(key);
+                        return next;
+                      })}>
+                      {searching || !collapsed.has(group.folder.toLowerCase()) ? "▾" : "▸"} {group.folder} ({group.items.length})
+                    </button>
+                  </td>
+                </tr>
+              )}
+              {(group.folder === "" || searching || !collapsed.has(group.folder.toLowerCase())) && group.items.map((it) => (
             <Fragment key={it.id}>
               <tr data-testid={`toolbox-row-${it.name}`}>
-                <td className="panel__name" title={it.description}>
-                  {it.name}
+                <td className="panel__name" title={it.description ? `${it.name} — ${it.description}` : it.name}>
+                  {group.folder !== "" ? <span className="toolbox__leaf">{splitToolboxName(it.name).leaf}</span> : it.name}
                 </td>
                 <td>{it.scope === "shared" ? "Shared" : "Personal"}</td>
                 <td className="panel__mono">{it.shell === "powershell" ? "PowerShell" : "cmd"}</td>
@@ -365,9 +392,70 @@ export function ToolboxPanel({ api, openBulkCore }: ToolboxPanelProps) {
                 <tr><td colSpan={6}><RunHistory api={api} scope="toolbox" id={it.id} showEmpty /></td></tr>
               )}
             </Fragment>
+              ))}
+            </Fragment>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/** Version history inside the editor (migration 0089). "Load" copies an old version into the form; Save then makes it
+ *  the newest version, so a restore is an ordinary, audited edit and never rewrites history. */
+function ToolboxVersions({ api, item, disabled, onLoad }: {
+  api: ConsoleApi;
+  item: ToolboxItem;
+  disabled: boolean;
+  onLoad: (v: ToolboxVersion) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [versions, setVersions] = useState<ToolboxVersion[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState<number | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    setError(null);
+    api.listToolboxVersions(item.id).then(
+      (vs) => { if (live) setVersions(vs); },
+      (e) => { if (live) setError(e instanceof Error ? e.message : String(e)); },
+    );
+    return () => { live = false; };
+  }, [api, item.id, item.version, open]);
+  return (
+    <div className="toolbox__versions" data-testid="toolbox-versions">
+      <button type="button" className="panel__action" aria-expanded={open} data-testid="toolbox-versions-toggle"
+        onClick={() => setOpen((o) => !o)}>
+        {open ? "Hide version history" : "Version history"}
+      </button>
+      {open && error && <span className="panel__toolbar-error" role="alert">{error}</span>}
+      {open && !error && versions === null && <span className="panel__hint">Loading…</span>}
+      {open && versions && (
+        <ul className="toolbox__version-list">
+          {versions.length === 0 && <li className="panel__hint">No saved versions yet.</li>}
+          {versions.map((v) => (
+            <li key={v.version} data-testid={`toolbox-version-${v.version}`}>
+              <span className="panel__mono">v{v.version}</span> {formatIsoUtc(v.saved_at)}
+              {v.saved_by ? ` by ${v.saved_by}` : ""}
+              {v.name !== item.name ? ` (as "${v.name}")` : ""}
+              {v.version === item.version ? (
+                <span className="panel__hint"> (current)</span>
+              ) : (
+                <button type="button" className="panel__action" disabled={disabled} data-testid={`toolbox-version-load-${v.version}`}
+                  onClick={() => { onLoad(v); setLoaded(v.version); }}>
+                  Load into editor
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {loaded !== null && (
+        <span className="panel__hint" role="status" data-testid="toolbox-version-loaded">
+          Version {loaded} is in the editor. Save to make it the newest version, or Cancel to discard.
+        </span>
+      )}
     </div>
   );
 }

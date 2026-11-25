@@ -43,6 +43,8 @@ pub enum Request {
     BrowseDirectory { path: String },
     KillProcess { pid: u32, image: String, owner: String },
     ControlService { service: String, verb: ServiceVerb },
+    /// 1.3.38: services.msc "Startup type". `ServiceConfig` capability, always confirmed.
+    SetServiceStartType { service: String, start_type: panels::services::ServiceStartType },
     ReadRegistry { path: String, value_name: String },
     WriteRegistry { path: String, value_name: String, new_value: String },
     OpenShell { program: ShellKind, cols: u16, rows: u16, run_as: RunAsRequest },
@@ -53,6 +55,8 @@ pub enum Request {
     DeletePath { path: String },
     PlaceUpload { transfer_id: uuid::Uuid, dest_dir: String },
     DiscardUpload { transfer_id: uuid::Uuid },
+    /// docs/77 (agent 1.3.38, `file_stage_v1`): stage one file for download from any folder.
+    StageDownload { path: String, stage_id: uuid::Uuid },
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -81,13 +85,15 @@ impl Request {
             | Request::ReadRegistry { .. } => true,
             Request::KillProcess { .. }
             | Request::ControlService { .. }
+            | Request::SetServiceStartType { .. }
             | Request::WriteRegistry { .. }
             | Request::OpenShell { .. }
             | Request::CreateDirectory { .. }
             | Request::RenamePath { .. }
             | Request::DeletePath { .. }
             | Request::PlaceUpload { .. }
-            | Request::DiscardUpload { .. } => false,
+            | Request::DiscardUpload { .. }
+            | Request::StageDownload { .. } => false,
         }
     }
 
@@ -101,6 +107,7 @@ impl Request {
             Request::BrowseDirectory { .. } => Capability::FileBrowse,
             Request::KillProcess { .. } => Capability::ProcessKill,
             Request::ControlService { .. } => Capability::ServiceControl,
+            Request::SetServiceStartType { .. } => Capability::ServiceConfig,
             Request::ReadRegistry { .. } => Capability::RegistryRead,
             Request::WriteRegistry { .. } => Capability::RegistryWrite,
             Request::OpenShell { run_as, .. } => match run_as {
@@ -114,7 +121,9 @@ impl Request {
             Request::CreateDirectory { .. }
             | Request::RenamePath { .. }
             | Request::DeletePath { .. }
-            | Request::PlaceUpload { .. } => Capability::FileDelete,
+            | Request::PlaceUpload { .. }
+            // Reading ANY file as SYSTEM is admin-equivalent, like placing one anywhere.
+            | Request::StageDownload { .. } => Capability::FileDelete,
             // Removes only what this session's own upload created, inside the transfer root.
             Request::DiscardUpload { .. } => Capability::FileUpload,
         }
@@ -130,6 +139,7 @@ impl Request {
                 Some(FileOp::Place { transfer_id: *transfer_id, dest_dir })
             }
             Request::DiscardUpload { transfer_id } => Some(FileOp::Discard { transfer_id: *transfer_id }),
+            Request::StageDownload { path, stage_id } => Some(FileOp::Stage { path, stage_id: *stage_id }),
             _ => None,
         }
     }
@@ -150,6 +160,10 @@ impl Request {
                 },
             },
             Request::WriteRegistry { path, .. } => GuardRail::for_registry_write(path),
+            Request::SetServiceStartType { service, start_type } => GuardRail::for_service_start_type(
+                service,
+                *start_type == panels::services::ServiceStartType::Disabled,
+            ),
             _ => GuardRail::Allow,
         }
     }
@@ -589,6 +603,37 @@ impl Dispatcher {
         }
     }
 
+    /// docs/76 terminal: authorize opening a SYSTEM PowerShell (the same capability, guard-rail and confirmation gate as
+    /// [`open_shell`](Self::open_shell)) and record `ShellOpen`, WITHOUT spawning: the Windows host spawns it itself
+    /// (`system_shell.rs`: pseudoconsole + job object), which the `conpty` crate here cannot do from a console-less
+    /// service. Returns the recorded event and, on success, the new shell id. A denial or a confirmation request is
+    /// recorded too, exactly as [`authorize`](Self::authorize) records them.
+    pub fn authorize_system_shell(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        confirmation: Confirmation,
+        now_ms: i64,
+    ) -> (AuditEvent, Result<uuid::Uuid, HandleError>) {
+        let req = Request::OpenShell { program: ShellKind::PowerShell, cols, rows, run_as: RunAsRequest::System };
+        if let Err((ev, e)) = self.authorize(&req, confirmation, now_ms) {
+            return (ev, Err(e));
+        }
+        let shell_id = uuid::Uuid::new_v4();
+        let ev = self.record(
+            AuditAction::ShellOpen { shell_id, program: "powershell".into(), identity: audit::RunAs::System },
+            Outcome::Ok,
+            now_ms,
+        );
+        (ev, Ok(shell_id))
+    }
+
+    /// docs/76 terminal: record that a shell opened by [`authorize_system_shell`](Self::authorize_system_shell)
+    /// ended (its exit code when it exited on its own; `None` when it was killed).
+    pub fn record_shell_close(&self, shell_id: uuid::Uuid, exit_code: Option<i32>, now_ms: i64) -> AuditEvent {
+        self.record(AuditAction::ShellClose { shell_id, exit_code }, Outcome::Ok, now_ms)
+    }
+
     /// Whether this session's grant permits browsing directories ([`Capability::FileBrowse`]),
     /// WITHOUT recording anything (docs/25 F04).
     ///
@@ -606,6 +651,17 @@ impl Dispatcher {
     /// Whether this session's grant holds the file-management capability (docs/58 §4). The host
     /// advertises `file_manage` only when it does, so the console's controls rest on the grant the
     /// agent actually verified, not on what the console believes.
+    /// docs/76: whether the installed grant holds [`Capability::ShellAsSystem`], so the host advertises the terminal
+    /// only when it could actually open (the agent still demands its confirmation token at open).
+    pub fn allows_system_shell(&self) -> bool {
+        self.grant.allows(Capability::ShellAsSystem)
+    }
+
+    /// 1.3.38: startup-type changes (`SetServiceStartType`).
+    pub fn allows_service_config(&self) -> bool {
+        self.grant.allows(Capability::ServiceConfig)
+    }
+
     pub fn allows_file_management(&self) -> bool {
         self.grant.allows(Capability::FileDelete)
     }
@@ -702,6 +758,15 @@ impl Dispatcher {
                 ops::service::control(service, v).map_err(op_err)?;
                 Ok((Response::Ack, None))
             }
+            Request::SetServiceStartType { service, start_type } => {
+                let before = ops::service::set_start_type(service, *start_type).map_err(op_err)?;
+                let action = AuditAction::ServiceConfigChange {
+                    service: service.clone(),
+                    before: before.map_or("unknown", |b| b.as_str()).to_string(),
+                    after: start_type.as_str().to_string(),
+                };
+                Ok((Response::Ack, Some(action)))
+            }
             Request::ReadRegistry { path, value_name } => {
                 let value = ops::registry::read_string(path, value_name).map_err(op_err)?;
                 Ok((Response::RegistryValue(value), None))
@@ -729,7 +794,8 @@ impl Dispatcher {
             | Request::RenamePath { .. }
             | Request::DeletePath { .. }
             | Request::PlaceUpload { .. }
-            | Request::DiscardUpload { .. } => {
+            | Request::DiscardUpload { .. }
+            | Request::StageDownload { .. } => {
                 Err(HandleError::Exec("file operations go through handle_file_op".into()))
             }
         }
@@ -794,6 +860,11 @@ fn describe(req: &Request) -> AuditAction {
             service: service.clone(),
             verb: format!("{verb:?}").to_lowercase(),
         },
+        Request::SetServiceStartType { service, start_type } => AuditAction::ServiceConfigChange {
+            service: service.clone(),
+            before: String::new(), // filled by the executor after reading the old value
+            after: start_type.as_str().to_string(),
+        },
         Request::ReadRegistry { path, value_name } => AuditAction::ConsentSignal {
             user_notified: false,
             policy: format!("read-only: {path}\\{value_name}"),
@@ -820,6 +891,13 @@ fn describe(req: &Request) -> AuditAction {
             to: dest_dir.clone(),
         },
         Request::DiscardUpload { transfer_id } => AuditAction::FileDelete { path: format!("upload {transfer_id}") },
+        // The requested path (unresolved): a refusal before resolution records what was asked for.
+        Request::StageDownload { path, .. } => AuditAction::FileTransfer {
+            direction: audit::Direction::Output,
+            path: path.clone(),
+            sha256: String::new(),
+            bytes: 0,
+        },
     }
 }
 
@@ -1298,6 +1376,28 @@ mod tests {
         }
     }
 
+    /// docs/76: the terminal's authorization path. Without the capability it is denied; with it, the agent demands
+    /// the confirmation token first (ShellAsSystem always confirms), then opens and records ShellOpen. Every step
+    /// leaves an audit record.
+    #[test]
+    fn system_shell_authorization_denies_then_confirms_then_records() {
+        let mut none = dispatcher_with(vec![Capability::ShellAsUser]);
+        let (ev, res) = none.authorize_system_shell(80, 25, Confirmation::NotProvided, 1);
+        assert!(matches!(res, Err(HandleError::Denied(_))), "no ShellAsSystem: {res:?}");
+        assert!(matches!(ev.outcome, Outcome::Denied { .. }));
+
+        let mut d = dispatcher_with(vec![Capability::ShellAsSystem]);
+        let (_ev, res) = d.authorize_system_shell(80, 25, Confirmation::NotProvided, 2);
+        let token = match res {
+            Err(HandleError::NeedsConfirmation { token, .. }) => token,
+            other => panic!("expected a confirmation request, got {other:?}"),
+        };
+        let (ev, res) = d.authorize_system_shell(80, 25, Confirmation::Token(token), 3);
+        let shell_id = res.expect("confirmed shell is authorized");
+        assert!(matches!(ev.action, AuditAction::ShellOpen { shell_id: id, .. } if id == shell_id));
+        let close = d.record_shell_close(shell_id, Some(0), 4);
+        assert!(matches!(close.action, AuditAction::ShellClose { shell_id: id, exit_code: Some(0) } if id == shell_id));
+    }
     #[test]
     fn sensitive_registry_write_needs_confirmation() {
         let mut d = dispatcher_with(vec![Capability::RegistryWrite]);

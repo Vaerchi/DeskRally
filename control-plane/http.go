@@ -392,6 +392,7 @@ func (s *Server) Handler() http.Handler {
 	protected.HandleFunc("DELETE /toolbox/{id}", s.handleDeleteToolboxItem)
 	protected.HandleFunc("POST /toolbox/{id}/runs", s.handleRunToolboxItem)
 	protected.HandleFunc("GET /toolbox/{id}/runs", s.handleToolboxRunHistory)
+	protected.HandleFunc("GET /toolbox/{id}/versions", s.handleToolboxVersions)
 	protected.HandleFunc("GET /machines/{id}/runs", s.handleMachineRunHistory)
 	protected.HandleFunc("POST /runs/{request_id}/result", s.handleRunResult)
 	protected.HandleFunc("GET /platform/tenants", s.handlePlatformListTenants)

@@ -520,3 +520,82 @@ async fn agent_refuses_a_second_data_channel() {
         extra.state()
     );
 }
+
+/// docs/76: the agent accepts ONE `shell` channel at a time, once the session channel exists; a second concurrent
+/// `shell` channel is refused. When the first closes the agent sees it end (security review H1), and a NEW shell
+/// channel is then accepted. Text and binary messages arrive as sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_accepts_one_shell_channel_and_refuses_a_second() {
+    use rmt_transport_webrtc::{ShellMessage, SHELL_CHANNEL_LABEL};
+    let url = signaling_url();
+    if !signaling_reachable(&url).await {
+        eprintln!("SKIP: no signaling server reachable at {url}");
+        return;
+    }
+    let agent_device = DeviceId::new();
+    let agent_url = url.clone();
+    let agent = tokio::spawn(async move {
+        let mut t = WebRtcTransport::connect(&agent_url, Role::dev_agent(agent_device, "ed25519:test-agent"))
+            .await
+            .expect("agent connect");
+        let mut shell_rx = t.take_shell_channel().expect("agent side has a shell slot");
+        let mut shell = tokio::time::timeout(Duration::from_secs(15), shell_rx.recv())
+            .await
+            .expect("no shell channel within 15 s")
+            .expect("shell slot dropped");
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            match tokio::time::timeout(Duration::from_secs(10), shell.recv()).await {
+                Ok(Some(m)) => got.push(m),
+                _ => break,
+            }
+        }
+        // Until the console closes it, nothing else may arrive (the refused second channel's text must not).
+        let ended = loop {
+            match tokio::time::timeout(Duration::from_secs(15), shell.recv()).await {
+                Ok(Some(m)) => got.push(m),
+                Ok(None) => break true,
+                Err(_) => break false,
+            }
+        };
+        let was_open_after = shell.is_open();
+        // A fresh channel after the close is accepted.
+        let mut again = tokio::time::timeout(Duration::from_secs(15), shell_rx.recv())
+            .await
+            .expect("no second shell channel within 15 s after the first closed")
+            .expect("shell slot dropped");
+        let third = tokio::time::timeout(Duration::from_secs(10), again.recv()).await.ok().flatten();
+        (t, got, ended, was_open_after, third)
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let controller = WebRtcTransport::connect(&url, Role::dev_controller(agent_device))
+        .await
+        .expect("controller connect");
+
+    let shell = controller.open_extra_data_channel(SHELL_CHANNEL_LABEL).await.expect("open shell channel");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shell.send_text("hello").await;
+    shell.send_raw(&[1, 2, 3]).await;
+    let second = controller.open_extra_data_channel(SHELL_CHANNEL_LABEL).await.expect("open second shell channel");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    second.send_text("from-the-second").await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    shell.close().await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reopened = controller.open_extra_data_channel(SHELL_CHANNEL_LABEL).await.expect("open shell channel again");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    reopened.send_text("again").await;
+
+    let (_agent_transport, got, ended, was_open_after, third) = tokio::time::timeout(Duration::from_secs(60), agent)
+        .await
+        .expect("agent task timed out")
+        .expect("agent task panicked");
+    assert_eq!(
+        got,
+        vec![ShellMessage::Text("hello".into()), ShellMessage::Binary(vec![1, 2, 3])],
+        "the first shell channel's messages arrive in order; the second channel is refused"
+    );
+    assert!(ended, "the agent must see the first shell channel end when the console closes it");
+    assert!(!was_open_after, "a closed shell channel must report not open");
+    assert_eq!(third, Some(ShellMessage::Text("again".into())), "a new shell channel is accepted after the first closed");
+}

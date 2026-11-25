@@ -45,6 +45,12 @@ export interface ControlServiceArgs {
   service: string;
   verb: ServiceVerb;
 }
+/** 1.3.38 (agent advertised `service_start_type_v1`): services.msc "Startup type". */
+export type SettableStartType = "auto" | "auto_delayed" | "manual" | "disabled";
+export interface SetServiceStartTypeArgs {
+  service: string;
+  start_type: SettableStartType;
+}
 export interface ReadRegistryArgs {
   path: string;
   value_name: string;
@@ -67,12 +73,15 @@ export type Request =
   | { type: "BrowseDirectory"; data: BrowseDirectoryArgs }
   | { type: "KillProcess"; data: KillProcessArgs }
   | { type: "ControlService"; data: ControlServiceArgs }
+  | { type: "SetServiceStartType"; data: SetServiceStartTypeArgs }
   | { type: "ReadRegistry"; data: ReadRegistryArgs }
   | { type: "WriteRegistry"; data: WriteRegistryArgs }
   // docs/58 file management (admin tier; sent only to an agent that advertised `file_manage`).
   | { type: "CreateDirectory"; data: { path: string } }
   | { type: "RenamePath"; data: { from: string; to: string } }
   | { type: "DeletePath"; data: { path: string } }
+  // docs/77 (agent advertised `file_stage_v1`): copy one file into the transfer folder as dr-stage-<stage_id>.bin.
+  | { type: "StageDownload"; data: { path: string; stage_id: string } }
   // docs/58 §12 (agent advertised `file_place`): place / discard a completed upload by transfer id.
   | { type: "PlaceUpload"; data: { transfer_id: string; dest_dir: string } }
   | { type: "DiscardUpload"; data: { transfer_id: string } };
@@ -347,6 +356,9 @@ export class BackstageClient {
   controlService(args: ControlServiceArgs, confirm: () => Promise<boolean>): Promise<Envelope> {
     return this.execConfirmable({ type: "ControlService", data: args }, confirm);
   }
+  setServiceStartType(args: SetServiceStartTypeArgs, confirm: () => Promise<boolean>): Promise<Envelope> {
+    return this.execConfirmable({ type: "SetServiceStartType", data: args }, confirm);
+  }
   writeRegistry(args: WriteRegistryArgs, confirm: () => Promise<boolean>): Promise<Envelope> {
     return this.execConfirmable({ type: "WriteRegistry", data: args }, confirm);
   }
@@ -361,6 +373,10 @@ export class BackstageClient {
   }
   deletePath(path: string, confirm: (pending: Envelope) => Promise<boolean>): Promise<Envelope> {
     return this.execConfirmable({ type: "DeletePath", data: { path } }, confirm);
+  }
+  /** docs/77: stage one remote file for download (the agent copies it to dr-stage-<stageId>.bin in its transfer folder). */
+  stageDownload(path: string, stageId: string, confirm: (pending: Envelope) => Promise<boolean>): Promise<Envelope> {
+    return this.execConfirmable({ type: "StageDownload", data: { path, stage_id: stageId } }, confirm);
   }
   placeUpload(transferId: string, destDir: string, confirm: (pending: Envelope) => Promise<boolean>): Promise<Envelope> {
     return this.execConfirmable({ type: "PlaceUpload", data: { transfer_id: transferId, dest_dir: destDir } }, confirm);

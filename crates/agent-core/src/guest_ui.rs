@@ -140,6 +140,9 @@ pub enum GuestEvent {
     /// consent signal that a view-only session is not a control session. A change repaints; a no-op
     /// (the same state re-asserted) does not.
     ViewOnly(bool),
+    /// docs/76: a technician opened (`true`) or closed (`false`) a SYSTEM command prompt on this machine. Shown on the
+    /// presence pill while it is open, so a shell is never invisible to the person at the machine.
+    ShellOpen(bool),
     /// The session started (`true`) or stopped (`false`) **recording the screen to a file** (loop
     /// 89). Folded so the guest's headline and the window caption say so while it runs.
     ///
@@ -251,6 +254,9 @@ pub trait GuestSurface: Send {
     /// WATCHING only (their input is dropped by the agent), `false` ⇒ CONTROLLING. The surface
     /// reflects it live — headline + window caption — so the guest can tell watching from control.
     fn set_view_only(&self, view_only: bool);
+    /// docs/76: a SYSTEM command prompt opened or closed. The default does nothing; the Windows guest window shows it
+    /// on the presence pill.
+    fn set_shell_open(&self, _open: bool) {}
     /// The session started or stopped RECORDING the screen to a file on this machine (loop 89).
     /// The surface reflects it live — headline + window caption — and, once it has been true, the
     /// ended banner keeps saying a recording was left behind. See [`GuestEvent::Recording`].
@@ -291,6 +297,7 @@ pub struct GuestPresenter {
     /// guest "only watching" while the technician can type — is the one error a consent indicator
     /// must never make, so the honest default is the more alarming one.
     view_only: bool,
+    shell_open: bool,
     /// `true` ⇒ the screen is being written to a file on this machine RIGHT NOW (loop 89).
     ///
     /// Starts false, like [`Self::view_only`], and for the same reason: a session opens without a
@@ -342,6 +349,7 @@ impl GuestPresenter {
             // A session opens in full control; view-only is toggled on afterward (and never
             // under-claimed — see the field doc).
             view_only: false,
+            shell_open: false,
             // Nothing is being recorded until a controller asks for it.
             recording: false,
             recorded_ever: false,
@@ -449,6 +457,13 @@ impl GuestPresenter {
                 }
                 GuestCommand::None
             }
+            GuestEvent::ShellOpen(open) => {
+                if self.shell_open != open {
+                    self.shell_open = open;
+                    self.dirty = true;
+                }
+                GuestCommand::None
+            }
             GuestEvent::Recording(recording) => {
                 // Edge-triggered like its siblings. `recorded_ever` LATCHES and is deliberately not
                 // part of the edge test: it is set on the way up and never cleared, so that the
@@ -549,6 +564,11 @@ impl GuestPresenter {
 
     pub fn view_only(&self) -> bool {
         self.view_only
+    }
+
+    /// docs/76: whether a SYSTEM command prompt is open (shown on the presence pill).
+    pub fn shell_open(&self) -> bool {
+        self.shell_open
     }
 
     /// The window CAPTION (title-bar text). Distinct from [`Self::headline`] (owner-drawn GDI pixels,

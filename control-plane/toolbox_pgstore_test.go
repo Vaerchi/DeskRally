@@ -34,6 +34,7 @@ func newToolboxFixture(t *testing.T) *toolboxFixture {
 	applyMgmtAuditChainMigration(t, su)
 	applyAttendedMigration(t, su)
 	applyMigrationFile(t, su, "migrations/0056_toolbox.sql") // group_session_policy is in the base test schema
+	applyMigrationFile(t, su, "migrations/0089_toolbox_item_version.sql") // toolbox version history
 	applyMigrationFile(t, su, "migrations/0060_session_transfer.sql") // session_record's composite reference
 	applyMigrationFile(t, su, "migrations/0087_run_record.sql")
 	f := &toolboxFixture{su: su}
@@ -286,6 +287,41 @@ func TestPgToolboxRunRequest(t *testing.T) {
 		t.Fatalf("run audit metadata = %s", meta)
 	}
 
+	// docs/75: parameters are folded into the hashed command, the audit records their NAMES only, and a bad
+	// parameter set is a 400 before anything is recorded.
+	var pr tbRunResp
+	if code := apiJSON(t, f.ownerSrv, "POST", "/toolbox/"+it.ID+"/runs",
+		fmt.Sprintf(`{"session_id":%q,"expected_version":%d,"params":{"User":"alice","Secret":"hunter2"}}`, sid, it.Version), &pr); code != http.StatusOK {
+		t.Fatalf("run with params = %d", code)
+	}
+	wantCmd, _ := ToolboxCommandWithParams("powershell", body, map[string]string{"User": "alice", "Secret": "hunter2"})
+	if pr.Command != wantCmd {
+		t.Fatalf("run with params command = %q", pr.Command)
+	}
+	var pmeta []byte
+	if err := f.su.QueryRow(ctx, `SELECT metadata FROM audit_event WHERE tenant_id = $1 AND action = 'toolbox.run_requested' AND metadata->>'request_id' = $2`,
+		f.tenant, pr.RequestID).Scan(&pmeta); err != nil {
+		t.Fatalf("param run audit row: %v", err)
+	}
+	var pm struct {
+		ParamNames []string `json:"param_names"`
+	}
+	_ = json.Unmarshal(pmeta, &pm)
+	if fmt.Sprint(pm.ParamNames) != "[Secret User]" || strings.Contains(string(pmeta), "hunter2") || strings.Contains(string(pmeta), "alice") {
+		t.Fatalf("param run audit metadata = %s", pmeta)
+	}
+	var before int
+	_ = f.su.QueryRow(ctx, `SELECT count(*) FROM audit_event WHERE tenant_id = $1 AND action = 'toolbox.run_requested'`, f.tenant).Scan(&before)
+	if code := apiJSON(t, f.ownerSrv, "POST", "/toolbox/"+it.ID+"/runs",
+		fmt.Sprintf(`{"session_id":%q,"expected_version":%d,"params":{"bad name":"x"}}`, sid, it.Version), nil); code != http.StatusBadRequest {
+		t.Fatalf("bad parameter name = %d, want 400", code)
+	}
+	var after int
+	_ = f.su.QueryRow(ctx, `SELECT count(*) FROM audit_event WHERE tenant_id = $1 AND action = 'toolbox.run_requested'`, f.tenant).Scan(&after)
+	if after != before {
+		t.Fatalf("a refused parameter set was audited as a run (%d -> %d)", before, after)
+	}
+
 	// Refusals.
 	if code, _ := tbRun(t, f.ownerSrv, it.ID, sid, it.Version+1); code != http.StatusConflict {
 		t.Fatalf("run at a stale version = %d, want 409", code)
@@ -326,8 +362,8 @@ func TestPgToolboxRunRequest(t *testing.T) {
 		t.Fatalf("run on an ended session = %d, want 409", code)
 	}
 	var n int
-	if err := f.su.QueryRow(ctx, `SELECT count(*) FROM audit_event WHERE tenant_id = $1 AND action = 'toolbox.run_requested'`, f.tenant).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("run_requested rows = %d (%v), want exactly 1 (refusals record nothing)", n, err)
+	if err := f.su.QueryRow(ctx, `SELECT count(*) FROM audit_event WHERE tenant_id = $1 AND action = 'toolbox.run_requested'`, f.tenant).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("run_requested rows = %d (%v), want exactly 2: the plain run and the run with params (refusals record nothing)", n, err)
 	}
 }
 

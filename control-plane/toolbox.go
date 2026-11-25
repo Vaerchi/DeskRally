@@ -206,10 +206,12 @@ type ToolboxStore interface {
 	// while the owner may use the toolbox (UsePersonal).
 	Update(ctx context.Context, tenantID, callerID string, perms ToolboxPerms, id string, expectedVersion int64, f ToolboxFields) (*ToolboxItem, *MgmtAuditEvent, error)
 	Delete(ctx context.Context, tenantID, callerID string, perms ToolboxPerms, id string, expectedVersion int64) (*MgmtAuditEvent, error)
+	// Versions lists an item's saved versions, newest first (migration 0089), when the caller can see the item.
+	Versions(ctx context.Context, tenantID, callerID, id string) ([]ToolboxVersion, error)
 	// RecordRun reads the item once (visible to caller, at expectedVersion), appends
 	// toolbox.run_requested with the request's fields, commits, and returns the snapshot.
 	// The actor's email is read in the same transaction (attribution survives a later email change).
-	RecordRun(ctx context.Context, tenantID, callerID, id string, expectedVersion int64, sessionID, machineID, requestID string) (*ToolboxRunRequest, *MgmtAuditEvent, error)
+	RecordRun(ctx context.Context, tenantID, callerID, id string, expectedVersion int64, sessionID, machineID, requestID string, params map[string]string) (*ToolboxRunRequest, *MgmtAuditEvent, error)
 }
 
 // ToolboxPerms is what a caller may change: SHARED items need CapManageToolbox; PERSONAL items (and

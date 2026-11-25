@@ -199,7 +199,7 @@ test.afterAll(async () => {
   await stopProc(cpProc);
 });
 
-test("secure mode: backstage is DENIED until 'Get access' mints + installs a control-plane grant", async () => {
+test("secure mode: opening Under the Hood mints + installs a control-plane grant by itself (no Get access click)", async () => {
   test.skip(skipReason !== null, skipReason ?? "");
   if (!browser) test.skip(true, "no browser");
 
@@ -217,6 +217,12 @@ test("secure mode: backstage is DENIED until 'Get access' mints + installs a con
       .text()
       .then((body) => ingests.push({ status: res.status(), body }))
       .catch(() => ingests.push({ status: res.status(), body: "" }));
+  });
+
+  // 2026-11-25: the grant is requested automatically when Under the Hood is first denied; watch the mint.
+  const mints: number[] = [];
+  page.on("response", (res) => {
+    if (res.url().includes("/grant/mint")) mints.push(res.status());
   });
 
   await page.goto(APP_URL);
@@ -237,25 +243,14 @@ test("secure mode: backstage is DENIED until 'Get access' mints + installs a con
   await selectSessionView(page, "Under the Hood");
   await page.getByRole("tab", { name: "System", exact: true }).click();
 
-  // The denial surfaces the "Get access" affordance (a no-grant denial mentions the grant).
-  const getAccess = page.getByTestId("backstage-grant-fetch");
-  await expect(getAccess, "secure agent should DENY backstage until a grant is installed").toBeVisible({
-    timeout: 15_000,
-  });
-  const deniedText = (await page.locator(".backstage__error").textContent())?.trim() ?? "";
-  console.log(`[e2e] channel=${browserChannel} DENIED banner: "${deniedText}"`);
-  expect(deniedText.toLowerCase()).toContain("grant");
-
-  // Hostname must NOT be showing real data yet (the panel is denied).
+  // The secure agent denies first (no grant yet); the console then mints from the control plane and installs the
+  // grant over Control WITHOUT a click, and the tab retries on the agent's GrantInstalled ack.
   const sysValue = (label: string) =>
     page
       .locator(".sysinfo__row")
       .filter({ has: page.getByText(label, { exact: true }) })
       .locator(".sysinfo__value");
-  expect(await sysValue("Hostname").count(), "no System data while denied").toBe(0);
-
-  // --- Click "Get access": mint from the control plane (/cp/grant/mint) + install over Control. ---
-  await getAccess.click();
+  console.log(`[e2e] channel=${browserChannel} waiting for the automatic grant`);
 
   // On the agent's GrantInstalled ack the tab auto-retries; System now renders REAL data.
   const hostnameValue = sysValue("Hostname");
@@ -269,7 +264,8 @@ test("secure mode: backstage is DENIED until 'Get access' mints + installs a con
 
   const hostname = (await hostnameValue.textContent())?.trim() ?? "";
   const os = (await sysValue("OS").textContent())?.trim() ?? "";
-  console.log(`[e2e] GRANTED → System hostname="${hostname}" os="${os}"`);
+  console.log(`[e2e] GRANTED → System hostname="${hostname}" os="${os}" mints=${JSON.stringify(mints)}`);
+  expect(mints, "the console requested the grant from the control plane by itself").toContain(200);
   expect(hostname, "hostname should be real data after the grant").not.toBe("");
   expect(hostname).not.toBe("—");
 

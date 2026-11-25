@@ -28,6 +28,10 @@ describe("chromeMode", () => {
   it("collapses behind the tab when minimal, overlays when opened", () => {
     expect(chromeMode(true, "minimal", false)).toBe("collapsed");
     expect(chromeMode(true, "minimal", true)).toBe("overlay");
+    // Over Under the Hood / Files / Chat an opened bar takes its own row (it must not hide the view's tabs).
+    expect(chromeMode(true, "minimal", true, false)).toBe("pinned");
+    expect(chromeMode(true, "minimal", false, false)).toBe("collapsed");
+    expect(chromeMode(true, "minimal", true, true)).toBe("overlay");
   });
 });
 

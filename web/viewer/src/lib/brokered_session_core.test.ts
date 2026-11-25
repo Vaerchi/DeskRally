@@ -327,7 +327,7 @@ describe("BrokeredSessionCore dispatch boundary and outcomes", () => {
     expect(await core.run(TOOLBOX_TASK, () => false)).toEqual({
       kind: "done", exitCode: 13, stdout: "out", stderr: "err", agentTruncated: false, consoleTruncated: false,
     });
-    expect(f.api.requestToolboxRun).toHaveBeenCalledExactlyOnceWith("tool-1", "session-1", 7);
+    expect(f.api.requestToolboxRun).toHaveBeenCalledExactlyOnceWith("tool-1", "session-1", 7, {});
     expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true);
     await expect(core.run(TOOLBOX_TASK, () => false)).rejects.toMatchObject({ phase: "authorization" });
     expect(f.control.runCommand).toHaveBeenCalledOnce();
@@ -485,7 +485,7 @@ describe("BrokeredSessionCore dispatch boundary and outcomes", () => {
     expect(f.control.runCommand).not.toHaveBeenCalled();
     f.ack();
     await drain();
-    expect(f.api.requestToolboxRun).toHaveBeenCalledExactlyOnceWith("tool-1", "session-1", 7);
+    expect(f.api.requestToolboxRun).toHaveBeenCalledExactlyOnceWith("tool-1", "session-1", 7, {});
     expect(f.control.runCommand).toHaveBeenCalledExactlyOnceWith("authorized command", "Cmd", true);
     expect(settled).not.toHaveBeenCalled();
     f.handlers.onCommandResult?.(RESULT);

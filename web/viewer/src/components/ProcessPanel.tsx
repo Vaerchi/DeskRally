@@ -3,9 +3,8 @@
  * rendered natively in the technician's browser (docs/04-backstage.md Part 1 — headless panels).
  *
  * Presentational only: it takes rows as props from a typed source and owns nothing but the local
- * sort selection. It does not fetch, and it intentionally has no kill/action affordance — the
- * mutating tools land later behind RBAC. Byte sizes are humanized and every null field renders
- * as "—".
+ * sort selection. It does not fetch. With `onKill` each row starts with an "End task" button (first, so it is
+ * never scrolled off past the long command line). Byte sizes are humanized and every null field renders as "—".
  */
 
 import { useMemo, useState } from "react";
@@ -26,10 +25,15 @@ export interface ProcessPanelProps {
   /** Initial sort direction (default: descending). */
   initialSortDirection?: SortDirection;
   /**
-   * When provided, a "Kill" action is shown per row (a mutating Tier-2 tool). The container wires
+   * When provided, an "End task" action is shown per row (a mutating Tier-2 tool). The container wires
    * this to the confirm-gated `BackstageClient.killProcess`. Omit for a read-only table.
    */
   onKill?: (row: ProcessRow) => void;
+  /**
+   * The machine's logical processor count. The agent reports CPU PER CORE (a process busy on 4 cores reads 400%);
+   * with this the column reads like Task Manager, a share of the whole machine (2026-11-25: values "well over 100%").
+   */
+  logicalCpus?: number | null;
 }
 
 const COLUMNS: { key: ProcessSortKey; label: string; numeric: boolean }[] = [
@@ -43,7 +47,9 @@ export function ProcessPanel({
   initialSortKey = "cpu",
   initialSortDirection = "desc",
   onKill,
+  logicalCpus,
 }: ProcessPanelProps) {
+  const cpuShare = (perCore: number) => (logicalCpus && logicalCpus > 0 ? Math.min(100, perCore / logicalCpus) : perCore);
   const [sortKey, setSortKey] = useState<ProcessSortKey>(initialSortKey);
   const [direction, setDirection] = useState<SortDirection>(initialSortDirection);
 
@@ -64,6 +70,7 @@ export function ProcessPanel({
       <table className="panel__table">
         <thead>
           <tr>
+            {onKill && <th className="panel__col--action">Action</th>}
             {COLUMNS.map((col) => (
               <th
                 key={col.key}
@@ -83,7 +90,6 @@ export function ProcessPanel({
             <th className="panel__col--num">PID</th>
             <th>User</th>
             <th>Command line</th>
-            {onKill && <th className="panel__col--action">Actions</th>}
           </tr>
         </thead>
         <tbody>
@@ -96,21 +102,22 @@ export function ProcessPanel({
           )}
           {sorted.map((p) => (
             <tr key={p.pid}>
+              {onKill && (
+                <td className="panel__col--action">
+                  <button className="panel__action panel__action--danger" onClick={() => onKill(p)}
+                    data-testid={`proc-end-${p.pid}`} title={`End ${p.name} (PID ${p.pid})`}>
+                    End task
+                  </button>
+                </td>
+              )}
               <td className="panel__name">{p.name}</td>
-              <td className="panel__col--num">{formatCpuPercent(p.cpu_percent)}</td>
+              <td className="panel__col--num">{formatCpuPercent(cpuShare(p.cpu_percent))}</td>
               <td className="panel__col--num">{formatBytes(p.memory_bytes)}</td>
               <td className="panel__col--num">{p.pid}</td>
               <td>{formatOptional(p.user)}</td>
               <td className="panel__mono panel__ellipsis" title={p.command_line ?? undefined}>
                 {formatOptional(p.command_line)}
               </td>
-              {onKill && (
-                <td className="panel__col--action">
-                  <button className="panel__action panel__action--danger" onClick={() => onKill(p)}>
-                    Kill
-                  </button>
-                </td>
-              )}
             </tr>
           ))}
         </tbody>

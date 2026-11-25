@@ -34,6 +34,8 @@ func (req *toolboxItemRequest) fields() ToolboxFields {
 type toolboxRunBody struct {
 	SessionID       string `json:"session_id"`
 	ExpectedVersion int64  `json:"expected_version"`
+	// Params are the script's param() values (docs/75). Optional; PowerShell items only.
+	Params map[string]string `json:"params,omitempty"`
 }
 
 // toolboxItemView is an item as the console sees it.
@@ -52,6 +54,8 @@ func writeToolboxErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &verr):
 		writeError(w, http.StatusBadRequest, verr.Msg)
+	case errors.Is(err, ErrToolboxParams):
+		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrToolboxNotFound):
 		writeError(w, http.StatusNotFound, "no such toolbox item")
 	case errors.Is(err, ErrToolboxVersion):
@@ -235,7 +239,7 @@ func (s *Server) handleRunToolboxItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	run, ev, err := s.Toolbox.RecordRun(r.Context(), p.TenantID, p.UserID, r.PathValue("id"), req.ExpectedVersion,
-		held.Rec.ID, held.Rec.MachineID, newUUID())
+		held.Rec.ID, held.Rec.MachineID, newUUID(), req.Params)
 	if err != nil {
 		writeToolboxErr(w, err)
 		return

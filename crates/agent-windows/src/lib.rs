@@ -91,6 +91,10 @@ pub mod screenshot;
 pub mod service;
 pub mod session_live;
 pub mod shared_capture;
+/// Under the Hood SYSTEM terminal (docs/76): PowerShell under a pseudoconsole in a kill-on-close job.
+pub(crate) mod system_shell;
+/// The terminal's per-session relay and its authority checks (docs/76 phase 3).
+pub(crate) mod shell_relay;
 pub mod signaling_mux;
 pub mod stdio;
 pub mod stub;

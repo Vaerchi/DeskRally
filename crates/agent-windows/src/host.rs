@@ -4546,6 +4546,13 @@ pub async fn serve_session_with_ice(
     let can_place_uploads = (crate::update_worker::is_local_system()
         && crate::upload_root::is_default_transfer_dir(&transfer_dir))
         || crate::upload_root::test_harness_anchored();
+    // docs/77: staged downloads go to the same folder; anything a dropped session left there is removed now.
+    let stage_dir_buf = can_place_uploads.then(|| transfer_dir.clone());
+    let staged_ledger = Arc::new(crate::fs_manage::StagedLedger::default());
+    let stage_dir = stage_dir_buf.as_deref().map(|d| (d, &staged_ledger));
+    if let Some((dir, _)) = stage_dir {
+        crate::fs_manage::sweep_staged(dir, crate::update_worker::is_local_system());
+    }
 
     let audit_signer = identity.as_ref().map(|id| (id.pubkey.clone(), id.signer.clone()));
     // docs/69: the device key signs this session's binding proof (its own domain tag keeps it apart
@@ -4738,7 +4745,7 @@ pub async fn serve_session_with_ice(
                 "backstage: INSECURE DEV MODE — self-issuing a full demo grant. Production sessions \
                  must pin a grant issuer so signed grants are required."
             );
-            Some(equip_dispatcher(new_backstage_dispatcher(device.0, audit_chain.clone()), &mutation_gate, &upload_root_slot))
+            Some(equip_dispatcher(new_backstage_dispatcher(device.0, audit_chain.clone()), &mutation_gate, &upload_root_slot, stage_dir))
         }
     };
     // docs/58 §1, §12: Backstage requests run on a serial worker with its own twin dispatcher, so a
@@ -4758,7 +4765,7 @@ pub async fn serve_session_with_ice(
         now_unix_ms,
     );
     if let Some(d) = dispatcher.as_ref() {
-        backstage_worker.install(equip_dispatcher(d.twin(), &mutation_gate, &upload_root_slot));
+        backstage_worker.install(equip_dispatcher(d.twin(), &mutation_gate, &upload_root_slot, stage_dir));
         upload_writer.install(d.twin());
     }
 
@@ -5522,6 +5529,47 @@ pub async fn serve_session_with_ice(
     // Kept as a plain bool so all the existing `if view_only` gates — input, reboot, tool-launch,
     // command-run, lock, log-off, shut-down — keep reading one value and cannot drift apart.
     let mut view_only = access_state.view_only();
+    // docs/76 terminal: what the shell relay checks on every keystroke and once a second. This loop keeps it in step:
+    // grant installs (InstallGrant), every view_only change, and the end of the session (teardown). The relay only
+    // runs if the console opens the one `shell` data channel the transport accepts.
+    let shell_authority = Arc::new(crate::shell_relay::ShellAuthority::new(mutation_gate.clone()));
+    shell_authority.set_view_only(view_only);
+    shell_authority.set_bound(binding.open());
+    if matches!(backstage_auth, BackstageAuth::InsecureSelfIssued) && dispatcher.is_some() {
+        shell_authority.set_grant(i64::MAX); // the dev self-issued grant has no expiry
+    }
+    let shell_dispatcher = Arc::new(std::sync::Mutex::new(dispatcher.as_ref().map(|d| d.twin())));
+    let shell_open_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shell_open_id = Arc::new(std::sync::Mutex::new(None::<uuid::Uuid>));
+    let (shell_audit_tx, mut shell_audit_rx) = tokio::sync::mpsc::unbounded_channel::<rmt_agent::backstage::audit::AuditEvent>();
+    let shell_static_refusal: Option<&'static str> = if observer {
+        Some("an observer session cannot open a shell")
+    } else if host_runs_as_interactive_user {
+        // Attended: the host runs as the guest's user, and the guest consented to being viewed, not to a shell.
+        Some("a SYSTEM shell is not available in an attended session")
+    } else {
+        None
+    };
+    let shell_task = transport.take_shell_channel().map(|rx| {
+        let ctx = crate::shell_relay::ShellRelayContext {
+            authority: shell_authority.clone(),
+            dispatcher: shell_dispatcher.clone(),
+            static_refusal: shell_static_refusal,
+            on_open_change: {
+                let flag = shell_open_flag.clone();
+                Box::new(move |open| flag.store(open, std::sync::atomic::Ordering::SeqCst))
+            },
+            audit_out: shell_audit_tx.clone(),
+            open_shell: shell_open_id.clone(),
+        };
+        let mut rx = rx;
+        tokio::spawn(async move {
+            // One shell channel at a time; the console may open a new one after the previous one closed (review H1).
+            while let Some(chan) = rx.recv().await {
+                crate::shell_relay::run(chan, &ctx).await;
+            }
+        })
+    });
     // The guest's indicator went off-screen (a display change it could not be re-placed after): held
     // view-only, on top of `access_state`, until the window reports it visible again.
     let mut indicator_lost = false;
@@ -5629,6 +5677,7 @@ pub async fn serve_session_with_ice(
     // above (the guest window can take seconds on a busy machine) must not eat an honest console's window
     // (Codex enforce-step3 r1 P2).
     binding.start_clock(Instant::now());
+    let mut pill_shell_open = false;
     while (video_open || input_open)
         && !stop.load(Ordering::Relaxed)
         && !session_stop.load(Ordering::Relaxed)
@@ -5659,6 +5708,15 @@ pub async fn serve_session_with_ice(
                     end_detail = Some("session ended: this machine stopped accepting input for too long (it may be busy or switching screens); reconnect to continue");
                     break;
                 }
+            }
+        }
+        // docs/76: tell the guest's pill when a SYSTEM command prompt opens or closes (edge only).
+        shell_authority.set_bound(binding.open());
+        let shell_now = shell_open_flag.load(Ordering::SeqCst);
+        if shell_now != pill_shell_open {
+            pill_shell_open = shell_now;
+            if let Some(s) = guest_surface.as_ref() {
+                s.set_shell_open(shell_now);
             }
         }
         // Demotion already released the request. Report the new state to the viewer.
@@ -5982,6 +6040,20 @@ pub async fn serve_session_with_ice(
                 }
             }
 
+            // docs/76: an event the shell relay sealed into THIS chain goes out on THIS transport, like hand-off audit.
+            Some(ev) = shell_audit_rx.recv() => match ft_audit(ev.id, &ev) {
+                Some(message) => {
+                    let payload = file_transfer::encode(&message);
+                    if transport.send_frame(Frame::new(ChannelId::FileTransfer, payload)).await.is_err() {
+                        input_open = false;
+                    }
+                }
+                None => {
+                    tracing::warn!("shell audit sealed but unencodable; closing input so nothing seals behind it");
+                    input_open = false;
+                }
+            },
+
             // docs/61: InputControlChanged snapshots and this session's hand refusals.
             out = recv_handoff(&mut handoff_rx) => match out {
                 Some(crate::session_directory::HandoffOutbound::KeepAwakeChanged) => {
@@ -6265,7 +6337,7 @@ pub async fn serve_session_with_ice(
                 // hold view-only (stopping any typing) until it is visible again, and tell both sides.
                 Some(GuestToHost::IndicatorVisible(visible)) => {
                     indicator_lost = !visible;
-                    view_only = access_state.view_only() || indicator_lost;
+                    view_only = access_state.view_only() || indicator_lost; shell_authority.set_view_only(view_only);
                     if view_only {
                         keep_awake.release();
                     }
@@ -6429,6 +6501,9 @@ pub async fn serve_session_with_ice(
                             // transfer is refused until then.
                             // The indicator rule first, for EVERY session: an observer may still download,
                             // but not while the guest cannot see that anyone is connected.
+                            // docs/77 SEC-002: a staged file is served only to the session that staged it.
+                            // docs/77: staged-file ownership is decided INSIDE serve_download, on the opened handle, for
+                            // every session including observers (release review H1/M2).
                             let refused = if !mutation_gate.is_open() {
                                 indicator_lost_file_transfer_refusal(&msg)
                             } else if observer {
@@ -6447,6 +6522,7 @@ pub async fn serve_session_with_ice(
                                     &transfer_dir,
                                     dispatcher.as_mut(),
                                     now_unix_ms(),
+                                    Some(&staged_ledger),
                                 ),
                             };
                             for reply in replies {
@@ -6797,10 +6873,16 @@ pub async fn serve_session_with_ice(
                                     match grant_matches_live_session(&signed_grant, control_plane_session, session_technician)
                                         .and_then(|_| dispatcher_from_signed_grant(&signed_grant, issuer, now_unix_ms(), device.0, &spent_grants, audit_chain.clone())) {
                                         Ok(disp) => {
-                                            let disp = equip_dispatcher(disp, &mutation_gate, &upload_root_slot);
-                                            backstage_worker.install(equip_dispatcher(disp.twin(), &mutation_gate, &upload_root_slot));
+                                            let disp = equip_dispatcher(disp, &mutation_gate, &upload_root_slot, stage_dir);
+                                            backstage_worker.install(equip_dispatcher(disp.twin(), &mutation_gate, &upload_root_slot, stage_dir));
                                             upload_writer.install(disp.twin());
                                             dispatcher = Some(disp);
+                                            // docs/76: the shell relay sees the new grant; a shell opened under the old one stops.
+                                            *shell_dispatcher.lock().unwrap_or_else(|p| p.into_inner()) = dispatcher.as_ref().map(|d| d.twin());
+                                            match SignedGrant::from_json(&signed_grant) {
+                                                Ok(s) => shell_authority.set_grant(s.claims.expires_at_ms),
+                                                Err(_) => shell_authority.set_grant(now_unix_ms()), // unreachable after verify; fail closed
+                                            }
                                             tracing::info!("backstage: signed grant verified and installed");
                                             ControlMessage::GrantInstalled
                                         }
@@ -6839,14 +6921,25 @@ pub async fn serve_session_with_ice(
                         // understands; it offers nothing until it hears back (an older agent never
                         // answers, because it drops this message as undecodable).
                         Ok(ControlMessage::RequestBackstageFeatures) => {
-                            let payload = control::encode(&ControlMessage::BackstageFeatures {
-                                features: backstage_features(
-                                    dispatcher.as_ref().is_some_and(|d| d.allows_file_management()),
-                                    can_place_uploads,
-                                    receipt_session.is_some(),
-                                    can_keep_awake,
-                                ),
-                            });
+                            let mut features = backstage_features(
+                                dispatcher.as_ref().is_some_and(|d| d.allows_file_management()),
+                                can_place_uploads,
+                                receipt_session.is_some(),
+                                can_keep_awake,
+                            );
+                            // docs/76: the terminal is offered only when this session could open one: a relay is
+                            // listening, the session is not refused outright, and the installed grant holds ShellAsSystem.
+                            if shell_task.is_some()
+                                && shell_static_refusal.is_none()
+                                && dispatcher.as_ref().is_some_and(|d| d.allows_system_shell())
+                            {
+                                features.push("system_shell_v1".to_string());
+                            }
+                            // 1.3.38: the Services tab offers a Startup type choice only when this agent can make it.
+                            if !observer && dispatcher.as_ref().is_some_and(|d| d.allows_service_config()) {
+                                features.push("service_start_type_v1".to_string());
+                            }
+                            let payload = control::encode(&ControlMessage::BackstageFeatures { features });
                             if let Err(e) = transport.send_frame(Frame::new(ChannelId::Control, payload)).await {
                                 tracing::debug!(error = %e, "backstage-features reply send failed");
                                 input_open = false;
@@ -7121,7 +7214,7 @@ pub async fn serve_session_with_ice(
                                 // Through the same one-way ratchet a verified policy uses, so no toggle lifts it.
                                 if binding.bound_grant().is_some_and(|g| g.access == rmt_agent::session_policy::AccessLevel::ViewOnly) {
                                     access_state.install_verified(rmt_agent::session_policy::AccessLevel::ViewOnly);
-                                    view_only = access_state.view_only() || indicator_lost;
+                                    view_only = access_state.view_only() || indicator_lost; shell_authority.set_view_only(view_only);
                                     if view_only {
                                         keep_awake.release();
                                     }
@@ -7420,7 +7513,7 @@ pub async fn serve_session_with_ice(
                                             // deadline), and a gate here would be one more place for
                                             // the two decisions to drift apart.
                                             session_lease.record_verified(expires_at_ms);
-                                            view_only = access_state.view_only() || indicator_lost;
+                                            view_only = access_state.view_only() || indicator_lost; shell_authority.set_view_only(view_only);
                                             if view_only {
                                                 keep_awake.release();
                                             }
@@ -7521,7 +7614,7 @@ pub async fn serve_session_with_ice(
                                             // has received a policy and cannot verify it.
                                             recording_policy_allowed = false;
                                             access_state.reject_unverified();
-                                            view_only = access_state.view_only() || indicator_lost;
+                                            view_only = access_state.view_only() || indicator_lost; shell_authority.set_view_only(view_only);
                                             if view_only {
                                                 keep_awake.release();
                                             }
@@ -7577,7 +7670,7 @@ pub async fn serve_session_with_ice(
                                     // group is view-only while every agent in it silently grants full
                                     // control. Better a session that is too restricted and says so.
                                     access_state.reject_unverified();
-                                    view_only = access_state.view_only() || indicator_lost;
+                                    view_only = access_state.view_only() || indicator_lost; shell_authority.set_view_only(view_only);
                                     if view_only {
                                         keep_awake.release();
                                     }
@@ -7657,6 +7750,7 @@ pub async fn serve_session_with_ice(
                             }
                             // View-only takes effect for typing already queued too, not only new input.
                             set_input_admitted(&sink, !view_only).await;
+                            shell_authority.set_view_only(view_only); // docs/76: a SYSTEM shell stops too
                             sync_handoff_eligibility(&input_handoff, handoff_registration.is_some(), observer, view_only);
                             if !enabled && view_only {
                                 tracing::info!(
@@ -8696,10 +8790,66 @@ pub async fn serve_session_with_ice(
     // and before the first await below, so nothing queued is admitted while it is pending (Codex
     // phase B review). Every upload still running is told the session ended.
     mutation_gate.revoke();
+    // docs/76: end any SYSTEM shell; never leave one running past the session. The authority flips first (no
+    // keystroke is admitted from here), but the WAIT for the relay comes after the input fence below (review H3).
+    shell_authority.end();
     for (flag, _) in live_uploads.values() {
         crate::upload_writer::cancel(flag, crate::upload_writer::SESSION_ENDED);
     }
     set_input_admitted(&sink, false).await;
+    if let Some((dir, ledger)) = stage_dir {
+        // docs/77: this session's staged files go now; crash leftovers by age. After the input fence (release L1).
+        crate::fs_manage::remove_session_staged(dir, crate::update_worker::is_local_system(), ledger);
+        crate::fs_manage::sweep_staged(dir, crate::update_worker::is_local_system());
+    }
+    if let Some(mut task) = shell_task {
+        // The relay task never ENDS on its own while the transport lives (it waits for the next shell channel), so
+        // wait for the SHELL to close instead: the relay notices the ended authority within a second, kills the
+        // tree and records ShellClose, then clears the open flag (release review M1: joining the task always
+        // stalled teardown the full bound). Bounded; nothing is waited for when no shell was open.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+        while shell_open_flag.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        task.abort();
+        // abort() only REQUESTS it: wait until the task is really gone (dropping it kills any shell it still held),
+        // so nothing can seal an event after the drain below has looked (re-review N1).
+        let _ = tokio::time::timeout(Duration::from_secs(6), &mut task).await;
+        // The session loop no longer runs to push the pill's edge: clear it here (release review L5).
+        if let Some(s) = guest_surface.as_ref() {
+            s.set_shell_open(false);
+        }
+        // A relay cut short never recorded ShellClose for the shell it had open: record it here (re-review N2).
+        let missed = shell_open_id.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(id) = missed {
+            let ev = shell_dispatcher
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .map(|d| d.record_shell_close(id, None, now_unix_ms()));
+            if let Some(ev) = ev {
+                let _ = shell_audit_tx.send(ev);
+            }
+            if let Some(s) = guest_surface.as_ref() {
+                s.set_shell_open(false);
+            }
+        }
+        // Deliver what the relay sealed while it closed (review M1): a sealed event left undelivered is a permanent
+        // seq gap in the chain. Bounded, like the other end-of-session sends.
+        while let Ok(ev) = shell_audit_rx.try_recv() {
+            let Some(message) = ft_audit(ev.id, &ev) else { break };
+            let payload = file_transfer::encode(&message);
+            if tokio::time::timeout(
+                Duration::from_millis(500),
+                transport.send_frame(Frame::new(ChannelId::FileTransfer, payload)),
+            )
+            .await
+            .map_or(true, |r| r.is_err())
+            {
+                break;
+            }
+        }
+    }
     // docs/58 §12: queued Backstage requests now carry a dead stamp and are refused; dropping the
     // sender lets the worker exit once it has answered them. Nothing waits for it.
     drop(backstage_worker);
@@ -9415,11 +9565,15 @@ fn equip_dispatcher(
     mut disp: Dispatcher,
     gate: &Arc<rmt_agent::backstage::gate::MutationGate>,
     uploads: &Arc<std::sync::Mutex<Option<Arc<crate::upload_root::UploadRoot>>>>,
+    stage_dir: Option<(&std::path::Path, &Arc<crate::fs_manage::StagedLedger>)>,
 ) -> Dispatcher {
     disp.set_mutation_gate(Arc::clone(gate));
-    disp.set_file_manager(Box::new(
-        crate::fs_manage::WinFileManager::for_this_agent().with_upload_root(Arc::clone(uploads)),
-    ));
+    let mut files = crate::fs_manage::WinFileManager::for_this_agent().with_upload_root(Arc::clone(uploads));
+    if let Some((dir, ledger)) = stage_dir {
+        // docs/77: only where placement works (the agent's own anchored transfer folder).
+        files = files.with_stage_dir(dir.to_path_buf(), crate::update_worker::is_local_system(), Arc::clone(ledger));
+    }
+    disp.set_file_manager(Box::new(files));
     disp
 }
 
@@ -9456,6 +9610,8 @@ pub(crate) fn backstage_features(
         f.push("file_manage".to_string());
         if can_place_uploads {
             f.push("file_place".to_string());
+            // docs/77 (1.3.38): StageDownload, from the same anchored folder placement uses.
+            f.push("file_stage_v1".to_string());
         }
     }
     if can_sign_receipts {
@@ -9538,6 +9694,7 @@ fn route_file_transfer(
     transfer_dir: &Path,
     dispatcher: Option<&mut Dispatcher>,
     now_ms: i64,
+    staged: Option<&crate::fs_manage::StagedLedger>,
 ) -> Vec<FtMessage> {
     use crate::upload_writer::{cancel, Item, Submit, LIVE, OVERFLOW};
     match msg {
@@ -9587,7 +9744,7 @@ fn route_file_transfer(
             }
             Vec::new()
         }
-        FtMessage::Request { id, path } => serve_download(chain, id, &path, transfer_dir, dispatcher, now_ms),
+        FtMessage::Request { id, path } => serve_download(chain, id, &path, transfer_dir, dispatcher, now_ms, staged),
         FtMessage::Ack { .. } | FtMessage::Error { .. } | FtMessage::Audit { .. } => Vec::new(),
     }
 }
@@ -10017,6 +10174,7 @@ fn serve_download(
     transfer_dir: &Path,
     dispatcher: Option<&mut Dispatcher>,
     now_ms: i64,
+    staged: Option<&crate::fs_manage::StagedLedger>,
 ) -> Vec<FtMessage> {
     // ADR-008: authorize BEFORE resolving or reading anything, so an unauthorized peer cannot use
     // the error taxonomy (path-denied vs not-found vs read-failed) as a filesystem oracle.
@@ -10077,18 +10235,40 @@ fn serve_download(
         }
         _ => return fail(format!("file not found: {path:?}"), dispatcher),
     }
+    let file = match std::fs::File::open(&resolved) {
+        Ok(f) => f,
+        Err(e) => return fail(format!("read failed: {e}"), dispatcher),
+    };
+    // docs/77: a staged download (dr-stage-*.bin) is served only to the session that staged it, decided on the name
+    // of the file actually OPENED (its final path from the handle: any case, ./, 8.3 alias, or a commit landing
+    // between two lookups all end here; release review M2). Behind the permission check above, and audited (L6).
+    let staged_name = match crate::anchor::final_path(std::os::windows::io::AsRawHandle::as_raw_handle(&file)) {
+        Ok(real) => crate::fs_manage::staged_name_of(Path::new(&real)),
+        Err(e) => return fail(format!("read failed: {e}"), dispatcher),
+    };
+    if let Some(n) = &staged_name {
+        if !staged.is_some_and(|l| l.owns(n)) {
+            return fail("that file is not available to this session".into(), dispatcher);
+        }
+    }
     let data = (|| -> std::io::Result<Vec<u8>> {
         use std::io::Read;
-        let file = std::fs::File::open(&resolved)?;
         let mut data = Vec::new();
-        file.take(64 * 1024 * 1024 + 1).read_to_end(&mut data)?;
+        (&file).take(crate::fs_manage::MAX_STAGE_BYTES + 1).read_to_end(&mut data)?;
         Ok(data)
     })();
     let data = match data {
-        Ok(d) if d.len() <= 64 * 1024 * 1024 => d,
+        Ok(d) if d.len() as u64 <= crate::fs_manage::MAX_STAGE_BYTES => d,
         Ok(_) => return fail("download exceeds the 64 MiB buffer limit".into(), dispatcher),
         Err(e) => return fail(format!("read failed: {e}"), dispatcher),
     };
+    // Served: the staged copy has done its job (read whole above). Deleted now; never served twice.
+    if let (Some(n), Some(l)) = (&staged_name, staged) {
+        drop(file);
+        if l.release(n) {
+            let _ = std::fs::remove_file(transfer_dir.join(n));
+        }
+    }
     let name = resolved
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -13230,10 +13410,10 @@ mod route_file_transfer_tests {
         let mut live = HashMap::new();
         let id = Uuid::new_v4();
         let offer = |name: &str| FtMessage::Offer(Offer { id, name: name.into(), size: 3, sha256: file_transfer::sha256_hex(b"abc") });
-        let first = route_file_transfer(&chain, offer("a.txt"), &writer, &mut live, gate.stamp(), &dir, None, 1);
+        let first = route_file_transfer(&chain, offer("a.txt"), &writer, &mut live, gate.stamp(), &dir, None, 1, None);
         assert!(first.is_empty(), "the first Offer goes to the writer");
         let original = Arc::clone(&live[&id].0);
-        let again = route_file_transfer(&chain, offer("b.txt"), &writer, &mut live, gate.stamp(), &dir, None, 1);
+        let again = route_file_transfer(&chain, offer("b.txt"), &writer, &mut live, gate.stamp(), &dir, None, 1, None);
         assert!(
             again.iter().any(|f| matches!(f, FtMessage::Error { message, .. } if message.contains("repeats an active id"))),
             "{again:?}"
@@ -13325,7 +13505,7 @@ mod indicator_lost_file_transfer_tests {
         assert_eq!(backstage_features(false, false, false, false), vec!["confirm".to_string(), "lock_sync_v1".to_string()]);
         assert_eq!(
             backstage_features(true, true, false, false),
-            vec!["confirm".to_string(), "lock_sync_v1".to_string(), "file_manage".to_string(), "file_place".to_string()]
+            vec!["confirm".to_string(), "lock_sync_v1".to_string(), "file_manage".to_string(), "file_place".to_string(), "file_stage_v1".to_string()]
         );
         assert_eq!(backstage_features(false, true, false, false), vec!["confirm".to_string(), "lock_sync_v1".to_string()], "placement needs file_delete too");
     }

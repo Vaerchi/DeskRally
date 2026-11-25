@@ -193,7 +193,7 @@ func resetSchemaWith(t *testing.T, pool *pgxpool.Pool, withGroupTree bool) {
 		DROP TABLE IF EXISTS platform_operator, platform_config;
 		DROP SEQUENCE IF EXISTS mfa_generation_seq;
 		DROP TABLE IF EXISTS
-			run_record, help_request_call, help_request_op, help_request, group_tree_version, session_transfer, toolbox_item, session_ticket_redemption, api_token, tenant_branding, tenant_session_policy,
+			run_record, help_request_call, help_request_op, help_request, group_tree_version, session_transfer, toolbox_item_version, toolbox_item, session_ticket_redemption, api_token, tenant_branding, tenant_session_policy,
 			group_session_policy,
 			user_credential_token, machine_field_order, machine_field, machine_property, tenant_ip_allowlist, dynamic_group,
 			user_session, user_totp, user_credential,

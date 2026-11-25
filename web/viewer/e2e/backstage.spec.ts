@@ -29,7 +29,7 @@ const AGENT_BIN = resolve(REPO, "target", "debug", "agent_host.exe");
 const SIGNALING_DIR = resolve(REPO, "server", "signaling");
 const SIGNALING_EXE = resolve(SIGNALING_DIR, "signaling.exe");
 import { SIGNALING_WS, SIG_PORT } from "./ports";
-import { selectSessionView } from "./nav";
+import { clickInMenu, openMenu, selectSessionView } from "./nav";
 import { openManualConnect } from "./manual_connect";
 const APP_URL = "http://127.0.0.1:5173/";
 
@@ -207,6 +207,20 @@ test("operator console renders REAL backstage data (System + Processes) over the
   console.log(`[e2e] backstage Processes → ${procCount} rows, first name="${firstName}"`);
   expect(procCount, "process list should be non-empty").toBeGreaterThan(0);
   expect(firstName ?? "", "first process should have a name").not.toBe("");
+
+  // --- Event log tab: any log, not only System (2026-11-25). Application always has events on this box. ---
+  await page.getByRole("tab", { name: "Event Log", exact: true }).click();
+  await expect(page.getByTestId("uth-log-current")).toHaveText("System", { timeout: 15_000 });
+  await page.getByTestId("uth-log-select").selectOption("Application");
+  await expect(page.getByTestId("uth-log-current")).toHaveText("Application");
+  const appRows = page.locator(".backstage__body tbody tr");
+  await waitFor(async () => (await appRows.count()) > 0 && !((await appRows.first().textContent()) ?? "").includes("No events"), 15_000, 400);
+  expect(((await appRows.first().textContent()) ?? "").includes("No events"), "Application log should list events").toBe(false);
+  // A typed-in log name is read too.
+  await page.getByTestId("uth-log-select").selectOption("__other__");
+  await page.getByTestId("uth-log-other").fill("Microsoft-Windows-Kernel-Boot/Operational");
+  await page.getByTestId("uth-log-other-show").click();
+  await expect(page.getByTestId("uth-log-current")).toHaveText("Microsoft-Windows-Kernel-Boot/Operational");
   // Free the agent for the next test's session.
   await page.close();
 });

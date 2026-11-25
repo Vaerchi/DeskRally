@@ -80,7 +80,7 @@ impl Capability {
     /// handled separately by [`GuardRail::evaluate`].
     pub fn always_requires_confirmation(self) -> bool {
         use Capability::*;
-        matches!(self, ShellAsCredential | RegistryHiveLoad | UninstallProgram)
+        matches!(self, ShellAsCredential | ShellAsSystem | RegistryHiveLoad | UninstallProgram)
     }
 }
 
@@ -145,6 +145,18 @@ pub const PROTECTED_PROCESSES: &[&str] = &[
     "system", "registry", "memory compression",
 ];
 
+/// The agent's own Windows service: its startup type is never changed from a session.
+pub const AGENT_SERVICES: &[&str] = &["RmtAgent"];
+
+/// Services Disabled is refused for: what Windows needs to boot or sign in, what it needs to come back on the network
+/// (a machine that reboots offline is as unreachable as one with the agent disabled), Windows Installer (the agent's
+/// own self-update), and the built-in antivirus and firewall (security review SEC-004).
+pub const CRITICAL_SERVICES: &[&str] = &[
+    "RpcSs", "RpcEptMapper", "DcomLaunch", "LSM", "SamSs", "PlugPlay", "Power", "BrokerInfrastructure",
+    "SystemEventsBroker", "CoreMessagingRegistrar", "EventLog", "ProfSvc", "gpsvc", "Winmgmt",
+    "Dhcp", "BFE", "nsi", "NlaSvc", "Dnscache", "netprofm", "msiserver", "WinDefend", "mpssvc", "Sense",
+];
+
 /// Registry roots where a write is a classic persistence / privilege-escalation vector and
 /// therefore always demands confirmation.
 pub const SENSITIVE_REG_PREFIXES: &[&str] = &[
@@ -166,6 +178,27 @@ impl GuardRail {
             return GuardRail::Deny { reason: "terminating a critical system process would crash the machine" };
         }
         GuardRail::Allow
+    }
+
+    /// A service startup-type change. Always confirmed (it survives the session and a reboot). Refused outright for
+    /// the agent's own service (turning it off would cut every later session to this machine), and Disabled is
+    /// refused for services Windows cannot boot or log on without.
+    pub fn for_service_start_type(service: &str, disabling: bool) -> Self {
+        // Windows reads a service name up to its first NUL: "RmtAgent\0x" would compare as a different name here
+        // and open RmtAgent there (security review SEC-001). Refuse anything an SCM key name cannot contain.
+        if service.is_empty()
+            || service.chars().count() > 256
+            || service.chars().any(|c| (c as u32) < 0x20 || c == '/' || c == '\\')
+        {
+            return GuardRail::Deny { reason: "that is not a valid service name" };
+        }
+        if AGENT_SERVICES.iter().any(|s| s.eq_ignore_ascii_case(service)) {
+            return GuardRail::Deny { reason: "cannot change the startup of the remote-support agent itself" };
+        }
+        if disabling && CRITICAL_SERVICES.iter().any(|s| s.eq_ignore_ascii_case(service)) {
+            return GuardRail::Deny { reason: "disabling this service would stop Windows from starting" };
+        }
+        GuardRail::RequireConfirmation { reason: "a startup type change stays in place after the session and a reboot" }
     }
 
     /// Evaluate a registry write target by its full path (case-insensitive prefix match).
@@ -218,6 +251,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn startup_type_changes_are_always_confirmed_and_never_touch_the_agent_or_boot_critical_services() {
+        assert!(matches!(GuardRail::for_service_start_type("rmtagent", false), GuardRail::Deny { .. }));
+        assert!(matches!(GuardRail::for_service_start_type("RpcSs", true), GuardRail::Deny { .. }));
+        // Re-enabling a critical service is allowed (still confirmed).
+        assert!(matches!(GuardRail::for_service_start_type("RpcSs", false), GuardRail::RequireConfirmation { .. }));
+        assert!(matches!(GuardRail::for_service_start_type("Spooler", true), GuardRail::RequireConfirmation { .. }));
+        // SEC-001: a NUL (or any control character / separator) never reaches the SCM.
+        assert!(matches!(GuardRail::for_service_start_type("RmtAgent\u{0}x", false), GuardRail::Deny { .. }));
+        assert!(matches!(GuardRail::for_service_start_type("RpcSs\u{0}", true), GuardRail::Deny { .. }));
+        assert!(matches!(GuardRail::for_service_start_type("a\\b", false), GuardRail::Deny { .. }));
+        assert!(matches!(GuardRail::for_service_start_type("", false), GuardRail::Deny { .. }));
+        assert!(matches!(GuardRail::for_service_start_type("Dhcp", true), GuardRail::Deny { .. }));
+    }
 
     /// The sensitive-key confirmation must not depend on how the caller SPELLS the hive.
     ///

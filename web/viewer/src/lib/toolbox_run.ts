@@ -26,14 +26,14 @@ export type ToolboxRunOutcome =
   | { sent: false; stale: false; error: string }
   | { sent: false; stale: true };
 
-export async function runToolboxScript(item: ToolboxItem, deps: ToolboxRunDeps): Promise<ToolboxRunOutcome> {
+export async function runToolboxScript(item: ToolboxItem, deps: ToolboxRunDeps, params: Record<string, string> = {}): Promise<ToolboxRunOutcome> {
   const sessionId = deps.currentSessionId();
   if (!sessionId) {
     return { sent: false, stale: false, error: "This session has no control-plane record, so a saved script cannot run." };
   }
   let grant;
   try {
-    grant = await deps.api.requestToolboxRun(item.id, sessionId, item.version);
+    grant = await deps.api.requestToolboxRun(item.id, sessionId, item.version, params);
   } catch (e) {
     if (!deps.isCurrent()) return { sent: false, stale: true };
     return { sent: false, stale: false, error: e instanceof Error ? e.message : String(e) };

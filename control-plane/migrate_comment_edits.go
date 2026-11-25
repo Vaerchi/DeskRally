@@ -7,6 +7,10 @@ package controlplane
 // 2026-11-23: a personal name was removed from one comment line in each file below (an external PII scan of the
 // public repository). The statements are byte-identical; reviewed with `git diff 92e11b37 -- control-plane/migrations`.
 // Add an entry only for a reviewed comment-only change; never to get past a schema edit.
+//
+// 2026-11-24: the private tree went back to the ORIGINAL bytes (identical to what production applied, so the
+// deploy box's own drift pre-check passes); the public export publishes the edited text via packaging/public-overlay.
+// This allowance stays so a database migrated from the public tree and one migrated from the private tree both pass.
 var reviewedCommentOnlyEdits = map[string]struct{ from, to string }{
 	"0080_oidc_remember.sql": {
 		from: "e255fbb32e6a5759478821b020d90d71cd814324da5d33f15d9e00f5777f6ceb",

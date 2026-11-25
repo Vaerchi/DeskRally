@@ -169,6 +169,11 @@ describe("console api: toolbox", () => {
     expect(JSON.parse(calls[1].init?.body as string)).toEqual({ ...input, expected_version: 4 });
     expect(JSON.parse(calls[3].init?.body as string)).toEqual({ session_id: "sess", expected_version: 6 });
     expect((calls[0].init?.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
+    // docs/75: parameters ride in the run body only when present.
+    await c.requestToolboxRun("a/b", "sess", 7, { User: "alice", Note: "it's $(x)" });
+    expect(JSON.parse(calls[4].init?.body as string)).toEqual({
+      session_id: "sess", expected_version: 7, params: { User: "alice", Note: "it's $(x)" },
+    });
   });
 
   it("rejects a malformed run response instead of sending something", async () => {

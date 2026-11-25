@@ -289,6 +289,10 @@ impl GuestSurface for GuestWindow {
         self.push(GuestEvent::ViewOnly(view_only));
     }
 
+    fn set_shell_open(&self, open: bool) {
+        self.push(GuestEvent::ShellOpen(open));
+    }
+
     fn set_recording(&self, recording: bool) {
         self.push(GuestEvent::Recording(recording));
     }
@@ -691,6 +695,11 @@ pub(crate) unsafe fn reveal_from_pill(guest: HWND) {
 /// Whether the session the pill belongs to is view-only (the pill then says "viewing").
 pub(crate) unsafe fn pill_view_only(guest: HWND) -> bool {
     state_of(guest).map(|st| st.presenter.view_only()).unwrap_or(false)
+}
+
+/// docs/76: whether a SYSTEM command prompt is open in the session the pill belongs to.
+pub(crate) unsafe fn pill_shell_open(guest: HWND) -> bool {
+    state_of(guest).map(|st| st.presenter.shell_open()).unwrap_or(false)
 }
 
 /// docs/69 6.1 (11-18): the session's comparison code for the pill, while the session runs.

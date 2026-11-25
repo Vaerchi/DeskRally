@@ -3016,8 +3016,14 @@ mod tests {
 
         let (_tx, mut rx) = tokio::sync::broadcast::channel::<Arc<TaggedFrame>>(4);
 
-        let _rt_thread = std::thread::spawn(move || {
-            rt.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
+        // The runtime stays alive until the native thread is DONE (a signal, not a 500 ms timer): under a loaded
+        // machine the native thread could start after a timed runtime had already shut down, and Tokio then panics for
+        // a reason unrelated to what this test checks (an intermittent failure in the parallel suite, 2026-11-25).
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let rt_thread = std::thread::spawn(move || {
+            rt.block_on(async {
+                let _ = done_rx.await;
+            });
         });
 
         let result = std::thread::spawn(move || {
@@ -3027,6 +3033,8 @@ mod tests {
         })
         .join()
         .expect("block_on(async { timeout(...).await }) must not panic on a native thread (Fix 1)");
+        let _ = done_tx.send(());
+        rt_thread.join().unwrap();
 
         match result {
             Err(_elapsed) => {}
@@ -4149,12 +4157,20 @@ mod tests {
         assert!(coordinator.state.lock().unwrap().key_holders.get(&0x42).is_none(), "a press landed while re-admission was deferred");
         // The delayed cleanup arrives: it must still release the old key, then open input.
         cap.control_tx.send(CaptureControl::ReleaseKeys { session, admission: Arc::clone(&adm), epoch }).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(coordinator.state.lock().unwrap().key_holders.get(&0x41).is_none(), "the delayed release was skipped");
-        assert!(*adm.fence.read().unwrap(), "input did not open once the release completed");
+        // Waited for, not slept for: under a loaded machine (parallel builds) the capture thread can take longer than a
+        // fixed 200-300 ms to act, which made this test fail intermittently (2026-11-25). The NEGATIVE check above
+        // keeps its fixed window: absence can only be shown over one.
+        let until = |cond: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !cond() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            cond()
+        };
+        assert!(until(&|| coordinator.state.lock().unwrap().key_holders.get(&0x41).is_none()), "the delayed release was skipped");
+        assert!(until(&|| *adm.fence.read().unwrap()), "input did not open once the release completed");
         cap.input_tx.try_send(press(0x43)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(coordinator.state.lock().unwrap().key_holders.get(&0x43).is_some(), "a press after the deferred re-admission was dropped");
+        assert!(until(&|| coordinator.state.lock().unwrap().key_holders.get(&0x43).is_some()), "a press after the deferred re-admission was dropped");
         stop.store(true, Ordering::SeqCst);
         thread.join().unwrap();
     }

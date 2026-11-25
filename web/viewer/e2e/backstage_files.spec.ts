@@ -152,7 +152,20 @@ test("Under the Hood creates, renames and deletes a folder, delete confirmed by 
       { timeout: 30_000 },
     );
     await selectSessionView(page, "Under the Hood");
-    await page.getByRole("tab", { name: "Files", exact: true }).click();
+    // 2026-11-24: with the session toolbar OPENED, its overlay covered Under the Hood's own tab row
+    // (Processes/Services/Files/Event log were invisible until the bar was minimized). Over a tools view an
+    // opened bar must take its own row: the tab row has to be what is actually under the pointer.
+    const toggle = page.getByTestId("session-tab-toggle");
+    if (await toggle.isVisible()) await toggle.click();
+    const filesTab = page.getByRole("tab", { name: "Files", exact: true });
+    await expect(filesTab).toBeVisible({ timeout: 15_000 });
+    const uncovered = await filesTab.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return !!hit && (hit === el || el.contains(hit));
+    });
+    expect(uncovered, "Under the Hood's tab row must not be covered by the opened session toolbar").toBe(true);
+    await filesTab.click();
 
     // Drives -> C:\ -> the work folder -> inside (a folder two levels down: no top-of-drive prompt).
     await page.getByRole("button", { name: `C:${BS}` }).first().click();
@@ -188,6 +201,21 @@ test("Under the Hood creates, renames and deletes a folder, delete confirmed by 
     await dialog.getByRole("button", { name: "Confirm" }).click();
     await expect(page.getByTestId("files-rename-beta")).toHaveCount(0, { timeout: 15_000 });
     expect(existsSync(at(work, "inside", "beta"))).toBe(false);
+
+    // A folder that vanishes under us (a USB stick pulled, an empty CD drive): the listing fails, and
+    // the Back/Up/This PC bar must still be there to get out.
+    rmSync(at(work, "inside"), { recursive: true, force: true });
+    await page.locator(".backstage__refresh").click();
+    await expect(page.locator(".backstage__error")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("uth-files-loc")).toContainText("inside");
+    await page.getByTestId("uth-files-up").click();
+    await expect(page.getByTestId("uth-files-loc")).toHaveText(work, { timeout: 15_000 });
+    await expect(page.locator(".backstage__error")).toHaveCount(0, { timeout: 15_000 });
+    await page.getByTestId("uth-files-back").click();
+    await expect(page.getByTestId("uth-files-loc")).toContainText("inside");
+    await page.getByTestId("uth-files-drives").click();
+    await expect(page.getByTestId("uth-files-loc")).toHaveText("This PC");
+    await expect(page.getByRole("button", { name: `C:${BS}` }).first()).toBeVisible({ timeout: 15_000 });
     await page.close();
   } finally {
     rmSync(work, { recursive: true, force: true });

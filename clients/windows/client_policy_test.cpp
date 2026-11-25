@@ -792,7 +792,11 @@ int main() {
         check("tabs:select beyond count does nothing", drtabs::select_index(drtabs::decode(key('5')), 3) == -1);
         check("tabs:select in range", drtabs::select_index(drtabs::decode(key('2')), 3) == 1);
         check("tabs:last of 3", drtabs::select_index(drtabs::decode(key('9')), 3) == 2);
-        check("tabs:close first of 3 -> new index 0 (the old second)", drtabs::replacement_after_close(0, 3) == 0);
+        check("tabs:close mark hit at the right edge", drtabs::on_close_mark(199, 200, 96));
+        check("tabs:close mark hit 22 px in at 96 DPI", drtabs::on_close_mark(178, 200, 96));
+        check("tabs:close mark miss on the label", !drtabs::on_close_mark(170, 200, 96));
+        check("tabs:close mark scales with DPI (44 px at 192)", drtabs::on_close_mark(157, 200, 192) && !drtabs::on_close_mark(150, 200, 192));
+        check("tabs:close mark miss past the tab", !drtabs::on_close_mark(201, 200, 96));        check("tabs:close first of 3 -> new index 0 (the old second)", drtabs::replacement_after_close(0, 3) == 0);
         check("tabs:close middle of 3 -> index 1 (the old third)", drtabs::replacement_after_close(1, 3) == 1);
         check("tabs:close last of 3 -> index 1 (the old second)", drtabs::replacement_after_close(2, 3) == 1);
         check("tabs:close the only tab -> none", drtabs::replacement_after_close(0, 1) == -1);

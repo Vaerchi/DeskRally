@@ -1204,6 +1204,19 @@ export interface ToolboxListing {
 }
 
 /** Editable fields of a toolbox item (scope is fixed at creation). */
+/** One saved version of a toolbox item (migration 0089). */
+export interface ToolboxVersion {
+  version: number;
+  name: string;
+  description: string;
+  shell: ToolboxShell;
+  run_as: ToolboxRunAs;
+  body: string;
+  body_sha256: string;
+  saved_by?: string;
+  saved_at: string;
+}
+
 export interface ToolboxItemInput {
   name: string;
   description: string;
@@ -1640,6 +1653,8 @@ export interface ConsoleApi {
   setDirectivePolicy(requireSecondApprover: boolean): Promise<DirectivePolicy>;
   /** The caller's toolbox: shared items plus their own personal ones. GET /toolbox (start_session). */
   listToolbox(): Promise<ToolboxListing>;
+  /** GET /toolbox/{id}/versions: saved versions, newest first (migration 0089). */
+  listToolboxVersions(id: string): Promise<ToolboxVersion[]>;
   /** POST /toolbox. A shared item needs manage_toolbox; 409 = name taken in that scope. */
   createToolboxItem(scope: ToolboxScope, input: ToolboxItemInput): Promise<ToolboxItem>;
   /** PUT /toolbox/{id}. 409 = changed since loaded (or name taken); 404 = not visible. */
@@ -1648,7 +1663,8 @@ export interface ConsoleApi {
   deleteToolboxItem(id: string, expectedVersion: number): Promise<void>;
   /** POST /toolbox/{id}/runs: authorize + audit a run request on the caller's live session; returns
    *  the exact command to send as RunCommand. 409 = view-only / ended / item changed. */
-  requestToolboxRun(id: string, sessionId: string, expectedVersion: number): Promise<ToolboxRunGrant>;
+  /** POST /toolbox/{id}/runs. `params` (docs/75) are the script's param() values; omitted when empty. */
+  requestToolboxRun(id: string, sessionId: string, expectedVersion: number, params?: Record<string, string>): Promise<ToolboxRunGrant>;
   listRunHistory(scope: "machines" | "toolbox", id: string, offset?: number): Promise<RunHistoryPage | null>;
   postRunReceipt(receipt: RunReceipt, signal: AbortSignal): Promise<number>;
   /** Authorize + centrally audit an ad-hoc command against a held session, returning the exact command
@@ -2655,6 +2671,15 @@ export class ConsoleApiClient implements ConsoleApi {
     };
   }
 
+  async listToolboxVersions(id: string): Promise<ToolboxVersion[]> {
+    const body = (await this.request(`/toolbox/${encodeURIComponent(id)}/versions`, "load the version history", { method: "GET" })) as Record<string, unknown> | null;
+    const versions = body?.versions;
+    if (!Array.isArray(versions)) {
+      throw new ConsoleApiError(200, `could not load the version history: malformed response (no "versions")`, "server");
+    }
+    return versions as ToolboxVersion[];
+  }
+
   async createToolboxItem(scope: ToolboxScope, input: ToolboxItemInput): Promise<ToolboxItem> {
     const body = await this.request("/toolbox", "save the toolbox item", { method: "POST", body: { ...input, scope } });
     return this.pluck<ToolboxItem>(body, "item", "save the toolbox item");
@@ -2674,10 +2699,11 @@ export class ConsoleApiClient implements ConsoleApi {
     });
   }
 
-  async requestToolboxRun(id: string, sessionId: string, expectedVersion: number): Promise<ToolboxRunGrant> {
+  async requestToolboxRun(id: string, sessionId: string, expectedVersion: number, params: Record<string, string> = {}): Promise<ToolboxRunGrant> {
     const body = (await this.request(`/toolbox/${encodeURIComponent(id)}/runs`, "run the toolbox item", {
       method: "POST",
-      body: { session_id: sessionId, expected_version: expectedVersion },
+      // docs/75: params only when there are any, so a parameterless run sends exactly the old body.
+      body: { session_id: sessionId, expected_version: expectedVersion, ...(Object.keys(params).length > 0 ? { params } : {}) },
     })) as Record<string, unknown> | null;
     const command = body?.command;
     const shell = body?.shell;

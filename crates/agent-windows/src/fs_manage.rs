@@ -58,6 +58,95 @@ const REFUSE_DRIVE: &str = "only fixed and removable drives can be changed from 
 const NO_UPLOADS: &str = "placing uploads is available only for files uploaded in this session to the agent's own transfer folder";
 const UPLOAD_GONE: &str = "that upload is not available (it was not received in this session, or it was already placed or discarded)";
 const UPLOAD_REPLACED: &str = "that upload is no longer the file this session received; upload it again";
+const NO_STAGE: &str = "downloading from any folder is available only when the agent uses its own transfer folder";
+const REFUSE_NOT_FILE: &str = "only a regular file can be downloaded (not a folder, link or device)";
+const REFUSE_HIVE: &str = "registry hives and Windows credential databases cannot be downloaded";
+const REFUSE_SECRET_DIR: &str = "that folder holds Windows credentials or keys and cannot be downloaded from";
+const REFUSE_TOO_BIG: &str = "files over 64 MiB cannot be downloaded yet";
+const REFUSE_SESSION_CAP: &str = "this session has 512 MiB staged and not yet downloaded; download those first";
+
+/// docs/77: the largest file `StageDownload` copies. The SAME limit `serve_download` reads (a staged file must be
+/// fetchable; security review SEC-005).
+pub(crate) const MAX_STAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// The most one session may have staged and not yet fetched (SEC-005: no unbounded disk use).
+pub(crate) const SESSION_STAGE_CAP: u64 = 512 * 1024 * 1024;
+
+/// Folders whose files are credentials or keys: refused for staging by their RESOLVED path (taken from the opened
+/// handle, so no spelling or link evades it). Security review SEC-003.
+const SECRET_DIRS: &[&str] = &[
+    r"\windows\system32\config\",
+    r"\windows\system32\microsoft\protect\",
+    r"\windows\repair\",
+    r"\windows\ntds\",
+    r"\programdata\microsoft\crypto\",
+    r"\appdata\roaming\microsoft\protect\",
+    r"\appdata\roaming\microsoft\credentials\",
+    r"\appdata\local\microsoft\credentials\",
+    r"\appdata\roaming\microsoft\vault\",
+    r"\appdata\local\microsoft\vault\",
+];
+
+fn in_secret_dir(resolved: &str) -> bool {
+    let lower = resolved.to_lowercase();
+    SECRET_DIRS.iter().any(|d| lower.contains(d))
+}
+
+/// A registry hive (`regf`) or an ESE database (NTDS.dit and the like: signature `EF CD AB 89` at offset 4), by its
+/// CONTENT: a renamed `SAM` copy is still a hive (SEC-003).
+fn is_secret_content(head: &[u8]) -> bool {
+    head.starts_with(b"regf") || (head.len() >= 8 && head[4..8] == [0xEF, 0xCD, 0xAB, 0x89])
+}
+
+/// What this session staged and has not fetched yet (SEC-002): only the staging session may download a staged file,
+/// which is then deleted; the rest is deleted at session end.
+#[derive(Default)]
+pub(crate) struct StagedLedger {
+    inner: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl StagedLedger {
+    fn total(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).values().sum()
+    }
+    fn add(&self, name: String, bytes: u64) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).insert(name, bytes);
+    }
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).contains_key(name)
+    }
+    pub(crate) fn release(&self, name: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(name).is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn add_for_test(&self, name: String, bytes: u64) {
+        self.add(name, bytes);
+    }
+
+    pub(crate) fn drain(&self) -> Vec<String> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).drain().map(|(k, _)| k).collect()
+    }
+}
+
+/// The staged file (its canonical, lower-case name) a download request for `path` would be served, if it is one.
+/// Resolved like the download itself and canonicalized (long name, real case), so no spelling of the name avoids the
+/// ownership check (release review H1). `None` for anything that is not a staged file or does not resolve.
+#[cfg(test)]
+pub(crate) fn staged_target(transfer_dir: &Path, path: &str) -> Option<String> {
+    let resolved = rmt_agent_core::file_transfer::resolve_download_path(transfer_dir, path).ok()?;
+    staged_name_of(&std::fs::canonicalize(&resolved).ok()?)
+}
+
+/// The ledger key (lower-case name) if `real` (a FINAL path, e.g. from the opened handle) is a staged file.
+pub(crate) fn staged_name_of(real: &Path) -> Option<String> {
+    let name = real.file_name()?.to_string_lossy().to_lowercase();
+    (name.starts_with("dr-stage-") && name.ends_with(".bin")).then_some(name)
+}
+/// The staged copy's name in the transfer folder.
+pub(crate) fn staged_name(stage_id: uuid::Uuid) -> String {
+    format!("dr-stage-{stage_id}.bin")
+}
+const GENERIC_READ: u32 = 0x8000_0000;
+
 
 const CONFIRM_DELETE: &str = "deleting cannot be undone";
 const CONFIRM_SYSTEM: &str = "this changes a Windows system or program folder";
@@ -79,6 +168,11 @@ pub struct WinFileManager {
     missing_protected: Vec<(FileIdentity, String)>,
     /// The session's held transfer root once the upload writer opened it (docs/58 §12).
     uploads: Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::upload_root::UploadRoot>>>>>,
+    /// docs/77: where `StageDownload` stages, when the upload writer has not opened the root yet: (transfer folder,
+    /// opened as LocalSystem).
+    stage_dir: Option<(PathBuf, bool)>,
+    /// This session's staged files (SEC-002).
+    staged: Option<std::sync::Arc<StagedLedger>>,
 }
 
 impl WinFileManager {
@@ -109,6 +203,8 @@ impl WinFileManager {
             sensitive: Vec::new(),
             missing_protected: Vec::new(),
             uploads: None,
+            stage_dir: None,
+            staged: None,
         };
         for dir in protected {
             if let Some(id) = identity_of(dir) {
@@ -135,6 +231,26 @@ impl WinFileManager {
     ) -> Self {
         self.uploads = Some(slot);
         self
+    }
+
+    /// Let this manager stage downloads (docs/77) into `transfer_dir`.
+    pub(crate) fn with_stage_dir(mut self, transfer_dir: PathBuf, system: bool, staged: std::sync::Arc<StagedLedger>) -> Self {
+        self.stage_dir = Some((transfer_dir, system));
+        self.staged = Some(staged);
+        self
+    }
+
+    /// The anchored root to stage into: the session's (if the upload writer opened it), else opened here.
+    fn stage_root(&self) -> Result<std::sync::Arc<crate::upload_root::UploadRoot>, PrepareError> {
+        if let Ok(root) = self.upload_root() {
+            return Ok(root);
+        }
+        let (dir, system) = self.stage_dir.as_ref().ok_or_else(|| PrepareError::Exec(NO_STAGE.into()))?;
+        let root = crate::upload_root::UploadRoot::open(dir, *system).map_err(|_| PrepareError::Exec(NO_STAGE.into()))?;
+        if !root.is_anchored() {
+            return Err(PrepareError::Exec(NO_STAGE.into()));
+        }
+        Ok(std::sync::Arc::new(root))
     }
 
     /// The session's anchored root, if uploads have been received to it.
@@ -575,6 +691,86 @@ impl FileManager for WinFileManager {
                     }),
                 })
             }
+            FileOp::Stage { path, stage_id } => {
+                let (letter, mut names) = parse(path)?;
+                let name = names.pop().ok_or(PrepareError::Refused(REFUSE_NOT_FILE))?;
+                let walk = walk(letter, &names)?;
+                // Inside the agent's own folders (its keys and configuration): refuse before opening anything.
+                if self.deny_in_chain(&walk).is_some() {
+                    return Err(PrepareError::Refused(REFUSE_PROTECTED));
+                }
+                let src = anchor::open_relative(
+                    walk.dir(),
+                    &name,
+                    GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    Disposition::Open,
+                    // Not FILE_NON_DIRECTORY_FILE: a folder must be REFUSED (audited as denied) by its attributes below,
+                    // not fail to open.
+                    0,
+                )
+                .map_err(|e| if is_reparse_refusal(&e) { PrepareError::Refused(REFUSE_LINK) } else { io_err(e) })?;
+                let attrs = anchor::attributes(src.as_raw_handle()).map_err(io_err)?;
+                if attrs & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                    return Err(PrepareError::Refused(REFUSE_NOT_FILE));
+                }
+                let id = anchor::file_identity(src.as_raw_handle()).map_err(io_err)?;
+                if self.deny_object(&id).is_some() {
+                    return Err(PrepareError::Refused(REFUSE_PROTECTED));
+                }
+                let mut src = std::fs::File::from(src);
+                let size = src.metadata().map_err(io_err)?.len();
+                if size > MAX_STAGE_BYTES {
+                    return Err(PrepareError::Refused(REFUSE_TOO_BIG));
+                }
+                let resolved = resolved(src.as_raw_handle())?;
+                if in_secret_dir(&resolved) {
+                    return Err(PrepareError::Refused(REFUSE_SECRET_DIR));
+                }
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut head = [0u8; 8];
+                    let n = src.read(&mut head).map_err(io_err)?;
+                    if is_secret_content(&head[..n]) {
+                        return Err(PrepareError::Refused(REFUSE_HIVE));
+                    }
+                    src.seek(SeekFrom::Start(0)).map_err(io_err)?;
+                }
+                let ledger = self.staged.clone().ok_or_else(|| PrepareError::Exec(NO_STAGE.into()))?;
+                if ledger.total().saturating_add(size) > SESSION_STAGE_CAP {
+                    return Err(PrepareError::Refused(REFUSE_SESSION_CAP));
+                }
+                let root = self.stage_root()?;
+                let guard = self
+                    .confirm_reason(&walk, Some(&id))
+                    .map_or(GuardRail::Allow, |reason| GuardRail::RequireConfirmation { reason });
+                let identity = identity_bytes(&[&walk.dir_id(), &id], &stage_id.to_string());
+                let audit = AuditAction::FileTransfer {
+                    direction: rmt_agent::backstage::audit::Direction::Output,
+                    path: resolved.clone(),
+                    sha256: String::new(),
+                    bytes: size,
+                };
+                Ok(Prepared {
+                    guard,
+                    identity,
+                    audit,
+                    commit: Box::new(move |admit| {
+                        if !admit() {
+                            return Err(CommitError::NotAdmitted);
+                        }
+                        let (sha256, bytes) = stage_copy(&root, src, stage_id).map_err(|e| CommitError::Exec(describe_io(&e)))?;
+                        ledger.add(staged_name(stage_id), bytes);
+                        drop(walk);
+                        Ok(AuditAction::FileTransfer {
+                            direction: rmt_agent::backstage::audit::Direction::Output,
+                            path: resolved,
+                            sha256,
+                            bytes,
+                        })
+                    }),
+                })
+            }
             FileOp::Discard { transfer_id } => {
                 let root = self.upload_root()?;
                 let (rec, file) = self.open_completed(&root, transfer_id)?;
@@ -598,6 +794,93 @@ impl FileManager for WinFileManager {
     }
 }
 
+/// Copy `src` into a protected `.part` in the root and commit it as [`staged_name`]; the digest is of the bytes
+/// copied. A file that grew past the limit while being read is refused and its part removed.
+fn stage_copy(
+    root: &crate::upload_root::UploadRoot,
+    mut src: std::fs::File,
+    stage_id: uuid::Uuid,
+) -> io::Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    let mut part = root.create_part(stage_id)?;
+    let result = (|| {
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > MAX_STAGE_BYTES {
+                return Err(io::Error::other(REFUSE_TOO_BIG));
+            }
+            hasher.update(&buf[..n]);
+            part.write_all(&buf[..n])?;
+        }
+        part.flush()?;
+        Ok((hex::encode(hasher.finalize()), total))
+    })();
+    match result {
+        Ok(done) => {
+            let (used, _) = root.commit(&part, &staged_name(stage_id))?;
+            if used != staged_name(stage_id) {
+                // A stale file of that exact name: never hand out a different name than the console expects.
+                let _ = crate::upload_root::UploadRoot::discard(&part);
+                return Err(io::Error::other("a staged file with that id already exists"));
+            }
+            Ok(done)
+        }
+        Err(e) => {
+            let _ = crate::upload_root::UploadRoot::discard(&part);
+            Err(e)
+        }
+    }
+}
+
+/// How long a staged download may wait to be fetched before a sweep removes it.
+pub(crate) const STAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Remove staged downloads (`dr-stage-*.bin`) older than [`STAGE_MAX_AGE`] from `transfer_dir`; best effort, at
+/// session start and end. Age, not ownership, decides: a multi-session agent shares this folder, and another live
+/// session's fresh staged file must survive this session's sweep.
+pub(crate) fn sweep_staged(transfer_dir: &Path, system: bool) {
+    // Only a folder whose anchor validates (admin-owned, no planted links) is swept by name (SEC-006).
+    if !crate::upload_root::UploadRoot::open(transfer_dir, system).is_ok_and(|r| r.is_anchored()) {
+        return;
+    }
+    sweep_staged_older_than(transfer_dir, STAGE_MAX_AGE);
+}
+
+/// Delete this session's staged files (at session end; SEC-002). Same anchor rule as the sweep.
+pub(crate) fn remove_session_staged(transfer_dir: &Path, system: bool, ledger: &StagedLedger) {
+    let names = ledger.drain();
+    if names.is_empty() || !crate::upload_root::UploadRoot::open(transfer_dir, system).is_ok_and(|r| r.is_anchored()) {
+        return;
+    }
+    for n in names {
+        let _ = std::fs::remove_file(transfer_dir.join(n));
+    }
+}
+
+pub(crate) fn sweep_staged_older_than(transfer_dir: &Path, max_age: std::time::Duration) {
+    let Ok(rd) = std::fs::read_dir(transfer_dir) else { return };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("dr-stage-") && name.ends_with(".bin")) {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let old = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age >= max_age);
+        if meta.is_file() && old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +898,77 @@ mod tests {
 
     fn yes() -> bool {
         true
+    }
+
+    #[test]
+    fn stage_copies_a_file_into_the_root_with_its_digest_and_refuses_what_it_must() {
+        let base = tmp("stage");
+        let up_dir = base.join("transfers");
+        std::fs::create_dir_all(&up_dir).unwrap();
+        let src_dir = base.join("work");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("report.txt"), b"hello staged world").unwrap();
+        // A hive is recognised by CONTENT, so a renamed copy is refused too (SEC-003).
+        std::fs::write(src_dir.join("notes-backup.txt"), b"regf\x01\x02\x03\x04rest").unwrap();
+        std::fs::write(src_dir.join("db.edb"), [0u8, 0, 0, 0, 0xEF, 0xCD, 0xAB, 0x89, 1, 2]).unwrap();
+        let protect = base.join("Users").join("u").join("AppData").join("Roaming").join("Microsoft").join("Protect");
+        std::fs::create_dir_all(&protect).unwrap();
+        std::fs::write(protect.join("masterkey"), b"key").unwrap();
+        let agent = base.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("key.bin"), b"secret").unwrap();
+        let root = std::sync::Arc::new(crate::upload_root::UploadRoot::anchored_for_test(&up_dir));
+        let ledger = std::sync::Arc::new(StagedLedger::default());
+        let mut m = WinFileManager::with_paths(&[agent.clone()], &[])
+            .with_upload_root(std::sync::Arc::new(std::sync::Mutex::new(Some(std::sync::Arc::clone(&root)))))
+            .with_stage_dir(up_dir.clone(), false, std::sync::Arc::clone(&ledger));
+
+        let id = uuid::Uuid::new_v4();
+        let p = m.prepare(FileOp::Stage { path: &s(&src_dir.join("report.txt")), stage_id: id }).unwrap();
+        assert!(matches!(p.guard, GuardRail::Allow));
+        match commit(p).unwrap() {
+            AuditAction::FileTransfer { sha256, bytes, path, .. } => {
+                assert_eq!(bytes, 18);
+                assert_eq!(sha256, hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"hello staged world")));
+                assert!(path.to_lowercase().ends_with("report.txt"), "{path}");
+            }
+            other => panic!("unexpected audit {other:?}"),
+        }
+        assert_eq!(std::fs::read(up_dir.join(staged_name(id))).unwrap(), b"hello staged world");
+        assert!(std::fs::read(src_dir.join("report.txt")).is_ok(), "the source is copied, not moved");
+        assert!(ledger.owns(&staged_name(id)), "the staging session owns its file (SEC-002)");
+        assert!(!ledger.owns(&staged_name(uuid::Uuid::new_v4())));
+
+        let refused = |m: &mut WinFileManager, path: &Path| {
+            matches!(m.prepare(FileOp::Stage { path: &s(path), stage_id: uuid::Uuid::new_v4() }), Err(PrepareError::Refused(_)))
+        };
+        assert!(refused(&mut m, &src_dir.join("notes-backup.txt")), "a registry hive, whatever its name");
+        assert!(refused(&mut m, &src_dir.join("db.edb")), "an ESE database");
+        assert!(refused(&mut m, &protect.join("masterkey")), "DPAPI master keys");
+        assert!(refused(&mut m, &agent.join("key.bin")), "the agent's own folder");
+        assert!(refused(&mut m, &src_dir), "a folder");
+
+        // Fresh staged files survive a sweep; old ones do not.
+        sweep_staged_older_than(&up_dir, STAGE_MAX_AGE);
+        assert!(up_dir.join(staged_name(id)).exists());
+        sweep_staged_older_than(&up_dir, std::time::Duration::ZERO);
+        assert!(!up_dir.join(staged_name(id)).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_staged_file_is_recognised_however_the_request_spells_it() {
+        let dir = tmp("staged-name");
+        let id = uuid::Uuid::new_v4();
+        std::fs::write(dir.join(staged_name(id)), b"x").unwrap();
+        std::fs::write(dir.join("report.txt"), b"y").unwrap();
+        let canonical = staged_name(id).to_lowercase();
+        assert_eq!(staged_target(&dir, &staged_name(id)), Some(canonical.clone()));
+        assert_eq!(staged_target(&dir, &staged_name(id).to_uppercase()), Some(canonical.clone()), "case");
+        assert_eq!(staged_target(&dir, &format!("./{}", staged_name(id))), Some(canonical.clone()), "./ prefix");
+        assert_eq!(staged_target(&dir, "report.txt"), None, "an ordinary transfer-folder file");
+        assert_eq!(staged_target(&dir, "dr-stage-missing.bin"), None, "nothing to serve");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn commit(p: Prepared) -> Result<AuditAction, CommitError> {

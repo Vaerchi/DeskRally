@@ -1,3 +1,5 @@
+import { paramValue, paramsForRun, paramsProblem, parseToolboxParams } from "../lib/toolbox_params";
+import { groupToolboxItems, splitToolboxName } from "../lib/toolbox_folders";
 import { FULLSCREEN_HINT_MS, isFullscreenBreakout, lockEscape, shouldShowFullscreenHint, unlockKeys } from "../lib/fullscreen_keys";
 import { contentRect } from "../lib/viewport";
 import type { RecoveryNotice } from "../lib/session_recovery";
@@ -522,7 +524,7 @@ export interface ViewerProps {
   toolboxItems?: readonly ToolboxItem[];
   /** Reload saved scripts without clearing the current listing while the request is pending. */
   onRefreshToolbox?: () => void;
-  onRunToolboxItem?: (item: ToolboxItem) => void;
+  onRunToolboxItem?: (item: ToolboxItem, params: Record<string, string>) => void;
   /** Why the last toolbox run was refused (control plane) — nothing ran. */
   toolboxError?: string;
   /** Why the toolbox could not be listed (shown instead of an empty toolbox). */
@@ -4424,13 +4426,21 @@ function ToolboxRunRow({
   listError?: string;
   pending: boolean;
   viewOnly: boolean;
-  onRun: (item: ToolboxItem) => void;
+  onRun: (item: ToolboxItem, params: Record<string, string>) => void;
 }) {
   const [selectedId, setSelectedId] = useState("");
   const selected = items?.find((it) => it.id === selectedId);
   useEffect(() => {
     if (!items?.some((it) => it.id === selectedId)) setSelectedId("");
   }, [items, selectedId]);
+  // Script parameters (docs/75): one input per name in the script's own param() block, fresh per selection.
+  const paramParse = useMemo(
+    () => (selected ? parseToolboxParams(selected.shell, selected.body) : { params: [], unsupported: false }),
+    [selected],
+  );
+  const [paramValues, setParamValues] = useState<Record<string, string>>({});
+  useEffect(() => setParamValues({}), [selected?.id, selected?.version]);
+  const paramIssue = selected ? paramsProblem(paramValues, paramParse) : null;
   const refreshButton = onRefresh && (
     <button
       type="button"
@@ -4474,12 +4484,18 @@ function ToolboxRunRow({
         onChange={(e) => setSelectedId(e.target.value)}
       >
         <option value="">Toolbox…</option>
-        {items.map((it) => (
-          <option key={it.id} value={it.id}>
-            {it.name}
-            {it.scope === "personal" ? " (mine)" : ""}
-          </option>
-        ))}
+        {groupToolboxItems(items).map((group) => {
+          const options = group.items.map((it) => (
+            <option key={it.id} value={it.id}>
+              {group.folder !== "" ? splitToolboxName(it.name).leaf : it.name}
+              {it.scope === "personal" ? " (mine)" : ""}
+            </option>
+          ));
+          // Folders ("Folder/Name") become option groups; unfiled scripts stay at the top.
+          return group.folder === "" ? options : (
+            <optgroup key={`folder:${group.folder.toLowerCase()}`} label={group.folder}>{options}</optgroup>
+          );
+        })}
       </select>
       {refreshButton}
       {selected && (
@@ -4488,12 +4504,35 @@ function ToolboxRunRow({
           {selected.description ? ` — ${selected.description}` : ""}
         </span>
       )}
+      {selected && paramParse.params.length > 0 && (
+        <span className="viewer__command-toolbox-params" data-testid="viewer-toolbox-params"
+          title="Values are not saved, but they reach the machine on the PowerShell command line, where endpoint logging can record them. Do not pass passwords or keys.">
+          {paramParse.params.map((p) => (
+            <label key={p.name} className="viewer__command-toolbox-param">
+              {p.name}
+              {p.mandatory ? "*" : ""}
+              <input
+                type={p.secretLooking ? "password" : "text"}
+                autoComplete="off"
+                data-testid={`viewer-toolbox-param-${p.name}`}
+                disabled={p.unsupported}
+                placeholder={p.unsupported ? "not supported" : p.defaultText || p.type}
+                value={paramValue(paramValues, p.name)}
+                onChange={(e) => setParamValues((v) => ({ ...v, [p.name]: e.target.value }))}
+              />
+            </label>
+          ))}
+          {paramIssue && (
+            <span className="viewer__command-toolbox-param-issue" data-testid="viewer-toolbox-param-issue">{paramIssue}</span>
+          )}
+        </span>
+      )}
       <button
         type="button"
         className="viewer__zoombtn"
         data-testid="viewer-toolbox-run"
-        disabled={!selected || pending || viewOnly}
-        onClick={() => selected && onRun(selected)}
+        disabled={!selected || pending || viewOnly || paramIssue !== null}
+        onClick={() => selected && onRun(selected, paramsForRun(paramValues, paramParse.params))}
         title={viewOnly ? "This session is view-only, so a script cannot run." : "Run this saved script on the guest (recorded in the audit trail)"}
       >
         Run script

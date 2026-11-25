@@ -576,3 +576,7 @@ crates/protocol/testdata/wake-vectors.json:private-network
 server/signaling/wake_test.go:private-network
 server/signaling/wake.go:literal-credential
 control-plane/migrate_comment_edits.go:long-hex
+# docs/76 terminal (2026-11-25): 'token' is the agent's one-time CONFIRMATION token field and its test values, not a credential.
+crates/agent-windows/src/shell_relay.rs:literal-credential
+web/viewer/src/lib/shell_client.test.ts:literal-credential
+web/viewer/src/lib/shell_client.ts:literal-credential
