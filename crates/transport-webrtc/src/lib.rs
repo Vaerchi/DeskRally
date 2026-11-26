@@ -480,6 +480,13 @@ pub const SHELL_CHANNEL_LABEL: &str = "shell";
 /// The largest single message accepted on the shell channel; a bigger one closes the channel.
 pub const MAX_SHELL_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_SHELL_INBOUND: usize = 64;
+/// docs/77 phase 3: the label of the second accepted extra channel, streamed downloads. Same rules as `shell`: one at a
+/// time, only after the session channel. The console sends only small JSON control messages on it (requests, credits,
+/// cancel), so its inbound limit is small; the agent sends file bytes the other way.
+pub const FILES_CHANNEL_LABEL: &str = "files";
+pub const MAX_FILES_MESSAGE_BYTES: usize = 4 * 1024;
+/// The files channel is a [`ShellChannel`] with a smaller inbound message limit.
+pub type FilesChannel = ShellChannel;
 
 /// One message on the shell channel: text carries a JSON control message, binary carries terminal bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,7 +507,7 @@ pub struct ShellChannel {
 }
 
 impl ShellChannel {
-    fn wire(dc: Arc<RTCDataChannel>, busy: Arc<std::sync::atomic::AtomicU64>, generation: u64) -> Self {
+    fn wire(dc: Arc<RTCDataChannel>, busy: Arc<std::sync::atomic::AtomicU64>, generation: u64, max_message: usize) -> Self {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed_notify = Arc::new(Notify::new());
         {
@@ -519,8 +526,8 @@ impl ShellChannel {
             let tx = tx.clone();
             let dc_close = dc_close.clone();
             Box::pin(async move {
-                if msg.data.len() > MAX_SHELL_MESSAGE_BYTES {
-                    tracing::warn!(len = msg.data.len(), "shell channel: oversized message; closing the channel");
+                if msg.data.len() > max_message {
+                    tracing::warn!(len = msg.data.len(), label = %dc_close.label(), "extra channel: oversized message; closing the channel");
                     let _ = dc_close.close().await;
                     return;
                 }
@@ -590,6 +597,8 @@ impl ShellChannel {
 /// never two at once.
 struct ShellSlot {
     tx: mpsc::Sender<ShellChannel>,
+    /// The largest inbound message on channels of this slot (shell: terminal input; files: control JSON).
+    max_message: usize,
     /// 0 = free; otherwise the generation of the ONE channel holding the slot. Only that channel's close frees it
     /// (re-review N3: a refused channel closing later must not free the slot under a live one).
     busy: Arc<std::sync::atomic::AtomicU64>,
@@ -606,11 +615,11 @@ async fn accept_shell_channel(
     let generation = shell_slot.next.fetch_add(1, Ordering::SeqCst) + 1;
     let claimed = first_exists && shell_slot.busy.compare_exchange(0, generation, Ordering::SeqCst, Ordering::SeqCst).is_ok();
     if !claimed {
-        tracing::warn!(role = "agent", first_exists, "refused a shell data channel (one is already open, or before the session channel)");
+        tracing::warn!(role = "agent", first_exists, label = %dc.label(), "refused an extra data channel (one is already open, or before the session channel)");
         let _ = dc.close().await;
         return;
     }
-    if let Err(e) = shell_slot.tx.try_send(ShellChannel::wire(dc, shell_slot.busy.clone(), generation)) {
+    if let Err(e) = shell_slot.tx.try_send(ShellChannel::wire(dc, shell_slot.busy.clone(), generation, shell_slot.max_message)) {
         // Nothing will serve it (the session loop ended, or its queue is full): close it and free the slot it held.
         let chan = match e {
             mpsc::error::TrySendError::Full(c) | mpsc::error::TrySendError::Closed(c) => c,
@@ -624,6 +633,8 @@ pub struct WebRtcTransport {
     dc: Arc<RTCDataChannel>,
     /// Agent side: the shell channel, if the console opens one (docs/76). Taken once by the session loop.
     shell_rx: Option<mpsc::Receiver<ShellChannel>>,
+    /// Agent side: the streamed-download channel, if the console opens one (docs/77 phase 3). Taken once.
+    files_rx: Option<mpsc::Receiver<FilesChannel>>,
     inbound: mpsc::Receiver<Frame>,
     /// Frames handed back by the session loop to be delivered BEFORE anything new (docs/69: frames
     /// an enforcing agent held while unbound, released in arrival order once the session is bound).
@@ -1091,7 +1102,9 @@ impl WebRtcTransport {
         let dc_slot = Arc::new(Mutex::new(Some(dc_tx)));
         // docs/76: the agent side also accepts one `shell` channel (same rule as the brokered path).
         let (shell_tx, shell_rx) = mpsc::channel::<ShellChannel>(2);
-        let shell_slot = Arc::new(ShellSlot { tx: shell_tx, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
+        let shell_slot = Arc::new(ShellSlot { tx: shell_tx, max_message: MAX_SHELL_MESSAGE_BYTES, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
+        let (files_tx, files_rx) = mpsc::channel::<FilesChannel>(2);
+        let files_slot = Arc::new(ShellSlot { tx: files_tx, max_message: MAX_FILES_MESSAGE_BYTES, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
 
         let ready_dc: Option<Arc<RTCDataChannel>> = if is_controller {
             let dc = pc
@@ -1111,6 +1124,7 @@ impl WebRtcTransport {
             let open = open.clone();
             let dc_slot = dc_slot.clone();
             let shell_slot = shell_slot.clone();
+            let files_slot = files_slot.clone();
             let peer_gone = peer_gone.clone();
             let peer_gone_notify = peer_gone_notify.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -1118,11 +1132,16 @@ impl WebRtcTransport {
                 let open = open.clone();
                 let dc_slot = dc_slot.clone();
                 let shell_slot = shell_slot.clone();
+                let files_slot = files_slot.clone();
                 let peer_gone = peer_gone.clone();
                 let peer_gone_notify = peer_gone_notify.clone();
                 Box::pin(async move {
                     if dc.label() == SHELL_CHANNEL_LABEL {
                         accept_shell_channel(dc, &dc_slot, &shell_slot).await;
+                        return;
+                    }
+                    if dc.label() == FILES_CHANNEL_LABEL {
+                        accept_shell_channel(dc, &dc_slot, &files_slot).await;
                         return;
                     }
 
@@ -1248,6 +1267,7 @@ impl WebRtcTransport {
             dc,
             // Agent side only: a controller opens a shell channel, it never accepts one.
             shell_rx: if is_controller { None } else { Some(shell_rx) },
+            files_rx: if is_controller { None } else { Some(files_rx) },
             inbound: inbound_rx,
             replay: std::collections::VecDeque::new(),
             video_in,
@@ -1449,13 +1469,16 @@ impl WebRtcTransport {
         let (dc_tx, dc_rx) = oneshot::channel::<Arc<RTCDataChannel>>();
         let dc_slot = Arc::new(tokio::sync::Mutex::new(Some(dc_tx)));
         let (shell_tx, shell_rx) = mpsc::channel::<ShellChannel>(2);
-        let shell_slot = Arc::new(ShellSlot { tx: shell_tx, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
+        let shell_slot = Arc::new(ShellSlot { tx: shell_tx, max_message: MAX_SHELL_MESSAGE_BYTES, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
+        let (files_tx, files_rx) = mpsc::channel::<FilesChannel>(2);
+        let files_slot = Arc::new(ShellSlot { tx: files_tx, max_message: MAX_FILES_MESSAGE_BYTES, busy: Arc::new(std::sync::atomic::AtomicU64::new(0)), next: std::sync::atomic::AtomicU64::new(0) });
 
         // Agent receives the data channel via on_data_channel.
         let inbound_tx_dc = inbound_tx.clone();
         let open_dc = open.clone();
         let dc_slot_dc = dc_slot.clone();
         let shell_slot_dc = shell_slot.clone();
+        let files_slot_dc = files_slot.clone();
         let peer_gone_dc = peer_gone.clone();
         let peer_gone_notify_dc = peer_gone_notify.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
@@ -1463,6 +1486,7 @@ impl WebRtcTransport {
             let open = open_dc.clone();
             let dc_slot = dc_slot_dc.clone();
             let shell_slot = shell_slot_dc.clone();
+            let files_slot = files_slot_dc.clone();
             let peer_gone = peer_gone_dc.clone();
             let peer_gone_notify = peer_gone_notify_dc.clone();
             Box::pin(async move {
@@ -1470,6 +1494,11 @@ impl WebRtcTransport {
                 // terminal bytes only; the session loop decides whether a shell may open at all.
                 if dc.label() == SHELL_CHANNEL_LABEL {
                     accept_shell_channel(dc, &dc_slot, &shell_slot).await;
+                    return;
+                }
+                // docs/77 phase 3: one `files` channel (streamed downloads), same rules as `shell`.
+                if dc.label() == FILES_CHANNEL_LABEL {
+                    accept_shell_channel(dc, &dc_slot, &files_slot).await;
                     return;
                 }
 
@@ -1590,6 +1619,7 @@ impl WebRtcTransport {
             pc,
             dc,
             shell_rx: Some(shell_rx),
+            files_rx: Some(files_rx),
             inbound: inbound_rx,
             replay: std::collections::VecDeque::new(),
             video_in,
@@ -1742,6 +1772,11 @@ impl WebRtcTransport {
     /// receiver resolves when the console opens the channel; it never resolves if the console never does.
     pub fn take_shell_channel(&mut self) -> Option<mpsc::Receiver<ShellChannel>> {
         self.shell_rx.take()
+    }
+
+    /// Agent side: the console's streamed-download channel (docs/77 phase 3), taken once; like the shell channel.
+    pub fn take_files_channel(&mut self) -> Option<mpsc::Receiver<FilesChannel>> {
+        self.files_rx.take()
     }
 
     /// TEST HOOK: open an ADDITIONAL data channel from this side of an established connection.

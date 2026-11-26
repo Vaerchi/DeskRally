@@ -126,12 +126,8 @@ impl ShellAuthority {
         if self.view_only.load(Ordering::SeqCst) {
             return Err("the session became view-only");
         }
-        if !self.bound.load(Ordering::SeqCst) {
-            return Err("the session is not bound to this console");
-        }
-        if !self.gate.admits(a.stamp) {
-            return Err("the on-screen indicator was lost");
-        }
+        self.check_read(a, now_ms)?;
+        // The shell (a SYSTEM process the technician types into) also ends with the grant that admitted it.
         if self.grant_generation.load(Ordering::SeqCst) != a.generation {
             return Err("access was replaced");
         }
@@ -142,6 +138,33 @@ impl ShellAuthority {
         if now_ms >= deadline {
             return Err("access expired");
         }
+        Ok(())
+    }
+
+    /// docs/77 phase 3: may a READ (a streamed download) admitted as `a` continue? The session-level rules of
+    /// [`Self::check`] (ended, bound, indicator) but NOT view-only (an observer may download today) and NOT the grant's
+    /// expiry or generation: the session-channel download checks the grant once, at install, and the console mints a
+    /// 5-minute grant once per session, so tying reads to it failed every streamed Get after five minutes (1.3.39
+    /// release review H1). The streamed download re-checks the dispatcher's permission every second instead.
+    pub(crate) fn admit_read(&self, now_ms: i64) -> Result<Admission, &'static str> {
+        let a = Admission {
+            stamp: self.gate.stamp(),
+            generation: self.grant_generation.load(Ordering::SeqCst),
+        };
+        self.check_read(&a, now_ms).map(|()| a)
+    }
+
+    pub(crate) fn check_read(&self, a: &Admission, now_ms: i64) -> Result<(), &'static str> {
+        if self.ended.load(Ordering::SeqCst) {
+            return Err("the session ended");
+        }
+        if !self.bound.load(Ordering::SeqCst) {
+            return Err("the session is not bound to this console");
+        }
+        if !self.gate.admits(a.stamp) {
+            return Err("the on-screen indicator was lost");
+        }
+        let _ = now_ms; // reads are not bounded by the grant's deadline (see admit_read)
         Ok(())
     }
 }
@@ -465,6 +488,30 @@ mod tests {
         assert_eq!(a.admit(i64::MAX - 1), Ok(a.admit(0).unwrap()));
     }
 
+    /// 1.3.39 release review H1: a READ (streamed download) outlives the grant's 5-minute deadline and a re-minted grant,
+    /// like the session-channel download; it stops on session end, the indicator, and binding. View-only does not stop
+    /// it (an observer may download).
+    #[test]
+    fn a_read_ignores_grant_expiry_and_replacement_but_not_the_session_rules() {
+        let (gate, a) = authority();
+        a.set_bound(true);
+        a.set_grant_at(10_000, 0, 0);
+        let adm = a.admit_read(1_000).expect("admitted");
+        assert_eq!(a.check_read(&adm, 50_000), Ok(()), "past the grant's deadline");
+        a.set_grant_at(99_000, 0, 0);
+        assert_eq!(a.check_read(&adm, 50_000), Ok(()), "a re-minted grant");
+        a.set_view_only(true);
+        assert_eq!(a.check_read(&adm, 50_000), Ok(()), "view-only (observers read)");
+        a.set_bound(false);
+        assert_eq!(a.check_read(&adm, 50_000), Err("the session is not bound to this console"));
+        a.set_bound(true);
+        gate.revoke();
+        assert_eq!(a.check_read(&adm, 50_000), Err("the on-screen indicator was lost"));
+        gate.reopen();
+        let adm = a.admit_read(50_000).expect("new read after the indicator returned");
+        a.end();
+        assert_eq!(a.check_read(&adm, 50_000), Err("the session ended"));
+    }
     #[test]
     fn an_admitted_shell_keeps_running_until_anything_changes() {
         let (gate, a) = authority();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describePlan, MAX_FILE_BYTES, MAX_UPLOAD_BYTES, needsConfirmation, planLocalCopy, planRemoteCopy, type LocalDirLike, type LocalFileLike, type RemoteEntryLike } from "./folder_copy";
+import { describePlan, MAX_FILE_BYTES, MAX_STREAM_FILE_BYTES, MAX_UPLOAD_BYTES, needsConfirmation, planLocalCopy, planRemoteCopy, type LocalDirLike, type LocalFileLike, type RemoteEntryLike } from "./folder_copy";
 
 const tree: Record<string, RemoteEntryLike[] | Error> = {
   "C:\\logs": [
@@ -47,6 +47,12 @@ describe("planRemoteCopy (docs/77 phase 2)", () => {
     expect(needsConfirmation({ ...base, files: [], totalBytes: 0 })).toBe(false);
     expect(needsConfirmation({ ...base, files: Array(501).fill({ rel: ["x"], path: "x", size: 1 }), totalBytes: 501 })).toBe(true);
     expect(needsConfirmation({ ...base, files: [], totalBytes: 2 * 1024 * 1024 * 1024 })).toBe(true);
+  });
+
+  it("with streaming (docs/77 phase 3b) files up to 4 GiB are planned, not skipped", async () => {
+    const plan = await planRemoteCopy("C:\\logs", lister, MAX_STREAM_FILE_BYTES);
+    expect(plan.files.map((f) => f.rel.join("/"))).toContain("huge.bin");
+    expect(plan.skipped).toEqual([{ path: "C:\\logs\\locked", reason: "access is denied" }]);
   });
 
   it("works from a drive root without doubling the separator", async () => {

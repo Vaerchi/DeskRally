@@ -580,3 +580,4 @@ control-plane/migrate_comment_edits.go:long-hex
 crates/agent-windows/src/shell_relay.rs:literal-credential
 web/viewer/src/lib/shell_client.test.ts:literal-credential
 web/viewer/src/lib/shell_client.ts:literal-credential
+web/viewer/src/lib/sha256_stream.test.ts:long-hex

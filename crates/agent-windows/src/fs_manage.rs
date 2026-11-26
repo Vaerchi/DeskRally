@@ -63,6 +63,13 @@ const REFUSE_NOT_FILE: &str = "only a regular file can be downloaded (not a fold
 const REFUSE_HIVE: &str = "registry hives and Windows credential databases cannot be downloaded";
 const REFUSE_SECRET_DIR: &str = "that folder holds Windows credentials or keys and cannot be downloaded from";
 const REFUSE_TOO_BIG: &str = "files over 64 MiB cannot be downloaded yet";
+const REFUSE_TOO_BIG_LEASE: &str = "files over 4 GiB cannot be downloaded";
+const REFUSE_LEASES: &str = "too many large files are waiting to be fetched in this session (16); fetch or wait 30 minutes";
+/// docs/77 phase 3b: the largest file a lease (a streamed download with no copy) may serve.
+pub(crate) const MAX_LEASE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Leases per session, and how long one waits to be fetched.
+pub(crate) const MAX_LEASES: usize = 16;
+pub(crate) const LEASE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const REFUSE_SESSION_CAP: &str = "this session has 512 MiB staged and not yet downloaded; download those first";
 
 /// docs/77: the largest file `StageDownload` copies. The SAME limit `serve_download` reads (a staged file must be
@@ -102,7 +109,25 @@ fn is_secret_content(head: &[u8]) -> bool {
 #[derive(Default)]
 pub(crate) struct StagedLedger {
     inner: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// docs/77 phase 3b: files too big to copy, leased by identity under the same `dr-stage-<id>.bin` name.
+    leases: std::sync::Mutex<std::collections::HashMap<String, Lease>>,
 }
+
+/// A file chosen for a streamed download without a copy: where it was and WHICH file it was (volume + file id).
+#[derive(Debug, Clone)]
+pub(crate) struct Lease {
+    pub(crate) path: String,
+    pub(crate) id: FileIdentity,
+    /// Creation time at staging: on FAT/exFAT a file id is positional and reused, so delete-and-recreate would keep the
+    /// id; the creation time does not survive that (3b review SEC-002).
+    pub(crate) created: Option<std::time::SystemTime>,
+    pub(crate) at: std::time::Instant,
+    /// Download attempts so far (each costs a full hashing pass; 3b review SEC-003).
+    pub(crate) attempts: u32,
+}
+
+/// Streamed download attempts one lease allows.
+pub(crate) const MAX_LEASE_ATTEMPTS: u32 = 3;
 
 impl StagedLedger {
     fn total(&self) -> u64 {
@@ -114,8 +139,57 @@ impl StagedLedger {
     pub(crate) fn owns(&self, name: &str) -> bool {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).contains_key(name)
     }
+    /// Forget a staged entry once served; true only when it was a COPY (the caller then deletes the file). A lease
+    /// owns no file and is just forgotten.
     pub(crate) fn release(&self, name: &str) -> bool {
+        self.leases.lock().unwrap_or_else(|p| p.into_inner()).remove(name);
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(name).is_some()
+    }
+
+    fn purge_expired_leases(leases: &mut std::collections::HashMap<String, Lease>) {
+        leases.retain(|_, l| l.at.elapsed() < LEASE_MAX_AGE);
+    }
+
+    pub(crate) fn lease_count(&self) -> usize {
+        let mut l = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+        Self::purge_expired_leases(&mut l);
+        l.len()
+    }
+
+    /// Record a lease; false when the session already holds [`MAX_LEASES`], or a staged COPY already has that name
+    /// (1.3.39 release review L3: one name, one meaning).
+    pub(crate) fn add_lease(&self, name: String, lease: Lease) -> bool {
+        if self.owns(&name) {
+            return false;
+        }
+        let mut l = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+        Self::purge_expired_leases(&mut l);
+        if l.len() >= MAX_LEASES {
+            return false;
+        }
+        l.insert(name, lease);
+        true
+    }
+
+    /// This session's unexpired lease of that (lower-case) staged name, if any (no attempt counted: a lookup).
+    pub(crate) fn lease(&self, name: &str) -> Option<Lease> {
+        let mut l = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+        Self::purge_expired_leases(&mut l);
+        l.get(name).cloned()
+    }
+
+    /// Take one download attempt on a lease: `Ok(lease)`, `Err(true)` when its attempts are used up (it is then
+    /// forgotten), `Err(false)` when there is no such lease.
+    pub(crate) fn attempt_lease(&self, name: &str) -> Result<Lease, bool> {
+        let mut l = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+        Self::purge_expired_leases(&mut l);
+        let Some(lease) = l.get_mut(name) else { return Err(false) };
+        if lease.attempts >= MAX_LEASE_ATTEMPTS {
+            l.remove(name);
+            return Err(true);
+        }
+        lease.attempts += 1;
+        Ok(lease.clone())
     }
     #[cfg(test)]
     pub(crate) fn add_for_test(&self, name: String, bytes: u64) {
@@ -123,10 +197,58 @@ impl StagedLedger {
     }
 
     pub(crate) fn drain(&self) -> Vec<String> {
+        self.leases.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).drain().map(|(k, _)| k).collect()
     }
 }
 
+/// docs/77 phase 3b: reopen a leased file for its streamed download. Opened WITH delete sharing (the user's apps keep
+/// saving/renaming/deleting it) and without following a reparse point; it must be the SAME file the technician chose
+/// (volume + file id; a file swapped in under the name is refused), still a regular file, not in a secret folder, and
+/// not a registry hive or ESE database by content. Returned at offset 0.
+pub(crate) fn open_lease(lease: &Lease) -> io::Result<(std::fs::File, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SHARE_DELETE: u32 = 0x4;
+    let fail = |e: PrepareError| match e {
+        PrepareError::Refused(r) => io::Error::other(r),
+        PrepareError::Exec(m) => io::Error::other(m),
+    };
+    // Walked again from the volume root WITHOUT following a link at any level, as the stage step did (3b review
+    // SEC-001: a plain open by name would follow a junction planted in an intermediate folder before any check).
+    let (letter, mut names) = parse(&lease.path).map_err(fail)?;
+    let name = names.pop().ok_or_else(|| io::Error::other(REFUSE_NOT_FILE))?;
+    let walk = walk(letter, &names).map_err(fail)?;
+    let h = anchor::open_relative(
+        walk.dir(),
+        &name,
+        GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | SHARE_DELETE,
+        Disposition::Open,
+        0,
+    )?;
+    let raw = h.as_raw_handle();
+    if anchor::attributes(raw)? & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(io::Error::other(REFUSE_NOT_FILE));
+    }
+    if anchor::file_identity(raw)? != lease.id {
+        return Err(io::Error::other("the file was replaced after it was chosen; choose it again"));
+    }
+    let real = anchor::final_path(raw)?;
+    if in_secret_dir(&real) {
+        return Err(io::Error::other(REFUSE_SECRET_DIR));
+    }
+    let mut f = std::fs::File::from(h);
+    if lease.created.is_some() && f.metadata()?.created().ok() != lease.created {
+        return Err(io::Error::other("the file was replaced after it was chosen; choose it again"));
+    }
+    let mut head = [0u8; 8];
+    let n = f.read(&mut head)?;
+    if is_secret_content(&head[..n]) {
+        return Err(io::Error::other(REFUSE_HIVE));
+    }
+    f.seek(SeekFrom::Start(0))?;
+    Ok((f, real))
+}
 /// The staged file (its canonical, lower-case name) a download request for `path` would be served, if it is one.
 /// Resolved like the download itself and canonicalized (long name, real case), so no spelling of the name avoids the
 /// ownership check (release review H1). `None` for anything that is not a staged file or does not resolve.
@@ -691,7 +813,7 @@ impl FileManager for WinFileManager {
                     }),
                 })
             }
-            FileOp::Stage { path, stage_id } => {
+            FileOp::Stage { path, stage_id, lease_ok } => {
                 let (letter, mut names) = parse(path)?;
                 let name = names.pop().ok_or(PrepareError::Refused(REFUSE_NOT_FILE))?;
                 let walk = walk(letter, &names)?;
@@ -720,8 +842,10 @@ impl FileManager for WinFileManager {
                 }
                 let mut src = std::fs::File::from(src);
                 let size = src.metadata().map_err(io_err)?.len();
-                if size > MAX_STAGE_BYTES {
-                    return Err(PrepareError::Refused(REFUSE_TOO_BIG));
+                // docs/77 phase 3b: over the copy limit, a streaming console gets a LEASE (no copy) up to 4 GiB.
+                let lease = size > MAX_STAGE_BYTES;
+                if lease && (!lease_ok || size > MAX_LEASE_BYTES) {
+                    return Err(PrepareError::Refused(if lease_ok { REFUSE_TOO_BIG_LEASE } else { REFUSE_TOO_BIG }));
                 }
                 let resolved = resolved(src.as_raw_handle())?;
                 if in_secret_dir(&resolved) {
@@ -737,6 +861,43 @@ impl FileManager for WinFileManager {
                     src.seek(SeekFrom::Start(0)).map_err(io_err)?;
                 }
                 let ledger = self.staged.clone().ok_or_else(|| PrepareError::Exec(NO_STAGE.into()))?;
+                if lease {
+                    if ledger.lease_count() >= MAX_LEASES {
+                        return Err(PrepareError::Refused(REFUSE_LEASES));
+                    }
+                    let guard = self
+                        .confirm_reason(&walk, Some(&id))
+                        .map_or(GuardRail::Allow, |reason| GuardRail::RequireConfirmation { reason });
+                    let identity = identity_bytes(&[&walk.dir_id(), &id], &stage_id.to_string());
+                    // Nothing leaves the machine at this step (3b review SEC-005): the lease is recorded with 0 bytes;
+                    // the streamed download's start record carries the size and the digest.
+                    let audit = AuditAction::FileTransfer {
+                        direction: rmt_agent::backstage::audit::Direction::Output,
+                        path: resolved.clone(),
+                        sha256: String::new(),
+                        bytes: 0,
+                    };
+                    let rec = audit.clone();
+                    let created = src.metadata().ok().and_then(|m| m.created().ok());
+                    return Ok(Prepared {
+                        guard,
+                        identity,
+                        audit,
+                        commit: Box::new(move |admit| {
+                            if !admit() {
+                                return Err(CommitError::NotAdmitted);
+                            }
+                            // Nothing is copied and nothing stays open (the user's own apps can still save, rename or
+                            // delete it): the identity is what the download must find again (open_lease).
+                            drop(src);
+                            drop(walk);
+                            if !ledger.add_lease(staged_name(stage_id), Lease { path: resolved, id, created, at: std::time::Instant::now(), attempts: 0 }) {
+                                return Err(CommitError::Exec(REFUSE_LEASES.into()));
+                            }
+                            Ok(rec)
+                        }),
+                    });
+                }
                 if ledger.total().saturating_add(size) > SESSION_STAGE_CAP {
                     return Err(PrepareError::Refused(REFUSE_SESSION_CAP));
                 }
@@ -900,6 +1061,84 @@ mod tests {
         true
     }
 
+    /// docs/77 phase 3b: over the copy limit, a streaming console gets a lease (no copy, nothing held open); the lease
+    /// reopens only the SAME file, and a file swapped in under the name is refused. Without lease_ok: today's refusal.
+    #[test]
+    fn a_file_over_the_copy_limit_is_leased_by_identity_not_copied() {
+        let base = tmp("lease");
+        let up_dir = base.join("transfers");
+        std::fs::create_dir_all(&up_dir).unwrap();
+        let src_dir = base.join("work");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let big = src_dir.join("big.iso");
+        {
+            let f = std::fs::File::create(&big).unwrap();
+            f.set_len(MAX_STAGE_BYTES + 1).unwrap(); // sparse: no 64 MiB write
+        }
+        let root = std::sync::Arc::new(crate::upload_root::UploadRoot::anchored_for_test(&up_dir));
+        let ledger = std::sync::Arc::new(StagedLedger::default());
+        let mut m = WinFileManager::with_paths(&[], &[])
+            .with_upload_root(std::sync::Arc::new(std::sync::Mutex::new(Some(std::sync::Arc::clone(&root)))))
+            .with_stage_dir(up_dir.clone(), false, std::sync::Arc::clone(&ledger));
+
+        let old = uuid::Uuid::new_v4();
+        assert!(
+            matches!(m.prepare(FileOp::Stage { path: &s(&big), stage_id: old, lease_ok: false }), Err(PrepareError::Refused(r)) if r == REFUSE_TOO_BIG),
+            "an older console (no lease_ok) is refused as before"
+        );
+
+        let id = uuid::Uuid::new_v4();
+        let p = m.prepare(FileOp::Stage { path: &s(&big), stage_id: id, lease_ok: true }).unwrap();
+        match commit(p).unwrap() {
+            AuditAction::FileTransfer { bytes, path, .. } => {
+                assert_eq!(bytes, 0, "nothing has left the machine at the stage step (SEC-005)");
+                assert!(path.to_lowercase().ends_with("big.iso"), "{path}");
+            }
+            other => panic!("unexpected audit {other:?}"),
+        }
+        assert!(!up_dir.join(staged_name(id)).exists(), "nothing is copied for a lease");
+        let lease = ledger.lease(&staged_name(id)).expect("the lease is recorded under the staged name");
+        assert!(!ledger.owns(&staged_name(id)), "a lease is not a staged copy (nothing to delete)");
+        // Not held open: the user's own app can still replace the file...
+        let (f, real) = open_lease(&lease).expect("the same file reopens");
+        assert!(real.to_lowercase().ends_with("big.iso"), "{real}");
+        drop(f);
+        std::fs::remove_file(&big).unwrap();
+        std::fs::write(&big, b"something else").unwrap();
+        // ...and a different file under the same name is refused.
+        let e = open_lease(&lease).unwrap_err().to_string();
+        assert!(e.contains("replaced"), "{e}");
+        assert!(!ledger.release(&staged_name(id)), "releasing a lease deletes nothing");
+        assert!(ledger.lease(&staged_name(id)).is_none());
+    }
+
+    #[test]
+    fn leases_are_capped_per_session() {
+        let ledger = StagedLedger::default();
+        let id = FileIdentity { volume: 1, id: [0; 16] };
+        for i in 0..MAX_LEASES {
+            assert!(ledger.add_lease(format!("l{i}"), Lease { path: "x".into(), id, created: None, at: std::time::Instant::now(), attempts: 0 }));
+        }
+        assert!(!ledger.add_lease("one-more".into(), Lease { path: "x".into(), id, created: None, at: std::time::Instant::now(), attempts: 0 }));
+        assert_eq!(ledger.lease_count(), MAX_LEASES);
+        ledger.drain();
+        ledger.add_for_test("copy".into(), 1);
+        assert!(!ledger.add_lease("copy".into(), Lease { path: "x".into(), id, created: None, at: std::time::Instant::now(), attempts: 0 }), "a name a staged copy holds cannot also be a lease");
+        ledger.drain();
+        assert_eq!(ledger.lease_count(), 0, "session end forgets every lease");
+    }
+
+    #[test]
+    fn a_lease_allows_a_few_download_attempts_then_is_forgotten() {
+        let ledger = StagedLedger::default();
+        let id = FileIdentity { volume: 1, id: [0; 16] };
+        ledger.add_lease("l".into(), Lease { path: "x".into(), id, created: None, at: std::time::Instant::now(), attempts: 0 });
+        for _ in 0..MAX_LEASE_ATTEMPTS {
+            assert!(ledger.attempt_lease("l").is_ok());
+        }
+        assert_eq!(ledger.attempt_lease("l").unwrap_err(), true, "used up: each attempt costs a full hashing pass (SEC-003)");
+        assert_eq!(ledger.attempt_lease("l").unwrap_err(), false, "and then forgotten");
+    }
     #[test]
     fn stage_copies_a_file_into_the_root_with_its_digest_and_refuses_what_it_must() {
         let base = tmp("stage");
@@ -924,7 +1163,7 @@ mod tests {
             .with_stage_dir(up_dir.clone(), false, std::sync::Arc::clone(&ledger));
 
         let id = uuid::Uuid::new_v4();
-        let p = m.prepare(FileOp::Stage { path: &s(&src_dir.join("report.txt")), stage_id: id }).unwrap();
+        let p = m.prepare(FileOp::Stage { path: &s(&src_dir.join("report.txt")), stage_id: id, lease_ok: false }).unwrap();
         assert!(matches!(p.guard, GuardRail::Allow));
         match commit(p).unwrap() {
             AuditAction::FileTransfer { sha256, bytes, path, .. } => {
@@ -940,7 +1179,7 @@ mod tests {
         assert!(!ledger.owns(&staged_name(uuid::Uuid::new_v4())));
 
         let refused = |m: &mut WinFileManager, path: &Path| {
-            matches!(m.prepare(FileOp::Stage { path: &s(path), stage_id: uuid::Uuid::new_v4() }), Err(PrepareError::Refused(_)))
+            matches!(m.prepare(FileOp::Stage { path: &s(path), stage_id: uuid::Uuid::new_v4(), lease_ok: false }), Err(PrepareError::Refused(_)))
         };
         assert!(refused(&mut m, &src_dir.join("notes-backup.txt")), "a registry hive, whatever its name");
         assert!(refused(&mut m, &src_dir.join("db.edb")), "an ESE database");

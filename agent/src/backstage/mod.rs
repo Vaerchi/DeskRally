@@ -56,7 +56,14 @@ pub enum Request {
     PlaceUpload { transfer_id: uuid::Uuid, dest_dir: String },
     DiscardUpload { transfer_id: uuid::Uuid },
     /// docs/77 (agent 1.3.38, `file_stage_v1`): stage one file for download from any folder.
-    StageDownload { path: String, stage_id: uuid::Uuid },
+    StageDownload {
+        path: String,
+        stage_id: uuid::Uuid,
+        /// docs/77 phase 3b: the console streams (file_stream_v1), so a file over the 64 MiB copy limit may be LEASED
+        /// (no copy) instead of refused. Absent (older consoles) = false: today's refusal.
+        #[serde(default)]
+        lease_ok: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -139,7 +146,7 @@ impl Request {
                 Some(FileOp::Place { transfer_id: *transfer_id, dest_dir })
             }
             Request::DiscardUpload { transfer_id } => Some(FileOp::Discard { transfer_id: *transfer_id }),
-            Request::StageDownload { path, stage_id } => Some(FileOp::Stage { path, stage_id: *stage_id }),
+            Request::StageDownload { path, stage_id, lease_ok } => Some(FileOp::Stage { path, stage_id: *stage_id, lease_ok: *lease_ok }),
             _ => None,
         }
     }

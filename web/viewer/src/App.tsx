@@ -2750,6 +2750,8 @@ export default function App() {
   // File browser download: delegates to downloadFileFromBrowse() which enforces the no-fallback
   // safety contract — if the agent has not sent a TransferDir message the call is a no-op.
   /** docs/77: fetch one file from the agent's transfer folder (a staged copy) as bytes, for the explorer's Get. */
+  // docs/77 phase 3: a stable opener for the streamed-download channel (BackstagePanels keeps one client per opener).
+  const openFilesChannel = useCallback(() => transportRef.current?.openFilesChannel() ?? null, []);
   const fetchFromAgent = useCallback(
     (rel: string) =>
       new Promise<Uint8Array>((resolve, reject) => {
@@ -3220,6 +3222,9 @@ export default function App() {
                   machineName={session.name}
                   serviceStartType={!observing && backstageFeatures.has("service_start_type_v1")}
                   fetchFromAgent={!observing && backstageFeatures.has("file_stage_v1") ? fetchFromAgent : undefined}
+                  openFilesChannel={!observing && backstageFeatures.has("file_stage_v1") && backstageFeatures.has("file_stream_v1")
+                    ? openFilesChannel
+                    : undefined}
                   openShellChannel={!observing && backstageFeatures.has("system_shell_v1")
                     ? () => transportRef.current?.openShellChannel() ?? null
                     : undefined}

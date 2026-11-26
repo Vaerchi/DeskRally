@@ -599,3 +599,60 @@ async fn agent_accepts_one_shell_channel_and_refuses_a_second() {
     assert!(!was_open_after, "a closed shell channel must report not open");
     assert_eq!(third, Some(ShellMessage::Text("again".into())), "a new shell channel is accepted after the first closed");
 }
+
+/// docs/77 phase 3: the agent accepts ONE `files` channel at a time, independently of the shell channel (both may be
+/// open together), refuses a second concurrent `files` channel, and closes a `files` channel that sends a message
+/// over its 4 KiB control limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_accepts_one_files_channel_alongside_the_shell_and_enforces_its_limit() {
+    use rmt_transport_webrtc::{ShellMessage, FILES_CHANNEL_LABEL, MAX_FILES_MESSAGE_BYTES, SHELL_CHANNEL_LABEL};
+    let url = signaling_url();
+    if !signaling_reachable(&url).await {
+        eprintln!("SKIP: no signaling server reachable at {url}");
+        return;
+    }
+    let agent_device = DeviceId::new();
+    let agent_url = url.clone();
+    let agent = tokio::spawn(async move {
+        let mut t = WebRtcTransport::connect(&agent_url, Role::dev_agent(agent_device, "ed25519:test-agent"))
+            .await
+            .expect("agent connect");
+        let mut shell_rx = t.take_shell_channel().expect("agent side has a shell slot");
+        let mut files_rx = t.take_files_channel().expect("agent side has a files slot");
+        let mut shell = tokio::time::timeout(Duration::from_secs(15), shell_rx.recv()).await.expect("no shell channel").expect("slot");
+        let mut files = tokio::time::timeout(Duration::from_secs(15), files_rx.recv()).await.expect("no files channel").expect("slot");
+        let s = tokio::time::timeout(Duration::from_secs(10), shell.recv()).await.ok().flatten();
+        let mut got = Vec::new();
+        // Everything until the oversized message closes the files channel.
+        let ended = loop {
+            match tokio::time::timeout(Duration::from_secs(15), files.recv()).await {
+                Ok(Some(m)) => got.push(m),
+                Ok(None) => break true,
+                Err(_) => break false,
+            }
+        };
+        (t, s, got, ended, files.is_open())
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let controller = WebRtcTransport::connect(&url, Role::dev_controller(agent_device)).await.expect("controller connect");
+
+    let shell = controller.open_extra_data_channel(SHELL_CHANNEL_LABEL).await.expect("open shell");
+    let files = controller.open_extra_data_channel(FILES_CHANNEL_LABEL).await.expect("open files");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shell.send_text("sh").await;
+    files.send_text("credit").await;
+    let second = controller.open_extra_data_channel(FILES_CHANNEL_LABEL).await.expect("open second files");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    second.send_text("from-the-second").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    files.send_raw(&vec![7u8; MAX_FILES_MESSAGE_BYTES + 1]).await;
+
+    let (_agent_transport, s, got, ended, open_after) = tokio::time::timeout(Duration::from_secs(60), agent)
+        .await
+        .expect("agent task timed out")
+        .expect("agent task panicked");
+    assert_eq!(s, Some(ShellMessage::Text("sh".into())), "the shell channel works alongside the files channel");
+    assert_eq!(got, vec![ShellMessage::Text("credit".into())], "only the first files channel is served; the second is refused");
+    assert!(ended, "an oversized message on the files channel closes it");
+    assert!(!open_after);
+}

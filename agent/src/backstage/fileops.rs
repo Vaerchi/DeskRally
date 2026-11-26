@@ -21,7 +21,8 @@ pub enum FileOp<'a> {
     Discard { transfer_id: uuid::Uuid },
     /// docs/77 (agent 1.3.38): copy one regular file into the transfer folder as `dr-stage-<stage_id>.bin`, so the
     /// existing verified download can fetch it from there.
-    Stage { path: &'a str, stage_id: uuid::Uuid },
+    /// docs/77 phase 3b: with `lease_ok`, a file over the copy limit is leased (identity recorded, no copy) instead.
+    Stage { path: &'a str, stage_id: uuid::Uuid, lease_ok: bool },
 }
 
 /// Admission, checked by a commit immediately before its irreversible system call.

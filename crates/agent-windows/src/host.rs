@@ -5570,6 +5570,35 @@ pub async fn serve_session_with_ice(
             }
         })
     });
+    // docs/77 phase 3: streamed downloads on the console's `files` channel (one file at a time, credit-paced). The same
+    // authority as the shell (minus view-only: a read) and the same dispatcher twin and audit path.
+    let files_streaming = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let files_task = transport.take_files_channel().map(|rx| {
+        let ctx = crate::file_stream::FileStreamContext {
+            authority: shell_authority.clone(),
+            dispatcher: shell_dispatcher.clone(),
+            chain: audit_chain.clone(),
+            audit_out: shell_audit_tx.clone(),
+            transfer_dir: transfer_dir.clone(),
+            staged: staged_ledger.clone(),
+            touch: {
+                let activity = activity.clone();
+                Box::new(move || {
+                    if let Some(a) = activity.as_deref() {
+                        a.touch();
+                    }
+                })
+            },
+            streaming: files_streaming.clone(),
+        };
+        let mut rx = rx;
+        tokio::spawn(async move {
+            while let Some(chan) = rx.recv().await {
+                crate::file_stream::run(chan, &ctx).await;
+                ctx.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    });
     // The guest's indicator went off-screen (a display change it could not be re-placed after): held
     // view-only, on top of `access_state`, until the window reports it visible again.
     let mut indicator_lost = false;
@@ -6934,6 +6963,12 @@ pub async fn serve_session_with_ice(
                                 && dispatcher.as_ref().is_some_and(|d| d.allows_system_shell())
                             {
                                 features.push("system_shell_v1".to_string());
+                            }
+                            // docs/77 phase 3: streamed downloads (the files channel) when this session may download.
+                            if files_task.is_some()
+                                && dispatcher.as_ref().is_some_and(|d| d.allows_file_transfer(Direction::Output))
+                            {
+                                features.push("file_stream_v1".to_string());
                             }
                             // 1.3.38: the Services tab offers a Startup type choice only when this agent can make it.
                             if !observer && dispatcher.as_ref().is_some_and(|d| d.allows_service_config()) {
@@ -8802,6 +8837,31 @@ pub async fn serve_session_with_ice(
         crate::fs_manage::remove_session_staged(dir, crate::update_worker::is_local_system(), ledger);
         crate::fs_manage::sweep_staged(dir, crate::update_worker::is_local_system());
     }
+    if let Some(mut task) = files_task {
+        // docs/77 phase 3: the ended authority stops a running stream within one 50 ms tick, which records its outcome;
+        // wait for that (bounded), then end the task. Before the shell block, whose drain delivers what it sealed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while files_streaming.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
+        // Deliver what the stream sealed (its outcome, or the drop guard's Failed after the abort): a sealed event left
+        // undelivered is a permanent seq gap (review M1; the shell block below drains too, but may not exist).
+        while let Ok(ev) = shell_audit_rx.try_recv() {
+            let Some(message) = ft_audit(ev.id, &ev) else { break };
+            let payload = file_transfer::encode(&message);
+            if tokio::time::timeout(
+                Duration::from_millis(500),
+                transport.send_frame(Frame::new(ChannelId::FileTransfer, payload)),
+            )
+            .await
+            .map_or(true, |r| r.is_err())
+            {
+                break;
+            }
+        }
+    }
     if let Some(mut task) = shell_task {
         // The relay task never ENDS on its own while the transport lives (it waits for the next shell channel), so
         // wait for the SHELL to close instead: the relay notices the ended authority within a second, kills the
@@ -10222,35 +10282,10 @@ fn serve_download(
         out
     };
 
-    let resolved = match file_transfer::resolve_download_path(transfer_dir, path) {
-        Ok(p) => p,
+    let OpenedDownload { file, resolved, staged_name } = match open_download(transfer_dir, path, staged) {
+        Ok(o) => o,
         Err(e) => return fail(e, dispatcher),
     };
-    // Real-path confinement: the resolved file must canonicalize to somewhere under the canonical
-    // transfer root (defeats a symlink/junction pointing outside).
-    match (std::fs::canonicalize(transfer_dir), std::fs::canonicalize(&resolved)) {
-        (Ok(root), Ok(real)) if real.starts_with(&root) => {}
-        (Ok(_), Ok(_)) => {
-            return fail(format!("path {path:?} escapes the transfer root"), dispatcher)
-        }
-        _ => return fail(format!("file not found: {path:?}"), dispatcher),
-    }
-    let file = match std::fs::File::open(&resolved) {
-        Ok(f) => f,
-        Err(e) => return fail(format!("read failed: {e}"), dispatcher),
-    };
-    // docs/77: a staged download (dr-stage-*.bin) is served only to the session that staged it, decided on the name
-    // of the file actually OPENED (its final path from the handle: any case, ./, 8.3 alias, or a commit landing
-    // between two lookups all end here; release review M2). Behind the permission check above, and audited (L6).
-    let staged_name = match crate::anchor::final_path(std::os::windows::io::AsRawHandle::as_raw_handle(&file)) {
-        Ok(real) => crate::fs_manage::staged_name_of(Path::new(&real)),
-        Err(e) => return fail(format!("read failed: {e}"), dispatcher),
-    };
-    if let Some(n) = &staged_name {
-        if !staged.is_some_and(|l| l.owns(n)) {
-            return fail("that file is not available to this session".into(), dispatcher);
-        }
-    }
     let data = (|| -> std::io::Result<Vec<u8>> {
         use std::io::Read;
         let mut data = Vec::new();
@@ -10302,6 +10337,45 @@ fn serve_download(
     );
     out.extend(audit);
     out
+}
+
+/// A download opened and checked: the handle, the path it resolved to, and the staged name if it is a staged copy.
+pub(crate) struct OpenedDownload {
+    pub(crate) file: std::fs::File,
+    pub(crate) resolved: PathBuf,
+    pub(crate) staged_name: Option<String>,
+}
+
+/// Resolve, confine and open a download from the transfer folder, deciding staged-copy ownership on the handle
+/// (shared by the session-channel download and the docs/77 phase 3 streamed download). The caller has already
+/// checked the permission. Errors are the reply text.
+pub(crate) fn open_download(
+    transfer_dir: &Path,
+    path: &str,
+    staged: Option<&crate::fs_manage::StagedLedger>,
+) -> Result<OpenedDownload, String> {
+    let resolved = file_transfer::resolve_download_path(transfer_dir, path)?;
+    // Real-path confinement: the resolved file must canonicalize to somewhere under the canonical
+    // transfer root (defeats a symlink/junction pointing outside).
+    match (std::fs::canonicalize(transfer_dir), std::fs::canonicalize(&resolved)) {
+        (Ok(root), Ok(real)) if real.starts_with(&root) => {}
+        (Ok(_), Ok(_)) => return Err(format!("path {path:?} escapes the transfer root")),
+        _ => return Err(format!("file not found: {path:?}")),
+    }
+    let file = std::fs::File::open(&resolved).map_err(|e| format!("read failed: {e}"))?;
+    // docs/77: a staged download (dr-stage-*.bin) is served only to the session that staged it, decided on the name
+    // of the file actually OPENED (its final path from the handle: any case, ./, 8.3 alias, or a commit landing
+    // between two lookups all end here; release review M2). Behind the permission check, and audited (L6).
+    let staged_name = match crate::anchor::final_path(std::os::windows::io::AsRawHandle::as_raw_handle(&file)) {
+        Ok(real) => crate::fs_manage::staged_name_of(Path::new(&real)),
+        Err(e) => return Err(format!("read failed: {e}")),
+    };
+    if let Some(n) = &staged_name {
+        if !staged.is_some_and(|l| l.owns(n)) {
+            return Err("that file is not available to this session".into());
+        }
+    }
+    Ok(OpenedDownload { file, resolved, staged_name })
 }
 
 /// Build an `Ack` reply.

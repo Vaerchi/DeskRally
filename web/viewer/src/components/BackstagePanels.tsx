@@ -9,7 +9,7 @@
  * loading state without any network access.
  */
 
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 // docs/76: xterm.js loads only when the Command prompt is offered (it also keeps it out of the first-load bundle).
 const TerminalPanel = lazy(() => import("./TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
 import {
@@ -38,8 +38,9 @@ import { ServicesPanel } from "./ServicesPanel";
 import { FileBrowserPanel, joinPath } from "./FileBrowserPanel";
 import { locationLabel, parentPath } from "../lib/filepath";
 import { LocalFolderPane } from "./LocalFolderPane";
-import { unsafeLocalName, writeLocalFile, type LocalDirHandle } from "../lib/local_folder";
-import { describePlan, needsConfirmation, planLocalCopy, planRemoteCopy } from "../lib/folder_copy";
+import { openLocalWritable, unsafeLocalName, writeLocalFile, type LocalDirHandle } from "../lib/local_folder";
+import { FileStreamClient, type FilesChannelLike } from "../lib/file_stream_client";
+import { describePlan, MAX_FILE_BYTES, MAX_STREAM_FILE_BYTES, needsConfirmation, planLocalCopy, planRemoteCopy } from "../lib/folder_copy";
 import { saveBytesAsFile } from "./FileTransferPanel";
 import { SystemInfoPanel } from "./SystemInfoPanel";
 import { EventLogPanel } from "./EventLogPanel";
@@ -64,6 +65,9 @@ export interface BackstagePanelsProps {
   serviceStartType?: boolean;
   /** docs/77 (agent advertised `file_stage_v1`): fetch a staged file from the agent's transfer folder as bytes. */
   fetchFromAgent?: (rel: string) => Promise<Uint8Array>;
+  /** docs/77 phase 3 (agent advertised `file_stream_v1`): open the streamed-download channel. With a local folder open,
+   *  Get streams the staged copy straight into it (credit-paced, verified) instead of collecting it in memory. */
+  openFilesChannel?: () => RTCDataChannel | null;
   /** Injectable client (default talks to `/backstage/exec` via fetch). */
   client?: BackstageClient;
   /** Event-log channel to query for the Event Log tab (default "System"). */
@@ -200,6 +204,7 @@ export function BackstagePanels({
   openShellChannel,
   serviceStartType,
   fetchFromAgent,
+  openFilesChannel,
 }: BackstagePanelsProps) {
   // docs/76: the Command prompt is not a request/response tab, so it sits beside the loader-driven tabs.
   const [terminalShown, setTerminalShown] = useState(false);
@@ -420,6 +425,40 @@ export function BackstagePanels({
   // docs/77 explorer: the local folder on screen (where Get writes) and a key to re-list it after a write.
   const [localDir, setLocalDir] = useState<LocalDirHandle | null>(null);
   const [localRefresh, setLocalRefresh] = useState(0);
+  // docs/77 phase 3: one streamed-download client per channel opener (one file at a time, queued).
+  const streamClient = useMemo(
+    () => (openFilesChannel ? new FileStreamClient(openFilesChannel as unknown as () => FilesChannelLike | null) : null),
+    [openFilesChannel],
+  );
+  useEffect(() => () => streamClient?.close(), [streamClient]);
+  // Stream the agent's `rel` (a staged copy) into `name` in `dir` (existing names kept). A failure leaves nothing: the
+  // client aborts the writable and the empty entry it created is removed. Returns the name it was saved as.
+  const streamInto = useCallback(
+    async (dir: LocalDirHandle, name: string, rel: string, onProgress?: (written: number, size: number) => void) => {
+      if (!streamClient) throw new Error("streaming is not available");
+      // The local file is opened INSIDE the client's queue (review L6), so two queued Gets never pick the same name.
+      let savedAs: string | null = null;
+      try {
+        await streamClient.get(rel, async () => {
+          const opened = await openLocalWritable(dir, name, "keep-both");
+          if (!opened) throw new Error("skipped");
+          savedAs = opened.name;
+          const w = opened.writable;
+          return {
+            write: (d: Uint8Array) => w.write(d as Uint8Array<ArrayBuffer>),
+            close: () => w.close(),
+            abort: async () => { await w.abort?.(); },
+          };
+        }, onProgress);
+      } catch (e) {
+        if (savedAs) await dir.removeEntry?.(savedAs).catch(() => undefined);
+        throw e;
+      }
+      if (savedAs === null) throw new Error("the file was not saved");
+      return savedAs as string;
+    },
+    [streamClient],
+  );
   // Get: stage the remote file (agent copies it into its transfer folder), fetch the staged copy (sha256 verified),
   // write it into the local folder on screen. An existing name is KEPT (name (2).ext): a Get never overwrites a
   // file on the technician's computer. Without folder access it goes through the browser's download.
@@ -436,12 +475,23 @@ export function BackstagePanels({
           const stageId = crypto.randomUUID();
           const env = await active.stageDownload(src, stageId, () =>
             requestConfirm(`Copy ${src} from ${machineName} to ${label}?`),
-          );
+          // Streaming into a chosen folder: a file over 64 MiB may be leased (docs/77 phase 3b).
+          !!(target && streamClient));
           if (!env.ok) {
             updatePlacement(key, { phase: "failed", message: env.error?.message ?? "refused" });
             return;
           }
           updatePlacement(key, { message: "Downloading…" });
+          if (target && streamClient) {
+            let shown = -1;
+            const saved = await streamInto(target, name, `dr-stage-${stageId}.bin`, (w, s) => {
+              const pct = s > 0 ? Math.floor((w * 100) / s) : 100;
+              if (pct !== shown) { shown = pct; updatePlacement(key, { message: `Downloading… ${pct}%` }); }
+            });
+            updatePlacement(key, { phase: "placed", message: `Saved as ${saved}` });
+            setLocalRefresh((n) => n + 1);
+            return;
+          }
           const bytes = await fetchFromAgent(`dr-stage-${stageId}.bin`);
           if (target) {
             // A fresh ArrayBuffer-backed copy: the writer takes a plain BufferSource.
@@ -457,7 +507,7 @@ export function BackstagePanels({
         }
       })();
     },
-    [fetchFromAgent, path, localDir, active, requestConfirm, machineName, updatePlacement],
+    [fetchFromAgent, path, localDir, active, requestConfirm, machineName, updatePlacement, streamClient, streamInto],
   );
 
   // docs/77 phase 2: Get a whole folder into the local folder on screen. The tree is listed first (count + size
@@ -477,7 +527,7 @@ export function BackstagePanels({
             const env = await active.exec({ type: "BrowseDirectory", data: { path: p } });
             if (env.ok && env.response?.type === "DirectoryListing") return env.response.data.entries;
             throw new Error(env.error?.message ?? "could not list it");
-          });
+          }, streamClient ? MAX_STREAM_FILE_BYTES : MAX_FILE_BYTES);
           const summary = describePlan(plan);
           if (needsConfirmation(plan) && !(await requestConfirm(`Copy ${summary} from ${root} on ${machineName} to ${label}?`))) {
             updatePlacement(key, { phase: "failed", message: `Cancelled (${summary})` });
@@ -502,10 +552,14 @@ export function BackstagePanels({
               const stageId = crypto.randomUUID();
               const env = await active.stageDownload(f.path, stageId, () =>
                 requestConfirm(`Copy ${f.path} from ${machineName} to ${label}?`),
-              );
+              !!streamClient);
               if (!env.ok) throw new Error(env.error?.message ?? "refused");
-              const bytes = await fetchFromAgent(`dr-stage-${stageId}.bin`);
-              await writeLocalFile(dir, f.rel[f.rel.length - 1], new Uint8Array(bytes), "keep-both");
+              if (streamClient) {
+                await streamInto(dir, f.rel[f.rel.length - 1], `dr-stage-${stageId}.bin`);
+              } else {
+                const bytes = await fetchFromAgent(`dr-stage-${stageId}.bin`);
+                await writeLocalFile(dir, f.rel[f.rel.length - 1], new Uint8Array(bytes), "keep-both");
+              }
               done += 1;
             } catch {
               failed += 1;
@@ -525,7 +579,7 @@ export function BackstagePanels({
         }
       })();
     },
-    [fetchFromAgent, path, localDir, active, requestConfirm, machineName, updatePlacement],
+    [fetchFromAgent, path, localDir, active, requestConfirm, machineName, updatePlacement, streamClient, streamInto],
   );
 
   const handleUploadHere = useCallback(

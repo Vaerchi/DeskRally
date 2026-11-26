@@ -81,7 +81,7 @@ export type Request =
   | { type: "RenamePath"; data: { from: string; to: string } }
   | { type: "DeletePath"; data: { path: string } }
   // docs/77 (agent advertised `file_stage_v1`): copy one file into the transfer folder as dr-stage-<stage_id>.bin.
-  | { type: "StageDownload"; data: { path: string; stage_id: string } }
+  | { type: "StageDownload"; data: { path: string; stage_id: string; lease_ok?: boolean } }
   // docs/58 §12 (agent advertised `file_place`): place / discard a completed upload by transfer id.
   | { type: "PlaceUpload"; data: { transfer_id: string; dest_dir: string } }
   | { type: "DiscardUpload"; data: { transfer_id: string } };
@@ -375,8 +375,15 @@ export class BackstageClient {
     return this.execConfirmable({ type: "DeletePath", data: { path } }, confirm);
   }
   /** docs/77: stage one remote file for download (the agent copies it to dr-stage-<stageId>.bin in its transfer folder). */
-  stageDownload(path: string, stageId: string, confirm: (pending: Envelope) => Promise<boolean>): Promise<Envelope> {
-    return this.execConfirmable({ type: "StageDownload", data: { path, stage_id: stageId } }, confirm);
+  /** `leaseOk` (docs/77 phase 3b): the console will STREAM it, so a file over the 64 MiB copy limit may be leased. */
+  stageDownload(
+    path: string,
+    stageId: string,
+    confirm: (pending: Envelope) => Promise<boolean>,
+    leaseOk = false,
+  ): Promise<Envelope> {
+    const data = leaseOk ? { path, stage_id: stageId, lease_ok: true } : { path, stage_id: stageId };
+    return this.execConfirmable({ type: "StageDownload", data }, confirm);
   }
   placeUpload(transferId: string, destDir: string, confirm: (pending: Envelope) => Promise<boolean>): Promise<Envelope> {
     return this.execConfirmable({ type: "PlaceUpload", data: { transfer_id: transferId, dest_dir: destDir } }, confirm);

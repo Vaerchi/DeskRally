@@ -31,8 +31,10 @@ export interface CopyPlan {
   truncated: boolean;
 }
 
-/** The agent's per-file download limit (agent fs_manage MAX_STAGE_BYTES). */
+/** The agent's per-file download limit when it copies (agent fs_manage MAX_STAGE_BYTES). */
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
+/** docs/77 phase 3b: the limit when the console streams (the agent leases instead of copying; MAX_LEASE_BYTES). */
+export const MAX_STREAM_FILE_BYTES = 4 * 1024 * 1024 * 1024;
 /** Above either of these the technician confirms the copy. */
 export const CONFIRM_FILES = 500;
 export const CONFIRM_BYTES = 1024 * 1024 * 1024;
@@ -51,6 +53,7 @@ export function joinRemote(dir: string, name: string): string {
 export async function planRemoteCopy(
   root: string,
   list: (path: string) => Promise<RemoteEntryLike[]>,
+  maxFileBytes: number = MAX_FILE_BYTES,
 ): Promise<CopyPlan> {
   const plan: CopyPlan = { files: [], dirs: [], skipped: [], totalBytes: 0, truncated: false };
   const queue: { path: string; rel: string[] }[] = [{ path: root, rel: [] }];
@@ -80,8 +83,8 @@ export async function planRemoteCopy(
         queue.push({ path: childPath, rel: childRel });
       } else {
         const size = e.size_bytes ?? 0;
-        if (size > MAX_FILE_BYTES) {
-          plan.skipped.push({ path: childPath, reason: "over 64 MiB" });
+        if (size > maxFileBytes) {
+          plan.skipped.push({ path: childPath, reason: maxFileBytes === MAX_FILE_BYTES ? "over 64 MiB" : "over 4 GiB" });
           continue;
         }
         plan.files.push({ rel: childRel, path: childPath, size });

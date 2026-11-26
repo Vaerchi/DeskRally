@@ -23,6 +23,8 @@ export interface LocalDirHandle {
   entries(): AsyncIterable<[string, LocalDirHandle | LocalFileHandle]>;
   getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<LocalDirHandle>;
   getFileHandle(name: string, opts?: { create?: boolean }): Promise<LocalFileHandle>;
+  /** Removes an entry (a streamed Get that failed removes the empty file it created). */
+  removeEntry?(name: string): Promise<void>;
 }
 
 export interface LocalEntry {
@@ -117,24 +119,40 @@ async function exists(dir: LocalDirHandle, name: string): Promise<boolean> {
  * Write `data` as `name` in `dir`. The name is checked first (refused, never cleaned). An existing file is replaced,
  * kept alongside (`name (2).ext`) or skipped, per `policy`. A failed write is aborted so no half file is left behind.
  */
-export async function writeLocalFile(
+/**
+ * Open `name` in `dir` for writing under `policy` (the name checked first; an existing file replaced, kept alongside, or
+ * skipped). Returns null when skipped. The caller writes and closes, or aborts so no half file is left behind
+ * (docs/77 phase 3 streams into it).
+ */
+export async function openLocalWritable(
   dir: LocalDirHandle,
   name: string,
-  data: Blob | BufferSource,
   policy: ConflictPolicy,
-): Promise<WriteResult> {
+): Promise<{ name: string; writable: LocalWritable } | null> {
   const bad = unsafeLocalName(name);
   if (bad) throw new Error(`"${name}" cannot be saved here: ${bad}`);
   let target = name;
   if (await exists(dir, name)) {
-    if (policy === "skip") return { kind: "skipped", name };
+    if (policy === "skip") return null;
     if (policy === "keep-both") {
       const taken = new Set((await listLocal(dir)).map((e) => e.name));
       target = keepBothName(name, taken);
     }
   }
   const handle = await dir.getFileHandle(target, { create: true });
-  const w = await handle.createWritable();
+  return { name: target, writable: await handle.createWritable() };
+}
+
+export async function writeLocalFile(
+  dir: LocalDirHandle,
+  name: string,
+  data: Blob | BufferSource,
+  policy: ConflictPolicy,
+): Promise<WriteResult> {
+  const opened = await openLocalWritable(dir, name, policy);
+  if (!opened) return { kind: "skipped", name };
+  const target = opened.name;
+  const w = opened.writable;
   try {
     await w.write(data);
     await w.close();

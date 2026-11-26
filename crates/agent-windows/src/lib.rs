@@ -95,6 +95,8 @@ pub mod shared_capture;
 pub(crate) mod system_shell;
 /// The terminal's per-session relay and its authority checks (docs/76 phase 3).
 pub(crate) mod shell_relay;
+/// Streamed downloads on the console's `files` channel (docs/77 phase 3).
+pub(crate) mod file_stream;
 pub mod signaling_mux;
 pub mod stdio;
 pub mod stub;

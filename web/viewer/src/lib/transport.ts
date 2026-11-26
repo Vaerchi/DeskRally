@@ -317,6 +317,17 @@ export class WebRTCTransport implements Transport {
     return dc;
   }
 
+  /**
+   * docs/77 phase 3: open this session's `files` data channel (streamed downloads, credit-paced). The agent accepts one
+   * at a time, after the session channel, alongside the shell channel; null when there is no live peer connection.
+   */
+  openFilesChannel(): RTCDataChannel | null {
+    if (!this.pc) return null;
+    const dc = this.pc.createDataChannel("files", { ordered: true });
+    dc.binaryType = "arraybuffer";
+    return dc;
+  }
+
   setBackground(hidden: boolean): void {
     this.background = hidden;
   }
