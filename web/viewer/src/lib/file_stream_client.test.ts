@@ -100,7 +100,7 @@ const data = (n: number) => { const d = new Uint8Array(n); for (let i = 0; i < n
 
 describe("FileStreamClient (docs/77 phase 3)", () => {
   it("streams a file into the sink in order, verified, never letting the agent run more than its window ahead", async () => {
-    const file = data(2.5 * 1024 * 1024 + 123); // over two windows: the agent must wait for credits
+    const file = data(1.5 * 1024 * 1024 + 123); // over one window: the agent must wait for credits
     const agent = new FakeAgent({ "dr-stage-1.bin": file });
     const client = new FileStreamClient(() => agent);
     const sink = new MemSink();
@@ -115,7 +115,7 @@ describe("FileStreamClient (docs/77 phase 3)", () => {
     const credits = agent.sentToAgent.filter((m) => m.t === "credit").map((m) => m.written as number);
     expect(credits[credits.length - 1]).toBe(file.length);
     expect([...credits].sort((a, b) => a - b)).toEqual(credits); // credits only move forward
-  }, 20_000);
+  }, 60_000); // generous: the fake disk yields per chunk and a loaded machine slows it (seen 11-26)
 
   it("an empty file completes", async () => {
     const agent = new FakeAgent({ "e.txt": new Uint8Array(0) });

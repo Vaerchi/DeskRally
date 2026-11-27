@@ -4117,11 +4117,16 @@ mod tests {
         };
         cap.input_tx.try_send(ev(stale_epoch, 0x51)).unwrap();
         cap.input_tx.try_send(ev(adm.current_epoch(), 0x57)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Waited for, not slept for (a fixed 300 ms flaked under load, like its neighbour on 2026-11-25). The queue is
+        // FIFO, so once the CURRENT press (queued second) has landed, the stale one has already been handled.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while coordinator.state.lock().unwrap().key_holders.get(&0x57).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         {
             let st = coordinator.state.lock().unwrap();
-            assert!(st.key_holders.get(&0x51).is_none(), "a pre-revocation press revived after re-admission");
             assert!(st.key_holders.get(&0x57).is_some(), "a current press was dropped");
+            assert!(st.key_holders.get(&0x51).is_none(), "a pre-revocation press revived after re-admission");
         }
         stop.store(true, Ordering::SeqCst);
         thread.join().unwrap();

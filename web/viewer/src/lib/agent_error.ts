@@ -23,11 +23,24 @@ export type AgentErrorRoute =
   | { kind: "input-control" }
   | { kind: "session-ended"; layoutChange: boolean }
   | { kind: "policy-rejected" }
+  | { kind: "monitor-pinned" }
   | { kind: "command" };
+
+/**
+ * The multi-session agent refusing a SelectMonitor because the session group's display is pinned (host.rs). Harmless:
+ * the agent keeps streaming what it pinned, and the console follows the MonitorPinned that comes with the monitor
+ * list. Agents before 1.3.40 send the list BEFORE the pin, so the console's automatic first selection can be refused
+ * this way; 2026-11-27 it surfaced as a banner with the raw "all displays" id 4294967295. Never shown.
+ */
+export function isMonitorPinRefusal(message: string): boolean {
+  return /^monitor selection is locked to (?:display \d+|all displays) for this session group\b/.test(message);
+}
 
 export function routeAgentError(message: string, policyInstallPending: boolean): AgentErrorRoute {
   if (isInputControlError(message)) return { kind: "input-control" };
   if (message.startsWith("session ended:")) return { kind: "session-ended", layoutChange: isDisplayLayoutEnd(message) };
+  // Before the pending-policy check: a pin refusal is never a policy verdict.
+  if (isMonitorPinRefusal(message)) return { kind: "monitor-pinned" };
   if (policyInstallPending) return { kind: "policy-rejected" };
   return { kind: "command" };
 }

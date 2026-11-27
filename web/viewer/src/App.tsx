@@ -3,6 +3,7 @@ import { withAuditWarning } from "./lib/audit_forward";
 import { SessionViewer } from "./components/SessionViewer";
 import { ConnectionDiagnostics } from "./components/ConnectionDiagnostics";
 import { BackgroundTracker } from "./lib/background";
+import { AppSessionLink, appBridge } from "./lib/android_app";
 import { desktopLink, desktopMinVersion, isDesktopClient, defaultDesktopPreference, attendedLaunchId, DESKTOP_PREFERENCE_KEY, type DesktopTarget } from "./lib/desktop_launch";
 import type { MonitorCanvas } from "./lib/monitor_canvas";
 /**
@@ -1786,6 +1787,9 @@ export default function App() {
                 // This is the case that used to vanish: the note was stored and never rendered.
                 setSessionPolicyState({ enforced: false, applied: false, note: message });
                 return;
+              case "monitor-pinned":
+                // The agent keeps its pinned display; MonitorPinned already told the viewer which. Nothing to show.
+                return;
               case "command":
                 settleAfterCommandError(message);
                 return;
@@ -2673,6 +2677,21 @@ export default function App() {
   useEffect(() => () => teardown(), [teardown]);
 
   const handleDisconnect = disconnectSession;
+
+  // docs/78: inside the DeskRally Android app, tell the app while a session is live (it keeps itself running in the
+  // background with a "session active" notification) and end the session when the app asks (its notification's End
+  // action, or its 15-minute background limit). A no-op in a browser.
+  const appLinkRef = useRef<AppSessionLink | null>(null);
+  const disconnectRef = useRef(disconnectSession);
+  disconnectRef.current = disconnectSession;
+  useEffect(() => {
+    const link = new AppSessionLink(appBridge(), () => disconnectRef.current());
+    appLinkRef.current = link;
+    return () => { link.dispose(); appLinkRef.current = null; };
+  }, []);
+  useEffect(() => {
+    appLinkRef.current?.report(state === "connected" && session !== null, session?.name);
+  }, [state, session]);
 
   useEffect(() => {
     // React does not unmount on tab closure. endSession uses a small keepalive fetch with

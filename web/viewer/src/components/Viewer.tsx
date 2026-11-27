@@ -1053,7 +1053,18 @@ export function Viewer({
   // the same answer from the same `primary` flag, but sending it makes the two provably agree
   // instead of relying on them staying in step.
   const monitorDefaultApplied = useRef(false);
+  // Multi-session pinned-display mode (no canvas): the agent's pin cannot change, so the viewer FOLLOWS it (the
+  // pinned display, or "all displays" when pinned to the composite) and never asks for another one (2026-11-27:
+  // asking was refused with the raw composite id in a banner).
+  const pinnedMode = pinnedMonitorId !== undefined && !monitorCanvas;
   useEffect(() => {
+    if (pinnedMode) {
+      monitorDefaultApplied.current = true;
+      if (pinnedMonitorId !== activeMonitor && isValidMonitorSelection(pinnedMonitorId, monitorList)) {
+        setActiveMonitor(pinnedMonitorId);
+      }
+      return;
+    }
     if (monitors.length > 0 && !monitorDefaultApplied.current) {
       monitorDefaultApplied.current = true;
       const initial = initialMonitorId !== undefined && isValidMonitorSelection(initialMonitorId, monitorList)
@@ -1073,7 +1084,7 @@ export function Viewer({
       // replacement request when a real list is present so the agent never sees a synthetic id.
       if (monitors.length > 0 && !monitorCanvas) onSelectMonitor?.(next);
     }
-  }, [monitors, monitorList, activeMonitor, onSelectMonitor, monitorCanvas, initialMonitorId]);
+  }, [monitors, monitorList, activeMonitor, onSelectMonitor, monitorCanvas, initialMonitorId, pinnedMode, pinnedMonitorId]);
 
   // Audio going away (agent restarted, endpoint unplugged) must not leave the control reading ON
   // for a stream that no longer exists — an indicator that lies is worse than one that is absent.

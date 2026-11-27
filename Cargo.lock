@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "rmt-agent-core"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "base64",
  "bytes",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "rmt-agent-windows"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "embed-resource",
  "futures-util",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "rmt-crypto"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "rmt-protocol"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "bytes",
  "hex",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "rmt-transport-webrtc"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "async-trait",
  "bytes",

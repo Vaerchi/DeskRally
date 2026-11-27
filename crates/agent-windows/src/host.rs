@@ -6741,22 +6741,10 @@ pub async fn serve_session_with_ice(
                                     input_open = false;
                                 }
                             }
-                            let monitors =
-                                published.lock().map(|g| g.clone()).unwrap_or_default();
-                            tracing::info!(count = monitors.len(), "replying to monitor-list request");
-                            let payload =
-                                control::encode(&ControlMessage::MonitorList { monitors });
-                            if let Err(e) = transport
-                                .send_frame(Frame::new(ChannelId::Control, payload))
-                                .await
-                            {
-                                tracing::debug!(error = %e, "monitor-list reply send failed");
-                                input_open = false;
-                            }
-                            // In multi-session pinned-display mode, immediately follow the monitor
-                            // list with MonitorPinned so every session learns the locked display
-                            // without waiting for a SelectMonitor round-trip.  The pin is
-                            // established by SharedCapture::spawn before any session registers.
+                            // Multi-session pinned-display mode: say which display is locked BEFORE the
+                            // list, so a viewer never auto-selects from the list and asks for a display the
+                            // pin then refuses (2026-11-27). The pin is established by SharedCapture::spawn
+                            // before any session registers.
                             if let Some(ref ss) = shared_selection_state {
                                 let pinned_id = ss.lock().unwrap().monitor;
                                 let payload = control::encode(
@@ -6769,6 +6757,18 @@ pub async fn serve_session_with_ice(
                                     tracing::debug!(error = %e, "MonitorPinned send failed on monitor-list reply");
                                     input_open = false;
                                 }
+                            }
+                            let monitors =
+                                published.lock().map(|g| g.clone()).unwrap_or_default();
+                            tracing::info!(count = monitors.len(), "replying to monitor-list request");
+                            let payload =
+                                control::encode(&ControlMessage::MonitorList { monitors });
+                            if let Err(e) = transport
+                                .send_frame(Frame::new(ChannelId::Control, payload))
+                                .await
+                            {
+                                tracing::debug!(error = %e, "monitor-list reply send failed");
+                                input_open = false;
                             }
                         }
                         Ok(ControlMessage::SelectMonitor { id }) => {
@@ -6814,11 +6814,7 @@ pub async fn serve_session_with_ice(
                                         );
                                     }
                                     PinResult::Rejected { pinned } => {
-                                        let message = format!(
-                                            "monitor selection is locked to display {pinned} \
-                                             for this session group; dynamic switching is not \
-                                             supported in multi-session mode"
-                                        );
+                                        let message = crate::monitor_canvas::pin_refusal_message(pinned);
                                         let payload =
                                             control::encode(&ControlMessage::Error { message });
                                         if let Err(e) = transport
@@ -10623,6 +10619,15 @@ struct BroadcastCapturer {
     /// This session's frame-rate demand on the shared producer (see
     /// `SharedCapture::register_fps_demand`); `None` for capturers built without one (tests).
     fps_demand: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// The composite canvas this session ADVERTISES (MonitorCanvas). When set, `capture_composite`
+    /// accepts exactly the frames that match it, so the advertised canvas and the delivered video
+    /// can never disagree - including when the snapshot had no topology and the canvas came from the
+    /// live monitor list (2026-11-27 release review). `None` = derive it from the snapshot (tests).
+    composite_canvas: Option<control::MonitorCanvas>,
+    /// The live monitor list `composite_canvas` was built from when the snapshot had NO topology
+    /// (sign-in screen). `monitors()` returns it so the viewer's picker lists the same displays the
+    /// canvas shows; empty whenever the snapshot has a topology.
+    canvas_monitors: Vec<MonitorInfo>,
     // input_ready removed: pinned-display mode makes input unconditionally ready; BroadcastCapturer
     // no longer clears it on stale-frame rejection.  Stale frames are discarded (Err return) but
     // do not affect session input state.
@@ -10648,7 +10653,22 @@ impl BroadcastCapturer {
             selection_state,
             last_selection,
             fps_demand: None,
+            composite_canvas: None,
+            canvas_monitors: Vec::new(),
         }
+    }
+
+    /// Pin the composite geometry check to the canvas advertised to this session's viewer.
+    /// `source` is the monitor list the canvas was built from; it is advertised by `monitors()`
+    /// only when the snapshot has no topology (otherwise the snapshot stays authoritative).
+    fn with_composite_canvas(mut self, canvas: Option<control::MonitorCanvas>, source: Vec<MonitorInfo>) -> Self {
+        self.canvas_monitors = if canvas.is_some() && self.initial_snapshot.topology.is_none() {
+            source
+        } else {
+            Vec::new()
+        };
+        self.composite_canvas = canvas;
+        self
     }
 
     /// Attach this session's demand slot, so the shared producer paces to it.
@@ -10664,9 +10684,11 @@ impl ScreenCapturer for BroadcastCapturer {
         // serve_session_with_ice is always coherent with initial_snapshot.generation (which
         // equals SessionInputSender::session_topology_gen).  Falls back to an empty list when
         // the snapshot has no topology (capturer does not implement the optional seam).
+        // With no topology but a composite canvas built from the live list (sign-in screen), advertise
+        // that same list so the picker and the canvas agree (1.3.41; was empty -> one synthetic display).
         match &self.initial_snapshot.topology {
             Some(t) => Ok(t.monitors.clone()),
-            None => Ok(Vec::new()),
+            None => Ok(self.canvas_monitors.clone()),
         }
     }
 
@@ -10754,8 +10776,11 @@ impl ScreenCapturer for BroadcastCapturer {
         // The shared producer already captured the whole virtual desktop. The trait's
         // default would fetch and stitch this same full frame once per monitor.
         let frame = self.capture_frame(COMPOSITE_MONITOR_ID)?;
-        let layout = self.initial_snapshot.topology.as_ref()
-            .and_then(|t| crate::monitor_canvas::layout(&t.monitors));
+        let layout = match &self.composite_canvas {
+            Some(c) => Some(c.clone()),
+            None => self.initial_snapshot.topology.as_ref()
+                .and_then(|t| crate::monitor_canvas::layout(&t.monitors)),
+        };
         if !layout.is_some_and(|c| frame.monitor_id == COMPOSITE_MONITOR_ID &&
             frame.width == c.width && frame.height == c.height) {
             return Err(rmt_agent_core::platform::PlatformError::CaptureUnavailable(
@@ -11113,6 +11138,18 @@ async fn run_multi_session_stream(
             shared_c.register_session_input_ready(std::sync::Arc::downgrade(&input_ready));
             input_sender.input_ready = std::sync::Arc::clone(&input_ready);
 
+            // The composite canvas is computed ONCE: the same value is advertised to the viewer
+            // (shared_canvas below) and enforced on every composite frame (BroadcastCapturer). At the
+            // sign-in screen the snapshot's topology can be absent; the live monitor list still
+            // describes what the composite capture shows, and a stale list fails closed (frames whose
+            // size does not match are dropped) instead of mis-mapping clicks.
+            let live = shared_c.monitors.read().map(|g| g.clone()).unwrap_or_default();
+            let session_canvas = if shared_c.read_selection().0 == COMPOSITE_MONITOR_ID {
+                crate::monitor_canvas::composite_layout(
+                    snap.topology.as_ref().map(|t| t.monitors.as_slice()),
+                    &live,
+                )
+            } else { None };
             let broadcast_capturer = BroadcastCapturer::new(
                 shared_c.subscribe(),
                 std::sync::Arc::clone(&snap),
@@ -11120,7 +11157,8 @@ async fn run_multi_session_stream(
                 std::sync::Arc::clone(&shared_c.published_snapshot),
                 std::sync::Arc::clone(&shared_c.selection_state),
             )
-            .with_fps_demand(shared_c.register_fps_demand(DEFAULT_STREAM_FPS));
+            .with_fps_demand(shared_c.register_fps_demand(DEFAULT_STREAM_FPS))
+            .with_composite_canvas(session_canvas.clone(), live);
 
             let clipboard: Option<Box<dyn Clipboard>> = opts_c
                 .clipboard_mode
@@ -11218,9 +11256,9 @@ async fn run_multi_session_stream(
                 // Coherent (monitor, generation) pair: write_selection under one lock closes both
                 // the ABA race and the incoherent-pair read race.
                 shared_selection_state: Some(std::sync::Arc::clone(&shared_c.selection_state)),
-                shared_canvas: if shared_c.read_selection().0 == COMPOSITE_MONITOR_ID {
-                    snap.topology.as_ref().and_then(|t| crate::monitor_canvas::layout(&t.monitors))
-                } else { None },
+                // The same canvas the capturer enforces (see session_canvas above); 2026-11-27: with no
+                // canvas the viewer fell back to asking for one display and was refused.
+                shared_canvas: session_canvas,
                 activity: Some(std::sync::Arc::clone(&activity)),
                 // docs/61: every session here shares one SharedCapture, so they can hand input
                 // control among themselves; the directory key is the signaling id the viewers see.
@@ -13174,6 +13212,32 @@ mod tests {
         let mut capturer = BroadcastCapturer::new(rx,Arc::clone(&snap),rt.handle().clone(),
             Arc::new(Mutex::new(snap)),Arc::new(Mutex::new(SelectionState {monitor:COMPOSITE_MONITOR_ID,generation:1})));
         let frame = CapturedFrame {monitor_id:COMPOSITE_MONITOR_ID,width:4,height:3,bytes:vec![21;48],is_keyframe:true};
+        tx.send(Arc::new(TaggedFrame {frame:frame.clone(),selection_gen:1})).unwrap();
+        assert_eq!(capturer.capture_composite().unwrap(),frame);
+        tx.send(Arc::new(TaggedFrame {frame:CapturedFrame {width:2,..frame},selection_gen:1})).unwrap();
+        assert!(capturer.capture_composite().is_err());
+    }
+
+    /// 1.3.40 release review: at the sign-in screen the snapshot has NO topology. The canvas built from
+    /// the live monitor list is advertised AND enforced, so its frames flow; a frame of another size
+    /// (stale list) is still dropped.
+    #[test]
+    fn broadcast_canvas_from_live_monitors_delivers_when_snapshot_has_no_topology() {
+        use crate::shared_capture::{SelectionState, TaggedFrame, VersionedSnapshot};
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let (tx,rx) = tokio::sync::broadcast::channel(8);
+        let live = vec![
+            MonitorInfo {id:0,left:-2,top:0,width:2,height:2,dpi_scale:1.0},
+            MonitorInfo {id:1,left:0,top:-1,width:2,height:3,dpi_scale:1.0}];
+        let snap = Arc::new(VersionedSnapshot {generation:0,topology:None});
+        let canvas = crate::monitor_canvas::composite_layout(None,&live);
+        assert!(canvas.is_some());
+        let mut capturer = BroadcastCapturer::new(rx,Arc::clone(&snap),rt.handle().clone(),
+            Arc::new(Mutex::new(snap)),Arc::new(Mutex::new(SelectionState {monitor:COMPOSITE_MONITOR_ID,generation:1})))
+            .with_composite_canvas(canvas, live.clone());
+        // 1.3.41: the picker gets the same displays the canvas shows.
+        assert_eq!(capturer.monitors().unwrap(), live);
+        let frame = CapturedFrame {monitor_id:COMPOSITE_MONITOR_ID,width:4,height:3,bytes:vec![7;48],is_keyframe:true};
         tx.send(Arc::new(TaggedFrame {frame:frame.clone(),selection_gen:1})).unwrap();
         assert_eq!(capturer.capture_composite().unwrap(),frame);
         tx.send(Arc::new(TaggedFrame {frame:CapturedFrame {width:2,..frame},selection_gen:1})).unwrap();

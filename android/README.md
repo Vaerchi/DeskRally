@@ -4,21 +4,26 @@ An installable Android app a technician uses to sign in to the DeskRally console
 Windows machines. It is **not** a guest/agent: no screen capture of the phone, no
 AccessibilityService.
 
-## What it is: a Trusted Web Activity, not a WebView
+## What it is: the console in the app's own WebView (docs/78, 0.2.0)
 
-The app is a thin launcher (`com.google.androidbrowserhelper` `LauncherActivity`, the Bubblewrap
-pattern). It opens the real console in **Chrome**, full screen, with no URL bar once Digital Asset
-Links verify. Where no TWA-capable browser exists it falls back to a Custom Tab.
+Until 0.1.x this was a Trusted Web Activity (the console ran in Chrome). The operator chose a real app (2026-11-27)
+because Chrome freezes a backgrounded page: a session dropped ~30 s after switching apps (its lease renewals stopped).
+Now `MainActivity` hosts the console in a WebView, and `SessionService` (a foreground service, type `specialUse`) keeps
+the app running while a session is live, with a "DeskRally session active" notification and an End action. The page
+keeps renewing the session lease, so the control plane's revocation window (~32 s) is unchanged. A session in the
+background ends after 15 minutes (warning at 13).
 
-Why not a WebView: the console uses SSO (client SSO / OIDC) and Google and Microsoft block sign-in
-inside embedded WebViews. The phone typing bar was tuned against Chrome's Gboard behaviour, and
-Chrome gives the full WebRTC stack. Everything the console already does on phones and the Galaxy Z
-Fold 7 (responsive CSS, touch gestures, typing bar) is reused unchanged; there is no app-side UI.
+Hardening the app now owns (Chrome provided it for the TWA): only the console origin loads (`LaunchUrlPolicy`); other
+links open in the browser; no file/content access, no mixed content, Safe Browsing on, debugging only in debug builds;
+every page permission request is denied; ONE bridge (`window.DeskRallyApp`, console origin only) carrying
+`session:on:<machine>` / `session:off` in and `end` out (`AppPolicy.kt`, `web/viewer/src/lib/android_app.ts`).
 
-`DeskRallyLauncherActivity` adds one thing: the activity is exported, so any app could send it an
-explicit intent with an arbitrary URL. `LaunchUrlPolicy` replaces anything that is not `https://`
-on the configured console host with the console start page (unit-tested).
+Permissions (operator-approved): `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE` (Play Console declaration:
+"Keeps an active remote-support session connected while the technician uses another app"), `POST_NOTIFICATIONS` (asked
+at the first session), `WAKE_LOCK` (a session survives the screen turning off).
 
+Known v1 limits: in-page (blob) downloads from the console do not leave the WebView; https downloads open in the browser.
+Sign-in happens inside the app (not shared with Chrome); Microsoft sign-in in a WebView must be confirmed on a device.
 ## Layout
 
 | Path | Purpose |

@@ -25,8 +25,8 @@ android {
         applicationId = "com.deskrally.technician"
         minSdk = 24
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         manifestPlaceholders["consoleHost"] = consoleHost
         buildConfigField("String", "CONSOLE_HOST", "\"$consoleHost\"")
@@ -63,7 +63,7 @@ android {
             signingConfigs.findByName("release")?.let { signingConfig = it }
         }
         debug {
-            // Debug builds use the SAME key so the TWA verifies against the one fingerprint in
+            // Debug builds use the SAME key so app links verify against the one fingerprint in
             // assetlinks.json; Android's auto-generated debug key would not match it.
             signingConfigs.findByName("release")?.let { signingConfig = it }
         }
@@ -81,6 +81,7 @@ android {
 }
 
 dependencies {
-    implementation("com.google.androidbrowserhelper:androidbrowserhelper:2.7.4")
+    // docs/78: WebViewCompat.addWebMessageListener (the one console bridge).
+    implementation("androidx.webkit:webkit:1.12.1")
     testImplementation("junit:junit:4.13.2")
 }
