@@ -418,6 +418,45 @@ func encodeAuditAction(w *canonicalWriter, raw json.RawMessage) error {
 			}
 		}
 		w.u64(*a.Epoch)
+	case "input_control_requested", "input_control_request_closed":
+		// docs/73 2.2.5: five uuids then the epoch (then, for the close, the request outcome), mirroring
+		// Rust encode_action. Both fields are pointers so a MISSING key is refused with its own error
+		// (never hashed as zero / empty); a present but wrong-type value fails the decode instead, and an
+		// empty or unknown outcome fails the allow-list below. Any refusal here would wedge the chain if the
+		// agent sealed it, which is why the agent's closed enum and this list must stay identical.
+		var a struct {
+			RequestID           string  `json:"request_id"`
+			RequesterSession    string  `json:"requester_session"`
+			RequesterTechnician string  `json:"requester_technician"`
+			HolderSession       string  `json:"holder_session"`
+			HolderTechnician    string  `json:"holder_technician"`
+			Epoch               *uint64 `json:"epoch"`
+			Outcome             *string `json:"outcome"`
+		}
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return fmt.Errorf("%s: %w", probe.Kind, err)
+		}
+		if a.Epoch == nil {
+			return fmt.Errorf("%s: epoch is required", probe.Kind)
+		}
+		closed := probe.Kind == "input_control_request_closed"
+		if closed {
+			if a.Outcome == nil {
+				return fmt.Errorf("%s: outcome is required", probe.Kind)
+			}
+			if !inputRequestOutcomes[*a.Outcome] {
+				return fmt.Errorf("%s: unknown outcome %q", probe.Kind, *a.Outcome)
+			}
+		}
+		for _, id := range []string{a.RequestID, a.RequesterSession, a.RequesterTechnician, a.HolderSession, a.HolderTechnician} {
+			if err := encodeUUIDField(w, id); err != nil {
+				return err
+			}
+		}
+		w.u64(*a.Epoch)
+		if closed {
+			w.lpStr(*a.Outcome)
+		}
 	default:
 		return fmt.Errorf("unknown audit action kind %q", probe.Kind)
 	}
@@ -469,4 +508,11 @@ type ContentTamperError struct {
 
 func (e *ContentTamperError) Error() string {
 	return fmt.Sprintf("audit content-hash mismatch at index %d: %s", e.At, e.Reason)
+}
+
+// inputRequestOutcomes is the closed set of request outcomes an input_control_request_closed event may
+// carry (docs/73 2.2.5). It mirrors the agent's InputRequestAuditOutcome enum; any other string is refused.
+var inputRequestOutcomes = map[string]bool{
+	"granted": true, "declined": true, "expired": true, "undelivered": true, "cancelled": true,
+	"replaced": true, "holder_changed": true, "already_satisfied": true, "failed": true, "ineligible": true,
 }

@@ -1,0 +1,311 @@
+{
+  "comment": "docs/73 2.2.2 request-for-control wire vectors, read by crates/agent-core (control/tests.rs) and web/viewer (control.test.ts). `wire` is the exact canonical encoding: decode(wire) re-encodes to the same bytes. `invalid` frames must fail to decode.",
+  "vectors": [
+    {
+      "name": "InputRequestCapable",
+      "wire": "{\"t\":\"InputRequestCapable\",\"c\":{}}"
+    },
+    {
+      "name": "InputRequestAvailable true",
+      "wire": "{\"t\":\"InputRequestAvailable\",\"c\":{\"available\":true}}"
+    },
+    {
+      "name": "InputRequestAvailable false",
+      "wire": "{\"t\":\"InputRequestAvailable\",\"c\":{\"available\":false}}"
+    },
+    {
+      "name": "RequestInputControl first",
+      "wire": "{\"t\":\"RequestInputControl\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"retry\":false}}"
+    },
+    {
+      "name": "RequestInputControl retry",
+      "wire": "{\"t\":\"RequestInputControl\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"retry\":true}}"
+    },
+    {
+      "name": "WithdrawInputControlRequest",
+      "wire": "{\"t\":\"WithdrawInputControlRequest\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\"}}"
+    },
+    {
+      "name": "Pending pending_delivery",
+      "wire": "{\"t\":\"InputControlRequestPending\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"state\":\"pending_delivery\"}}"
+    },
+    {
+      "name": "Pending shown",
+      "wire": "{\"t\":\"InputControlRequestPending\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"state\":\"shown\"}}"
+    },
+    {
+      "name": "Pending accepted_in_flight",
+      "wire": "{\"t\":\"InputControlRequestPending\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"state\":\"accepted_in_flight\"}}"
+    },
+    {
+      "name": "Result granted with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"granted\"}}"
+    },
+    {
+      "name": "Result declined with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"declined\"}}"
+    },
+    {
+      "name": "Result expired with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"expired\"}}"
+    },
+    {
+      "name": "Result undelivered with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"undelivered\"}}"
+    },
+    {
+      "name": "Result cancelled with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"cancelled\"}}"
+    },
+    {
+      "name": "Result replaced with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"replaced\"}}"
+    },
+    {
+      "name": "Result holder_changed with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"holder_changed\"}}"
+    },
+    {
+      "name": "Result already_satisfied with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"already_satisfied\"}}"
+    },
+    {
+      "name": "Result failed with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"failed\"}}"
+    },
+    {
+      "name": "Result ineligible with id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"ineligible\"}}"
+    },
+    {
+      "name": "Result ineligible no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"ineligible\"}}"
+    },
+    {
+      "name": "Result no_holder no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"no_holder\"}}"
+    },
+    {
+      "name": "Result busy no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"busy\"}}"
+    },
+    {
+      "name": "Result rate_limited no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"rate_limited\"}}"
+    },
+    {
+      "name": "Result capacity no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"capacity\"}}"
+    },
+    {
+      "name": "Result unsupported_holder no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"unsupported_holder\"}}"
+    },
+    {
+      "name": "Result unknown no id",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"unknown\"}}"
+    },
+    {
+      "name": "InputControlRequested",
+      "wire": "{\"t\":\"InputControlRequested\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"from_session\":\"cccccccc-9999-4aaa-8bbb-dddddddddddd\",\"expires_in_ms\":60000}}"
+    },
+    {
+      "name": "InputControlPromptShown",
+      "wire": "{\"t\":\"InputControlPromptShown\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\"}}"
+    },
+    {
+      "name": "Answer accept",
+      "wire": "{\"t\":\"AnswerInputControlRequest\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"accept\":true}}"
+    },
+    {
+      "name": "Answer decline",
+      "wire": "{\"t\":\"AnswerInputControlRequest\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"accept\":false}}"
+    },
+    {
+      "name": "Withdrawn granted",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"granted\"}}"
+    },
+    {
+      "name": "Withdrawn declined",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"declined\"}}"
+    },
+    {
+      "name": "Withdrawn expired",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"expired\"}}"
+    },
+    {
+      "name": "Withdrawn undelivered",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"undelivered\"}}"
+    },
+    {
+      "name": "Withdrawn cancelled",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"cancelled\"}}"
+    },
+    {
+      "name": "Withdrawn replaced",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"replaced\"}}"
+    },
+    {
+      "name": "Withdrawn holder_changed",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"holder_changed\"}}"
+    },
+    {
+      "name": "Withdrawn already_satisfied",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"already_satisfied\"}}"
+    },
+    {
+      "name": "Withdrawn failed",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"failed\"}}"
+    },
+    {
+      "name": "Withdrawn ineligible",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"ineligible\"}}"
+    },
+    {
+      "name": "Withdrawn no_holder",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"no_holder\"}}"
+    },
+    {
+      "name": "Withdrawn busy",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"busy\"}}"
+    },
+    {
+      "name": "Withdrawn rate_limited",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"rate_limited\"}}"
+    },
+    {
+      "name": "Withdrawn capacity",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"capacity\"}}"
+    },
+    {
+      "name": "Withdrawn unsupported_holder",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"unsupported_holder\"}}"
+    },
+    {
+      "name": "Withdrawn unknown",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"unknown\"}}"
+    },
+    {
+      "name": "Withdrawn requester_left",
+      "wire": "{\"t\":\"InputControlRequestWithdrawn\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"reason\":\"requester_left\"}}"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "client id not a uuid",
+      "wire": "{\"t\":\"RequestInputControl\",\"c\":{\"client_request_id\":\"not-a-uuid\",\"retry\":false}}"
+    },
+    {
+      "name": "withdraw id too short",
+      "wire": "{\"t\":\"WithdrawInputControlRequest\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333\"}}"
+    },
+    {
+      "name": "unknown outcome string",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"bogus\"}}"
+    },
+    {
+      "name": "requester_left is not a result outcome",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"requester_left\"}}"
+    },
+    {
+      "name": "unknown pending state",
+      "wire": "{\"t\":\"InputControlRequestPending\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"state\":\"done\"}}"
+    },
+    {
+      "name": "answer with a non-boolean accept",
+      "wire": "{\"t\":\"AnswerInputControlRequest\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"accept\":\"yes\"}}"
+    },
+    {
+      "name": "prompt id with a control character",
+      "wire": "{\"t\":\"InputControlPromptShown\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-88888888888\\u0007\"}}"
+    },
+    {
+      "name": "Result granted no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"granted\"}}"
+    },
+    {
+      "name": "Result declined no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"declined\"}}"
+    },
+    {
+      "name": "Result expired no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"expired\"}}"
+    },
+    {
+      "name": "Result undelivered no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"undelivered\"}}"
+    },
+    {
+      "name": "Result cancelled no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"cancelled\"}}"
+    },
+    {
+      "name": "Result replaced no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"replaced\"}}"
+    },
+    {
+      "name": "Result holder_changed no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"holder_changed\"}}"
+    },
+    {
+      "name": "Result already_satisfied no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"already_satisfied\"}}"
+    },
+    {
+      "name": "Result failed no id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":null,\"outcome\":\"failed\"}}"
+    },
+    {
+      "name": "Result no_holder with id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"no_holder\"}}"
+    },
+    {
+      "name": "Result busy with id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"busy\"}}"
+    },
+    {
+      "name": "Result rate_limited with id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"rate_limited\"}}"
+    },
+    {
+      "name": "Result capacity with id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"capacity\"}}"
+    },
+    {
+      "name": "Result unsupported_holder with id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"unsupported_holder\"}}"
+    },
+    {
+      "name": "Result unknown with id (invalid: see the id rule)",
+      "wire": "{\"t\":\"InputControlRequestResult\",\"c\":{\"client_request_id\":\"aaaaaaaa-1111-4222-8333-444444444444\",\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"outcome\":\"unknown\"}}"
+    },
+    {
+      "wire": "{\"t\":\"RequestInputControl\",\"c\":{\"client_request_id\":\"AAAAAAAA-1111-4222-8333-444444444444\",\"retry\":false}}",
+      "name": "upper-case hex in a client id"
+    },
+    {
+      "wire": "{\"t\":\"InputControlPromptShown\",\"c\":{\"request_id\":\"BBBBBBBB-5555-4666-8777-888888888888\"}}",
+      "name": "upper-case hex in a request id"
+    },
+    {
+      "wire": "{\"t\":\"InputControlRequested\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"from_session\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"expires_in_ms\":60000}}",
+      "name": "from_session over 128 bytes"
+    },
+    {
+      "wire": "{\"t\":\"InputControlRequested\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"from_session\":\"bad\\u0007id\",\"expires_in_ms\":60000}}",
+      "name": "from_session with a control character"
+    },
+    {
+      "wire": "{\"t\":\"InputControlRequested\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"from_session\":\"s\",\"expires_in_ms\":120001}}",
+      "name": "expires_in_ms over the ceiling"
+    },
+    {
+      "wire": "{\"t\":\"InputControlRequested\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"from_session\":\"s\",\"expires_in_ms\":-1}}",
+      "name": "expires_in_ms negative"
+    },
+    {
+      "wire": "{\"t\":\"InputControlRequested\",\"c\":{\"request_id\":\"bbbbbbbb-5555-4666-8777-888888888888\",\"from_session\":\"s\",\"expires_in_ms\":1.5}}",
+      "name": "expires_in_ms fractional"
+    }
+  ]
+}

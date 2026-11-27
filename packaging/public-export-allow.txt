@@ -581,3 +581,8 @@ crates/agent-windows/src/shell_relay.rs:literal-credential
 web/viewer/src/lib/shell_client.test.ts:literal-credential
 web/viewer/src/lib/shell_client.ts:literal-credential
 web/viewer/src/lib/sha256_stream.test.ts:long-hex
+# docs/73 request-input-control golden vectors (public test constants: canonical preimages, hashes, encoded frames), 2026-11-27.
+crates/protocol/testdata/input-request-audit-vectors.json:long-base64
+crates/protocol/testdata/input-request-audit-vectors.json:long-hex
+crates/protocol/testdata/input-request-control-vectors.json:long-base64
+crates/protocol/testdata/input-request-control-vectors.json:long-hex

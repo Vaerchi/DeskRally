@@ -248,7 +248,23 @@ export function parseEnvelope(text: string): Envelope {
       }
     }
   }
-  return value as unknown as Envelope;
+  const envelope = value as unknown as Envelope;
+  if (envelope.error) envelope.error.message = explainAgentRefusal(envelope.error.message);
+  return envelope;
+}
+
+/** The refusal an agent older than 1.3.39 (no streamed Get) sends for a file over its 64 MiB copy limit. */
+const OLD_AGENT_SIZE_LIMIT = "files over 64 MiB cannot be downloaded yet";
+
+/**
+ * Turn a refusal that only makes sense to us into one the operator can act on (2026-11-27: a Get of a large
+ * file from a machine still on agent 1.3.38 said only "cannot be downloaded yet").
+ */
+export function explainAgentRefusal(message: string): string {
+  if (message.includes(OLD_AGENT_SIZE_LIMIT) && !message.includes("agent 1.3.39")) {
+    return `${message}. This machine's DeskRally agent is too old for large downloads: it needs agent 1.3.39 or later, which it installs automatically on its next update.`;
+  }
+  return message;
 }
 
 // ---------------------------------------------------------------------------

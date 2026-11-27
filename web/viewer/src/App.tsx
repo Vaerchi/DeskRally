@@ -27,7 +27,6 @@ import {
   type Machine as AccessMachine,
 } from "./components/AccessPanel";
 import { type MonitorInfo, type SessionPolicyState } from "./components/Viewer";
-import { BackstagePanels } from "./components/BackstagePanels";
 import { FileTransferPanel, saveBytesAsFile, type CompletedDownload } from "./components/FileTransferPanel";
 import { IncomingDownloadPrompt } from "./components/IncomingDownloadPrompt";
 import { RelayNotice } from "./components/RelayNotice";
@@ -86,6 +85,8 @@ import {
   type AdminRightsModel,
 } from "./lib/admin_rights";
 import { InputControlBadge, InputHandoffControl } from "./components/InputHandoffControl";
+import { InputControlPrompts, InputRequestControl, useInputRequestSnapshot } from "./components/InputRequestControl";
+import { InputRequestController } from "./lib/input_request";
 import { SessionParticipants } from "./components/SessionParticipants";
 import { acceptParticipantSnapshot } from "./lib/participants";
 import {
@@ -304,6 +305,7 @@ const UsersPanel = lazy(() => import("./components/UsersPanel").then((m) => ({ d
 const RolesPanel = lazy(() => import("./components/RolesPanel").then((m) => ({ default: m.RolesPanel })));
 const MyAccountPanel = lazy(() => import("./components/MyAccountPanel").then((m) => ({ default: m.MyAccountPanel })));
 const HelpPanel = lazy(() => import("./components/HelpPanel").then((m) => ({ default: m.HelpPanel })));
+const BackstagePanels = lazy(() => import("./components/BackstagePanels").then((m) => ({ default: m.BackstagePanels })));
 
 // How often the machine list refreshes in the background while the console is visible (see the fleetTick effect).
 const FLEET_REFRESH_MS = 30_000;
@@ -461,6 +463,9 @@ export default function App() {
   // signaling id (what the agent keys its directory on), and our own id is how we tell ourselves apart.
   const [participants, setParticipants] = useState<SessionParticipantEntry[]>([]);
   const [ownSignalingId, setOwnSignalingId] = useState<string | null>(null);
+  // docs/73 §2.2: request input control (requester) and its prompt (holder). Per session: reset with it.
+  const [inputRequests] = useState(() => new InputRequestController(() => controlRef.current));
+  const inputRequestSnap = useInputRequestSnapshot(inputRequests);
   // A hand the agent never answers must not disable the action forever (the agent ignores repeats
   // while one is pending, so a retry after this is safe).
   useEffect(() => {
@@ -1361,6 +1366,7 @@ export default function App() {
     setAgentTransferDir(undefined);
     setAdminRights(NO_ADMIN_RIGHTS);
     setInputHandoff(NO_INPUT_HANDOFF);
+    inputRequests.reset();
     pendingMachineAliasRef.current = undefined;
     setMachineAlias(undefined);
     // The session ACCESS policy is per-SESSION, so it must not survive teardown. Left set, the next
@@ -1970,6 +1976,8 @@ export default function App() {
           // (isCurrent) before routing, which input_handoff.spec.ts pins.
           onInputHandoffAvailable: (available) => setInputHandoff((m) => handoffAdvertised(m, available)),
           onInputControlChanged: (owner, mode) => setInputHandoff((m) => inputControlChanged(m, owner, mode)),
+          // docs/73 §2.2: only ever sent after the announcement below; a superseded session's frames are dropped.
+          onInputRequestMessage: (m) => { if (isCurrent()) inputRequests.handleMessage(m); },
           // docs/69: resolve the binding exchange's waits (a reply nobody is waiting for is ignored).
           onBindAgentProof: (agentNonceHex, sigHex) => { const r = bindWaiters.proof; bindWaiters.proof = null; r?.({ agentNonceHex, sigHex }); },
           // A refusal can arrive while we still wait for the proof (the agent refused the grant itself).
@@ -1980,6 +1988,8 @@ export default function App() {
         },
       );
       controlRef.current = control;
+      // A new control client is a new requester incarnation (§2.2.2): nothing carries over a reconnect.
+      inputRequests.reset();
 
 
       // V2: backstage tooling over the live session. The transport adapts the request/response
@@ -2282,6 +2292,10 @@ export default function App() {
         // docs/58 §2: ask which Backstage features this agent understands. An older agent drops the
         // question, so the console simply never offers what it cannot do.
         control.requestBackstageFeatures();
+        // docs/73 §2.2.2: say, once per session, that this console implements request-for-control. The agent
+        // sends none of its new messages to a console that did not (an undecodable one would fail the session),
+        // so an old agent simply never offers the feature. Bulk runs (BrokeredSessionCore) never announce.
+        control.announceInputRequestCapable();
         if (backgroundTracker.current.background) {
           control.setBackground(true);
           transport.setBackground(true);
@@ -3235,8 +3249,10 @@ export default function App() {
   // Under the Hood (Backstage) as one element, shown in the session area or in its own window (2026-11-24: the operator wanted
   // the SYSTEM tools "in a separate window" beside the screen). The window re-renders on every App render, like the
   // screen pop-out, so it never shows stale panels.
+  // Lazy (2026-11-27 bundle budget): Under the Hood loads when first opened. The Suspense is part of the element,
+  // so both the inline page and the pop-out window's separate React root get the loading fallback.
   const backstagePanelsEl = session ? (
-
+    <Suspense fallback={<div className="panel__hint" role="status" data-testid="page-loading">Loading…</div>}>
                 <BackstagePanels
                   machineName={session.name}
                   serviceStartType={!observing && backstageFeatures.has("service_start_type_v1")}
@@ -3276,6 +3292,7 @@ export default function App() {
                       : undefined
                   }
                 />
+    </Suspense>
   ) : null;
   const uthWindowRef = useRef<{ win: Window; root: Root } | null>(null);
   const [uthPopped, setUthPopped] = useState(false);
@@ -3504,6 +3521,10 @@ export default function App() {
                 setInputHandoff((m) => handRequested(m));
                 controlRef.current?.handInputControl(ownSignalingId);
               }} />
+            <InputRequestControl snapshot={inputRequestSnap} handoff={inputHandoff} observing={observing || viewOnly}
+              ownSessionId={ownSignalingId}
+              onRequest={() => inputRequests.request()}
+              onWithdraw={() => inputRequests.withdraw()} />
             </MenuSection>
             <KeepAwakeControl model={keepAwake} advertised={backstageFeatures.has("keep_awake_v1")}
               observing={observing} viewOnly={viewOnly} onRequest={(on) => {
@@ -3686,6 +3707,8 @@ export default function App() {
                 client={fileTransferClient ?? undefined}
                 pending={pendingDownloads}
               />
+              {/* The holder prompt lives inside the viewer (so it shows in full screen); on any other view it is here. */}
+              {view !== "screen" && <InputControlPrompts controller={inputRequests} participants={participants} fixed />}
               {view === "screen" && (
                 <SessionViewer
                   onVideoElement={onRecoveryVideo}
@@ -3695,6 +3718,7 @@ export default function App() {
                   tabHost={minimalChrome ? tabHost : null}
                   onPopoutChange={setViewerPoppedOut}
                   onVisibilityChange={onViewerVisibility}
+                  overlay={<InputControlPrompts controller={inputRequests} participants={participants} />}
                   popoutControls={<ClipboardControl client={observing ? undefined : clipboardClient ?? undefined} notice={clipboardNotice} />}
                   inputPanelExtras={<ClipboardQuick client={observing ? undefined : clipboardClient ?? undefined} />}
                   transport={transportRef.current ?? undefined}

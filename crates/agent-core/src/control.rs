@@ -962,6 +962,136 @@ pub enum ControlMessage {
         /// The machine-wide input-arbitration mode.
         mode: InputControlMode,
     },
+    /// controller → agent (docs/73 2.2.2): this viewer implements request-for-control. Sent once per
+    /// session after the viewer has joined. An agent that does not know it drops the frame (the agent
+    /// decoder ignores unknown viewer frames); an agent that does answers [`Self::InputRequestAvailable`].
+    /// A viewer that never sends it is never sent any other request-control message.
+    InputRequestCapable {},
+    /// agent → controller (docs/73 2.2.2): whether this session may use request-for-control (`false` for
+    /// observers). Sent ONLY to a session that announced [`Self::InputRequestCapable`].
+    InputRequestAvailable {
+        /// Whether the request action may be offered.
+        available: bool,
+    },
+    /// controller → agent (docs/73 2.2.2): ask the current input owner for control. `retry` is true on
+    /// every re-send of the same `client_request_id` (a lost reply is recovered by re-sending).
+    RequestInputControl {
+        /// A UUID minted by the viewer; the replay key together with the session.
+        client_request_id: String,
+        /// True on a re-send of the same id.
+        #[serde(default)]
+        retry: bool,
+    },
+    /// controller → agent (docs/73 2.2.2): withdraw a request that is not yet accepted.
+    WithdrawInputControlRequest {
+        /// The id the request was made under.
+        client_request_id: String,
+    },
+    /// agent → controller (docs/73 2.2.2): a request is live, in its CURRENT state (never a stored one).
+    InputControlRequestPending {
+        /// Echo of the viewer's id.
+        client_request_id: String,
+        /// The agent's id for the admitted request.
+        request_id: String,
+        /// Where the request stands.
+        state: InputRequestState,
+    },
+    /// agent → controller (docs/73 2.2.2): the final answer to a request, or an immediate refusal
+    /// (`request_id` null, never audited). Sticky in the viewer per `client_request_id`.
+    InputControlRequestResult {
+        /// Echo of the viewer's id.
+        client_request_id: String,
+        /// The agent's id, absent for an immediate refusal or `unknown`.
+        #[serde(default)]
+        request_id: Option<String>,
+        /// What happened.
+        outcome: InputRequestOutcome,
+    },
+    /// agent → holder (docs/73 2.2.2): another technician asks for input control.
+    InputControlRequested {
+        /// The agent's id for the request.
+        request_id: String,
+        /// The requester, as a signaling session id.
+        from_session: String,
+        /// How long the prompt stays valid.
+        expires_in_ms: u64,
+    },
+    /// holder → agent (docs/73 2.2.2): the prompt was rendered (establishes `shown`).
+    InputControlPromptShown {
+        /// The request the prompt is for.
+        request_id: String,
+    },
+    /// holder → agent (docs/73 2.2.2): accept or decline. The answering session is the transport's own,
+    /// never taken from the message.
+    AnswerInputControlRequest {
+        /// The request being answered.
+        request_id: String,
+        /// Accept (hand input control over) or decline.
+        accept: bool,
+    },
+    /// agent → holder (docs/73 2.2.2): the prompt is over. `reason` is the outcome name, `requester_left`,
+    /// or `unknown` for an id the agent does not hold for this holder. Also the reply to a late answer.
+    InputControlRequestWithdrawn {
+        /// The request.
+        request_id: String,
+        /// Why.
+        reason: InputRequestOutcome,
+    },
+}
+
+/// Where a live request-for-control stands (docs/73 2.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRequestState {
+    /// Admitted; the holder's prompt is not yet confirmed shown.
+    PendingDelivery,
+    /// The holder's viewer showed the prompt.
+    Shown,
+    /// The holder accepted; the hand-off is running.
+    AcceptedInFlight,
+}
+
+/// The closed set of request-for-control outcomes and refusals (docs/73 2.2.2). The first ten are the
+/// terminal outcomes of an ADMITTED request (also the audit enum); the next six are immediate refusals
+/// (no request id, never audited); `unknown` is reply-only; `requester_left` appears only in
+/// [`ControlMessage::InputControlRequestWithdrawn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRequestOutcome {
+    /// The holder accepted and input control moved to the requester.
+    Granted,
+    /// The holder declined.
+    Declined,
+    /// The holder did not answer within 60 s.
+    Expired,
+    /// The holder's viewer never confirmed the prompt within 10 s.
+    Undelivered,
+    /// The requester withdrew.
+    Cancelled,
+    /// The requester sent a newer request.
+    Replaced,
+    /// Input control changed hands (or became ownerless) before the holder answered.
+    HolderChanged,
+    /// Input control had already been handed to the requester.
+    AlreadySatisfied,
+    /// The accepted hand-off did not complete.
+    Failed,
+    /// The requester lost eligibility (admitted request), or cannot request at all (refusal).
+    Ineligible,
+    /// Refusal: nobody owns input.
+    NoHolder,
+    /// Refusal: a hand-off is in flight or key releases are still owed (Input is recovering).
+    Busy,
+    /// Refusal: the 10 s per-session rate limit.
+    RateLimited,
+    /// Refusal: the per-holder or machine request cap.
+    Capacity,
+    /// Refusal: the holder's viewer never announced request-for-control.
+    UnsupportedHolder,
+    /// Reply-only: the agent holds no record of that request id.
+    Unknown,
+    /// Withdrawn-only: the requester's session ended.
+    RequesterLeft,
 }
 
 /// The machine-wide input-arbitration mode, as the viewer shows it (docs/61).
@@ -1043,6 +1173,9 @@ pub fn decode(bytes: &[u8]) -> Result<ControlMessage, ControlCodecError> {
             )));
         }
     }
+    if let Err(why) = validate_input_request(&msg) {
+        return Err(<ControlCodecError as serde::de::Error>::custom(why));
+    }
     if let ControlMessage::HandInputControl { to_session } = &msg {
         if !is_valid_session_id(to_session) {
             return Err(<ControlCodecError as serde::de::Error>::custom(format!(
@@ -1121,6 +1254,78 @@ pub const MAX_LAUNCH_TOOL_KEY_BYTES: usize = 64;
 /// character set is otherwise unrestricted: unknown clean keys still reach the agent's whitelist.
 fn is_valid_tool_key(key: &str) -> bool {
     !key.chars().any(char::is_control) && key.len() <= MAX_LAUNCH_TOOL_KEY_BYTES
+}
+
+/// docs/73: every request id on the wire is a canonical UUID string, and a `Result` never carries
+/// `requester_left` (a `Withdrawn`-only reason). Refused at decode so no handler sees a malformed id.
+fn validate_input_request(msg: &ControlMessage) -> Result<(), String> {
+    let uuid = |what: &str, s: &str| {
+        if is_valid_uuid_text(s) {
+            Ok(())
+        } else {
+            Err(format!("{what} is not a canonical UUID"))
+        }
+    };
+    match msg {
+        ControlMessage::RequestInputControl { client_request_id, .. }
+        | ControlMessage::WithdrawInputControlRequest { client_request_id } => uuid("client_request_id", client_request_id),
+        ControlMessage::InputControlRequestPending { client_request_id, request_id, .. } => {
+            uuid("client_request_id", client_request_id)?;
+            uuid("request_id", request_id)
+        }
+        ControlMessage::InputControlRequestResult { client_request_id, request_id, outcome } => {
+            uuid("client_request_id", client_request_id)?;
+            if let Some(id) = request_id {
+                uuid("request_id", id)?;
+            }
+            use InputRequestOutcome::*;
+            match outcome {
+                RequesterLeft => return Err("requester_left is not a result outcome".into()),
+                // Terminal outcomes of an ADMITTED request name it; immediate refusals and `unknown` never do;
+                // `ineligible` is both (a refusal, or an admitted request whose requester lost eligibility).
+                Granted | Declined | Expired | Undelivered | Cancelled | Replaced | HolderChanged
+                | AlreadySatisfied | Failed => {
+                    if request_id.is_none() {
+                        return Err("a terminal outcome carries its request_id".into());
+                    }
+                }
+                NoHolder | Busy | RateLimited | Capacity | UnsupportedHolder | Unknown => {
+                    if request_id.is_some() {
+                        return Err("a refusal or unknown carries no request_id".into());
+                    }
+                }
+                Ineligible => {}
+            }
+            Ok(())
+        }
+        ControlMessage::InputControlRequested { request_id, from_session, expires_in_ms } => {
+            uuid("request_id", request_id)?;
+            if *expires_in_ms > MAX_REQUEST_EXPIRES_IN_MS {
+                return Err(format!("expires_in_ms exceeds {MAX_REQUEST_EXPIRES_IN_MS}"));
+            }
+            if is_valid_session_id(from_session) {
+                Ok(())
+            } else {
+                Err("from_session contains control characters or is too long".into())
+            }
+        }
+        ControlMessage::InputControlPromptShown { request_id }
+        | ControlMessage::AnswerInputControlRequest { request_id, .. }
+        | ControlMessage::InputControlRequestWithdrawn { request_id, .. } => uuid("request_id", request_id),
+        _ => Ok(()),
+    }
+}
+
+/// Largest `expires_in_ms` a prompt may carry (the design's expiry is 60 s; 2 minutes is the sanity ceiling).
+pub const MAX_REQUEST_EXPIRES_IN_MS: u64 = 120_000;
+
+/// A canonical LOWER-CASE hyphenated UUID: 36 characters, hex digits and hyphens at 8-13-18-23.
+pub fn is_valid_uuid_text(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+        })
 }
 
 /// Longest `HandInputControl` target id [`decode`] accepts, in bytes. A signaling session id is a
@@ -1215,6 +1420,19 @@ pub fn observer_rule(msg: &ControlMessage) -> ObserverRule {
         ControlMessage::StartRecording { .. } | ControlMessage::StopRecording { .. } => Refuse,
         // docs/61: an observer never hands input control (it has none to hand); refused at dispatch.
         ControlMessage::HandInputControl { .. } => Refuse,
+        // docs/73: an observer may announce, but its requests and answers reach the handler, which
+        // answers an observer `ineligible` / does nothing (it is never eligible and never a holder).
+        ControlMessage::InputRequestCapable {} => Allow,
+        ControlMessage::RequestInputControl { .. }
+        | ControlMessage::WithdrawInputControlRequest { .. }
+        | ControlMessage::InputControlPromptShown { .. }
+        | ControlMessage::AnswerInputControlRequest { .. } => ViewOnlyGated,
+        // docs/73 agent -> controller messages: never meaningful from a controller.
+        ControlMessage::InputRequestAvailable { .. }
+        | ControlMessage::InputControlRequestPending { .. }
+        | ControlMessage::InputControlRequestResult { .. }
+        | ControlMessage::InputControlRequested { .. }
+        | ControlMessage::InputControlRequestWithdrawn { .. } => Refuse,
         // agent -> controller messages: never meaningful from a controller.
         ControlMessage::MonitorList { .. }
         | ControlMessage::SelectMonitorAccepted { .. }

@@ -179,7 +179,7 @@ export function inputHandoffView(
     m.mode === "shared"
       ? "Input is shared: every controlling technician can type."
       : m.mode === "blocked"
-        ? "Input is locked: the technician who had control left. Take control to continue."
+        ? "Input is locked: no technician has control right now. Take control to continue."
         : youHaveControl
           ? "You have input control."
           : `${otherOwner} has input control.`;

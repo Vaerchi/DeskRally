@@ -114,9 +114,15 @@ use rmt_agent_core::{
 };
 
 use crate::input_arbiter::{
-    verdict_for, CommitOutcome, FenceScope, HandRefusal, InjectionVerdict, InputArbiter, Member,
-    Mode, Participants, Transition,
+    verdict_for, CommitOutcome, CommitStep, FenceScope, HandRefusal, InjectionVerdict, InputArbiter,
+    Member, Mode, Participants, Transition,
 };
+use crate::input_request::{
+    Directive, HolderMsg, Outcome, ReqState, Refusal, Request, RequestBook, RequestReply, Resolved,
+    TrustedIds, WithdrawReason, AuditRecord, EXPIRES_AFTER, REQUEST_HAND_DEADLINE, UNDELIVERED_AFTER,
+};
+use uuid::Uuid;
+use std::time::Instant;
 use crate::session_directory::{input_control_snapshot, HandoffOutbound, SessionDirectory, SessionIdentity};
 
 // ── Constants ─────────────────────────────────────────────────────────────────────────────────────
@@ -684,8 +690,25 @@ impl InputCoordinator {
     /// retries the revocation itself, and only while that revocation is still current.
     fn release_keys(&self, session: u64) -> bool {
         self.os_sink.cancel_typing(true);
+        self.release_keys_after_cancel(session)
+    }
+
+    /// [`release_keys`] minus the typing cancel, for a caller that has already cancelled typing in
+    /// this same pass (the fence pass cancels once, not once per member). Safe because the cancel's
+    /// only job is that no keystroke of typing follows the release, and typing is injected solely by
+    /// the capture thread, which is the caller.
+    fn release_keys_after_cancel(&self, session: u64) -> bool {
         let mut s = self.state.lock().unwrap();
         !self.release_holders(&mut s, session)
+    }
+
+    /// Numeric VK codes `session` currently holds (diagnostics for the owed-release log; never text).
+    fn held_key_codes(&self, session: u64) -> Vec<u32> {
+        let s = self.state.lock().unwrap();
+        let mut v: Vec<u32> =
+            s.key_holders.iter().filter(|(_, h)| h.contains(&session)).map(|(c, _)| u32::from(*c)).collect();
+        v.sort_unstable();
+        v
     }
 
     fn release_session(&self, session: u64) {
@@ -912,6 +935,20 @@ pub(crate) struct InputArbiterHub {
     /// host spawns one and released only when its blocking `hand_input_control` returns. Session churn
     /// can leave detached jobs behind, so a per-session slot alone does not bound them; this does.
     hands_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Mirror of `ArbCore::last_committed` (docs/73 2.2.4 item 3), published under `core` by every
+    /// commit, so the capture thread judges an owed fence without taking `core`.
+    last_committed_mirror: AtomicU64,
+    /// Set by the capture thread while at least one owed (release-only) fence entry exists. Admission
+    /// of request-driven control (docs/73, later build step) reads only this atomic.
+    releases_owed: AtomicBool,
+    /// Origin of `next_deadline_ns` (docs/73 2.2.3 (c)).
+    clock_base: Instant,
+    /// Earliest instant (nanoseconds after `clock_base`) at which a request sweep has work;
+    /// `u64::MAX` = none. Read by the capture thread without taking `core`.
+    next_deadline_ns: AtomicU64,
+    /// Test tap of every routed directive, in routing order across all sessions.
+    #[cfg(test)]
+    route_log: Mutex<Vec<Directive>>,
 }
 
 /// Most hand jobs outstanding at once across the machine. Hands serialize in the arbiter anyway
@@ -931,6 +968,11 @@ struct ArbCore {
     arbiter: InputArbiter,
     registry: ArbRegistry,
     next_incarnation: u64,
+    /// The latest `Owned` commit (id 0 = none yet): only an `Owned` commit changes it, and only the
+    /// capture thread commits. Its id is mirrored into `last_committed_mirror`.
+    last_commit: LastCommit,
+    /// docs/73 2.2.3: the request records, replay cache and outbox, decided under this same lock.
+    requests: RequestBook,
 }
 
 struct ArbSnapshot {
@@ -950,6 +992,10 @@ struct RegEntry {
     incarnation: u64,
     eligible: bool,
     release_keep_awake: Option<Box<dyn FnOnce() + Send>>,
+    /// The viewer announced `InputRequestCapable` (docs/73 2.2.2).
+    request_capable: bool,
+    /// The directory entry was removed (`member_left`) but the ordered teardown has not run yet.
+    left: bool,
 }
 
 impl Participants for ArbRegistry {
@@ -974,6 +1020,8 @@ impl InputArbiterHub {
                 arbiter: InputArbiter::new(),
                 registry: ArbRegistry::default(),
                 next_incarnation: 1,
+                last_commit: LastCommit::default(),
+                requests: RequestBook::default(),
             }),
             snapshot: RwLock::new(ArbSnapshot { mode: Mode::Unowned, epoch: 0 }),
             epoch_mirror: Arc::new(AtomicU64::new(0)),
@@ -982,7 +1030,32 @@ impl InputArbiterHub {
             dispatch_probe: Mutex::new(None),
             directory: SessionDirectory::new(),
             hands_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_committed_mirror: AtomicU64::new(0),
+            releases_owed: AtomicBool::new(false),
+            clock_base: Instant::now(),
+            next_deadline_ns: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            route_log: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The id of the transition whose commit last made someone the owner (0 = none). Lock-free.
+    fn last_committed(&self) -> u64 {
+        self.last_committed_mirror.load(Ordering::SeqCst)
+    }
+
+    /// The signaling session id of the live session holding `handle` (the viewers' name for it).
+    pub(crate) fn signaling_id_of(&self, handle: u64) -> Option<String> {
+        self.directory.signaling_id_of_handle(handle)
+    }
+
+    /// Whether an owed release-only set exists (see `run_arb_fences`). It is updated at the END of a
+    /// capture pass, so it lags a supersede that happened on another thread: admission must also
+    /// check the mode (a `Blocked`/`Transitioning` mode with the flag still clear is not proof that
+    /// nothing is owed). Unused outside tests until build step (b).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn releases_owed(&self) -> bool {
+        self.releases_owed.load(Ordering::SeqCst)
     }
 
     /// Admit one hand job machine-wide, or `None` when [`MAX_HANDS_IN_FLIGHT`] are outstanding.
@@ -1013,6 +1086,7 @@ impl InputArbiterHub {
             changed
         };
         self.epoch_mirror.store(c.arbiter.epoch(), Ordering::SeqCst);
+        self.last_committed_mirror.store(c.last_commit.id, Ordering::SeqCst);
         if changed {
             self.directory.broadcast_with(|sid_of| input_control_snapshot(&mode, sid_of));
         }
@@ -1071,7 +1145,7 @@ impl InputArbiterHub {
         let mut c = self.core.lock().unwrap_or_else(|e| e.into_inner());
         let incarnation = c.next_incarnation;
         c.next_incarnation += 1;
-        c.registry.entries.insert(handle, RegEntry { incarnation, eligible: false, release_keep_awake: None });
+        c.registry.entries.insert(handle, RegEntry { incarnation, eligible: false, release_keep_awake: None, request_capable: false, left: false });
         Member { handle, incarnation }
     }
 
@@ -1082,7 +1156,7 @@ impl InputArbiterHub {
     /// eligibility while OWNING input (or while a hand to it is in flight) resolves to `Blocked`,
     /// announced to every participant — a session that cannot type must never hold input hostage.
     pub(crate) fn set_control_eligible(&self, handle: u64, eligible: bool) {
-        let mut c = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.lock_core();
         let Some(e) = c.registry.entries.get_mut(&handle) else { return };
         let was = std::mem::replace(&mut e.eligible, eligible);
         if was && !eligible {
@@ -1090,13 +1164,16 @@ impl InputArbiterHub {
             if c.arbiter.lose_eligibility(member) {
                 self.publish(&c);
             }
+            // A requester that lost eligibility is `ineligible`; a request-driven hand with this
+            // session as a party was aborted by the arbiter (guard), so its request settles `failed`.
+            self.finish_locked(&mut c, Instant::now());
         }
     }
 
     /// A session is gone (clean end and detected crash take the same path). Returns true when the
     /// arbitration mode changed — owner/target teardown moves to `Blocked`, announced in stage 3.
     fn teardown_by_handle(&self, handle: u64) -> bool {
-        let mut c = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.lock_core();
         let Some(e) = c.registry.entries.remove(&handle) else { return false };
         let member = Member { handle, incarnation: e.incarnation };
         let mut changed = c.arbiter.teardown(member);
@@ -1106,6 +1183,11 @@ impl InputArbiterHub {
             changed |= c.arbiter.reset_unarmed();
         }
         self.publish(&c);
+        // Requests follow the registry and the mode: a requester that left is discarded, a holder that
+        // left or a Blocked mode ends pending ones `holder_changed`, a request-driven hand with the
+        // departed session as a party (aborted by the arbiter guard) settles `failed`.
+        self.finish_locked(&mut c, Instant::now());
+        c.requests.drop_cache_of_handle(handle);
         changed
     }
 
@@ -1155,7 +1237,25 @@ impl InputArbiterHub {
         // observes the new mode/epoch, and nothing approved under the old owner is still pending
         // injection when the caller runs its typist barrier (Codex r2 H3).
         let _gate = self.dispatch_gate.write().unwrap_or_else(|e| e.into_inner());
-        let mut c = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.lock_core();
+        let r = self.begin_locked(&mut c, sender, target, None);
+        if r.is_ok() {
+            // Pending requests see the transition: any not aimed at their requester end `holder_changed`.
+            self.finish_locked(&mut c, Instant::now());
+        }
+        r
+    }
+
+    /// The begin itself, under `core` (and, for the caller, the dispatch gate): validate, begin the hand
+    /// (a request-driven one carries its deadline guard), publish, and release the non-target keep-awake
+    /// holds. Shared by the plain and the request-driven begin.
+    fn begin_locked(
+        &self,
+        c: &mut ArbCore,
+        sender: u64,
+        target: u64,
+        deadline: Option<Instant>,
+    ) -> Result<Transition, HandRefusal> {
         let member_of = |c: &ArbCore, h: u64, miss: HandRefusal| {
             c.registry
                 .entries
@@ -1163,12 +1263,15 @@ impl InputArbiterHub {
                 .map(|e| Member { handle: h, incarnation: e.incarnation })
                 .ok_or(miss)
         };
-        let s = member_of(&c, sender, HandRefusal::SenderNotLive)?;
-        let t = member_of(&c, target, HandRefusal::TargetNotLive)?;
+        let s = member_of(c, sender, HandRefusal::SenderNotLive)?;
+        let t = member_of(c, target, HandRefusal::TargetNotLive)?;
         let ArbCore { arbiter, registry, .. } = &mut *c;
-        let r = arbiter.begin_hand(s, t, registry);
+        let r = match deadline {
+            Some(d) => arbiter.begin_request_hand(s, t, registry, d),
+            None => arbiter.begin_hand(s, t, registry),
+        };
         if let Ok(transition) = &r {
-            self.publish(&c);
+            self.publish(c);
             // Acquisition takes the same core lock. Once this fence starts, no
             // former participant can acquire a new hold before being readmitted.
             for (&handle, entry) in &mut c.registry.entries {
@@ -1184,10 +1287,29 @@ impl InputArbiterHub {
 
     /// Commit transition `id` after its fence completed, judged against liveness at THIS instant.
     fn commit(&self, id: u64) -> CommitOutcome {
-        let mut c = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        self.commit_at(id, Instant::now())
+    }
+
+    /// [`commit`] with an injected clock. A request-driven transition past its deadline is aborted
+    /// instead of committed (reported as `StaleTransition`); an `Owned` commit records `last_commit`
+    /// (id, owner, epoch) and settles the requests it decides (`granted` is recorded here but sent only
+    /// by `finish_granted`, after the hand's own audit directives).
+    fn commit_at(&self, id: u64, now: Instant) -> CommitOutcome {
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
         let ArbCore { arbiter, registry, .. } = &mut *c;
-        let out = arbiter.commit(id, registry);
+        let out = match arbiter.commit_by(id, registry, now) {
+            CommitStep::Outcome(o) => o,
+            CommitStep::AbortedDeadline => {
+                tracing::warn!(transition = id, "input request: the fence finished after the deadline; the hand was aborted, not committed");
+                CommitOutcome::StaleTransition
+            }
+        };
+        if let CommitOutcome::Owned { who, epoch } = &out {
+            c.last_commit = LastCommit { id, who: Some(*who), epoch: *epoch };
+        }
         self.publish(&c);
+        self.finish_locked(&mut c, now);
         out
     }
 
@@ -1258,6 +1380,750 @@ impl InputArbiterHub {
     }
 }
 
+// ── docs/73 2.2.3 / 2.2.4: request-for-control state machine on the hub ───────────────────────────
+
+/// The latest `Owned` commit (docs/73 2.2.4 item 3), independent of any request. `Mode::Owned` carries
+/// no transition id, so this is how `abort_transition` tells "committed" from "never began".
+#[derive(Clone, Copy, Default)]
+struct LastCommit {
+    id: u64,
+    who: Option<Member>,
+    epoch: u64,
+}
+
+/// What a holder's session loop reports about its two accept admissions (its `HandSlot` and the
+/// machine-wide permit, `try_admit_hand`). The slot lives in host.rs; the hub only needs the verdict.
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AcceptGate {
+    Held,
+    Unavailable,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AnswerResult {
+    /// Consumed under `core`: `accepted_in_flight`, no transition id yet. The job calls
+    /// `begin_request_by_handle(request_id)` and waits at most until `deadline`.
+    Consumed { request_id: Uuid, deadline: Instant },
+    Declined,
+    /// The slot is busy with the holder's own PLAIN hand to the requester: no consumption, no settle.
+    Ignored,
+    /// Slot or permit unavailable for any other reason: consumed, then settled `failed` at once.
+    FailedBusy,
+    /// Answer after terminal, or for an id this holder does not hold: `Withdrawn` queued, no effect.
+    Withdrawn,
+    /// A second answer to a consumed request, or an unregistered answerer.
+    NoEffect,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AbortReason {
+    Deadline,
+    CaptureUnavailable,
+    WorkerLost,
+    PartyLeft,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AbortOutcome {
+    Aborted,
+    AlreadyCommitted { who: Member, epoch: u64 },
+    Stale,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RequestBeginError {
+    Refused(HandRefusal),
+    /// The dispatch gate could not be taken before the deadline: nothing began, the mode is untouched.
+    GateTimeout,
+    /// The request is gone (its requester left) or was never consumed: the job ends without beginning.
+    Discarded,
+}
+
+/// What the hand job concludes after waiting for its fence.
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FenceResolution {
+    Committed { who: Member, epoch: u64 },
+    Failed,
+}
+
+/// The job's answer after its `recv_timeout` / enqueue failure / disconnect (docs/73 2.2.4 item 2-3):
+/// look at `done_rx` first (the fence may have finished in the instant between), then ask the hub;
+/// after `Stale`, look at `done_rx` ONCE MORE, because the fence sends `done` right after its commit.
+/// `AlreadyCommitted` takes exactly the `Committed` path, so a commit that wins the race is never `Failed`.
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+pub(crate) fn resolve_after_wait(
+    hub: &InputArbiterHub,
+    id: u64,
+    done_rx: &std::sync::mpsc::Receiver<CommitOutcome>,
+    reason: AbortReason,
+    now: Instant,
+) -> FenceResolution {
+    resolve_after_wait_with(hub, id, done_rx, reason, now, || {})
+}
+
+/// [`resolve_after_wait`] with a hook that runs after the hub has answered and before the final look
+/// at `done_rx`: the instant in which the fence's `done` value can still arrive. Tests use it to send
+/// that value exactly there; production passes a no-op.
+pub(crate) fn resolve_after_wait_with(
+    hub: &InputArbiterHub,
+    id: u64,
+    done_rx: &std::sync::mpsc::Receiver<CommitOutcome>,
+    reason: AbortReason,
+    now: Instant,
+    after_hub_answer: impl FnOnce(),
+) -> FenceResolution {
+    let from_done = |o: CommitOutcome| match o {
+        CommitOutcome::Owned { who, epoch } => FenceResolution::Committed { who, epoch },
+        _ => FenceResolution::Failed,
+    };
+    if let Ok(o) = done_rx.try_recv() {
+        return from_done(o);
+    }
+    let answer = hub.abort_transition(id, reason, now);
+    after_hub_answer();
+    match answer {
+        AbortOutcome::AlreadyCommitted { who, epoch } => FenceResolution::Committed { who, epoch },
+        // Aborted: the epoch advance and `Blocked` are already published, so no commit can follow.
+        AbortOutcome::Aborted => FenceResolution::Failed,
+        AbortOutcome::Stale => done_rx.try_recv().map(from_done).unwrap_or(FenceResolution::Failed),
+    }
+}
+
+/// Is `m` a live, not-departed participant of the registry (the request layer's notion of "live").
+fn req_live(reg: &ArbRegistry, m: Member) -> bool {
+    reg.entries.get(&m.handle).is_some_and(|e| e.incarnation == m.incarnation && !e.left)
+}
+
+fn req_eligible(reg: &ArbRegistry, m: Member) -> bool {
+    req_live(reg, m) && reg.entries.get(&m.handle).is_some_and(|e| e.eligible)
+}
+
+/// THE ONLY terminal path of a request: `RequestBook::settle`, with the route decided right here.
+fn settle_req(c: &mut ArbCore, id: Uuid, outcome: Outcome, now: Instant) -> bool {
+    let Some(r) = c.requests.find(id) else { return false };
+    let (rq, hd) = (r.requester, r.holder);
+    let (rl, hl) = (req_live(&c.registry, rq), req_live(&c.registry, hd));
+    c.requests.settle(id, outcome, now, rl, hl)
+}
+
+/// Bring every live request in line with the arbiter, the registry and the last commit. Each event
+/// handler applies its own change and then calls this, under `core`, so "first event under the lock
+/// wins" and a request can only ever be settled once (`settle` ignores a terminal one).
+fn reconcile(c: &mut ArbCore, now: Instant) {
+    let mode = c.arbiter.mode().clone();
+    let ids: Vec<Uuid> = c.requests.live.iter().map(|r| r.request_id).collect();
+    for id in ids {
+        let Some(r) = c.requests.find(id).cloned() else { continue };
+        // The requester's session ended: discard, no result, no close (the holder hears `requester_left`).
+        if !req_live(&c.registry, r.requester) {
+            let ArbCore { requests, registry, .. } = c;
+            requests.discard_requester(r.requester, |m| req_live(registry, m));
+            continue;
+        }
+        if r.state == ReqState::AcceptedInFlight {
+            // A consumed request is ended only by its job's outcome, i.e. by what became of its transition.
+            if let Some(tid) = r.transition {
+                if !matches!(&mode, Mode::Transitioning { id: cur, .. } if *cur == tid) {
+                    let o = if c.last_commit.id == tid { Outcome::Granted } else { Outcome::Failed };
+                    settle_req(c, id, o, now);
+                }
+            }
+            continue;
+        }
+        if !req_eligible(&c.registry, r.requester) {
+            settle_req(c, id, Outcome::Ineligible, now);
+        } else if !req_eligible(&c.registry, r.holder) {
+            settle_req(c, id, Outcome::HolderChanged, now);
+        } else {
+            match &mode {
+                Mode::Owned { who } if *who != r.holder => {
+                    let satisfied = *who == r.requester && r.plain_to_requester == Some(c.last_commit.id);
+                    settle_req(c, id, if satisfied { Outcome::AlreadySatisfied } else { Outcome::HolderChanged }, now);
+                }
+                Mode::Owned { .. } => {}
+                Mode::Blocked | Mode::Unowned => {
+                    settle_req(c, id, Outcome::HolderChanged, now);
+                }
+                // A plain hand of the holder to THIS requester: nothing yet, its commit decides.
+                Mode::Transitioning { id: tid, to } if *to == r.requester => {
+                    if let Some(rr) = c.requests.find_mut(id) {
+                        rr.plain_to_requester = Some(*tid);
+                    }
+                }
+                Mode::Transitioning { .. } => {
+                    settle_req(c, id, Outcome::HolderChanged, now);
+                }
+            }
+        }
+    }
+}
+
+/// `core`'s lock plus the duty to flush the request layer's directives before releasing it.
+struct CoreGuard<'a> {
+    hub: &'a InputArbiterHub,
+    g: std::sync::MutexGuard<'a, ArbCore>,
+}
+
+impl std::ops::Deref for CoreGuard<'_> {
+    type Target = ArbCore;
+    fn deref(&self) -> &ArbCore {
+        &self.g
+    }
+}
+
+impl std::ops::DerefMut for CoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ArbCore {
+        &mut self.g
+    }
+}
+
+impl Drop for CoreGuard<'_> {
+    fn drop(&mut self) {
+        self.hub.flush_directives(&mut self.g);
+    }
+}
+
+/// Queue a reply to the requester (replay hits and `unknown`): the directive is the only reply channel.
+fn send_reply(c: &mut ArbCore, to: u64, reply: RequestReply) {
+    if let Some(msg) = reply.as_msg() {
+        c.requests.push(Directive::ToRequester { to, msg });
+    }
+}
+#[cfg_attr(not(test), allow(dead_code))] // until the host wiring (docs/73 build step c)
+impl InputArbiterHub {
+    /// `core`, with the request layer's directives routed onto the sessions' handoff queues, in
+    /// decision order, BEFORE the lock is released (the guard flushes on drop). Every entry point that
+    /// can decide something takes `core` through this, so no directive is ever queued outside `core`
+    /// and a requester's chain sees `requested` before anything that follows it.
+    fn lock_core(&self) -> CoreGuard<'_> {
+        CoreGuard { hub: self, g: self.core.lock().unwrap_or_else(|e| e.into_inner()) }
+    }
+
+    /// Route every directive the book holds onto the target session's handoff queue (`HandoffTx::send`
+    /// never blocks). Runs under `core` (lock order core -> directory). A `requested` seal that cannot
+    /// be queued means the requester is being disconnected: that request is NOT admitted, and nothing
+    /// else for it is routed.
+    fn flush_directives(&self, c: &mut ArbCore) {
+        let ds = c.requests.take_outbox();
+        if ds.is_empty() {
+            return;
+        }
+        let mut abandoned: Vec<Uuid> = Vec::new();
+        for d in ds {
+            if d.request_id().is_some_and(|id| abandoned.contains(&id)) {
+                continue;
+            }
+            #[cfg(test)]
+            self.route_log.lock().unwrap_or_else(|e| e.into_inner()).push(d.clone());
+            let to = d.target();
+            let is_requested = matches!(&d, Directive::Audit { record: AuditRecord::Requested { .. }, .. });
+            let rid = d.request_id();
+            let closed_outcome = match &d {
+                Directive::Audit { record: AuditRecord::Closed { outcome, .. }, .. } => Some(*outcome),
+                _ => None,
+            };
+            if !self.directory.send_to_handle(to, HandoffOutbound::Request(d)) {
+                if is_requested {
+                    abandoned.push(rid.expect("a requested seal names its request"));
+                } else if let Some(outcome) = closed_outcome {
+                    // The outcome is already decided and recorded in the replay cache; the requester's
+                    // chain simply ends without the close (docs/73 2.2.5).
+                    tracing::error!(
+                        request = ?rid,
+                        outcome = outcome.name(),
+                        handle = to,
+                        "input request: the closed audit record could not be queued; the outcome stands and the requester's chain ends without it"
+                    );
+                } else {
+                    tracing::debug!(handle = to, "input request: a directive could not be queued (the session is ending)");
+                }
+            }
+        }
+        for id in abandoned {
+            tracing::warn!(request = %id, "input request: the requested seal could not be queued; the request is not admitted");
+            c.requests.abandon(id);
+        }
+        self.refresh_next_deadline(c);
+    }
+
+    /// Test-only tap: every directive in the order it was routed, across all sessions.
+    #[cfg(test)]
+    pub(crate) fn take_log(&self) -> Vec<Directive> {
+        std::mem::take(&mut *self.route_log.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The viewer announced `InputRequestCapable` (docs/73 2.2.2).
+    pub(crate) fn set_request_capable(&self, handle: u64) {
+        if let Some(e) = self.lock_core().registry.entries.get_mut(&handle) {
+            e.request_capable = true;
+        }
+    }
+
+    fn deadline_ns(&self, t: Instant) -> u64 {
+        t.saturating_duration_since(self.clock_base).as_nanos().min(u64::MAX as u128 - 1) as u64
+    }
+
+    /// Publish the earliest instant at which a sweep has work, for the capture thread's cheap check.
+    fn refresh_next_deadline(&self, c: &ArbCore) {
+        let due = [c.requests.next_due(), c.arbiter.guard().map(|g| g.deadline)].into_iter().flatten().min();
+        self.next_deadline_ns.store(due.map_or(u64::MAX, |t| self.deadline_ns(t)), Ordering::SeqCst);
+    }
+
+    /// After a state change: reconcile the requests and refresh the next-deadline mirror.
+    fn finish_locked(&self, c: &mut ArbCore, now: Instant) {
+        reconcile(c, now);
+        self.refresh_next_deadline(c);
+    }
+
+    /// Abort the in-flight request-driven transition under `core` (epoch advanced, `Blocked`, guard
+    /// cleared) and PUBLISH before any request is settled, so by the time anyone hears `failed` a commit
+    /// is already impossible.
+    fn abort_locked(&self, c: &mut ArbCore, id: u64, reason: AbortReason) -> bool {
+        if !c.arbiter.guard().is_some_and(|g| g.id == id) || !c.arbiter.abort_transition(id) {
+            return false;
+        }
+        tracing::warn!(transition = id, ?reason, "input request: the request-driven hand was aborted; input is Blocked until a claim");
+        self.publish(c);
+        true
+    }
+
+    /// Timers and deadline aborts, a short `core` critical section with no I/O (docs/73 2.2.3). Run at
+    /// the top of every entry point, by the capture thread when the next-deadline mirror has passed, and
+    /// from the session loops' 1 s arm.
+    pub(crate) fn sweep_requests(&self, now: Instant) {
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
+    }
+
+    /// Cheap capture-thread check: sweep only when the published next deadline has passed.
+    pub(crate) fn sweep_if_due(&self, now: Instant) {
+        if self.next_deadline_ns.load(Ordering::SeqCst) <= self.deadline_ns(now) {
+            self.sweep_requests(now);
+        }
+    }
+
+    fn sweep_locked(&self, c: &mut ArbCore, now: Instant) {
+        c.requests.prune(now);
+        if let Some(g) = c.arbiter.guard() {
+            if now >= g.deadline {
+                self.abort_locked(c, g.id, AbortReason::Deadline);
+            }
+        }
+        reconcile(c, now);
+        let due: Vec<(Uuid, Outcome)> = c
+            .requests
+            .live
+            .iter()
+            .filter_map(|r| match r.state {
+                ReqState::PendingDelivery if now >= r.admitted_at + UNDELIVERED_AFTER => Some((r.request_id, Outcome::Undelivered)),
+                ReqState::Shown if now >= r.admitted_at + EXPIRES_AFTER => Some((r.request_id, Outcome::Expired)),
+                // Consumed, but no job ever recorded a transition for it by the deadline: a lost job.
+                ReqState::AcceptedInFlight if r.transition.is_none() && r.deadline.is_some_and(|d| now >= d) => {
+                    Some((r.request_id, Outcome::Failed))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, o) in due {
+            settle_req(c, id, o, now);
+        }
+        self.refresh_next_deadline(c);
+    }
+
+    /// The requester's `RequestInputControl` (docs/73 2.2.2/2.2.3). Every reply is a directive queued to
+    /// the requester under `core` (replay hits, `unknown` and refusals included): the directive is the
+    /// ONLY reply channel. A session that is not registered or never announced `InputRequestCapable` is
+    /// dropped silently: nothing queued, no state, no rate-limit charge.
+    pub(crate) fn request_input(&self, b: u64, client_request_id: Uuid, retry: bool, now: Instant) {
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
+        let Some(be) = c.registry.entries.get(&b) else {
+            tracing::debug!(handle = b, "input request: dropped (the session is not registered)");
+            return;
+        };
+        if !be.request_capable {
+            tracing::debug!(handle = b, "input request: dropped (the session never announced InputRequestCapable)");
+            return;
+        }
+        let bm = Member { handle: b, incarnation: be.incarnation };
+        let b_ok = be.eligible && !be.left;
+        if let Some(reply) = c.requests.reply_for_key(bm, client_request_id) {
+            send_reply(&mut c, b, reply);
+            return;
+        }
+        if retry {
+            let unknown = RequestReply::Result { client_request_id, request_id: None, outcome: Resolved::Unknown };
+            send_reply(&mut c, b, unknown);
+            return;
+        }
+        let mode = c.arbiter.mode().clone();
+        let owner = if let Mode::Owned { who } = &mode { Some(*who) } else { None };
+        let owner_live = owner.is_some_and(|w| req_live(&c.registry, w));
+        let joined = self.directory.identity_of_handle(b).is_some();
+        // The fixed refusal order: ineligible -> no_holder -> busy -> unsupported_holder -> rate/capacity.
+        let refusal = if !b_ok || !joined || owner == Some(bm) {
+            Some(Refusal::Ineligible)
+        } else if matches!(mode, Mode::Blocked | Mode::Unowned) || (owner.is_some() && !owner_live) {
+            Some(Refusal::NoHolder)
+        } else if matches!(mode, Mode::Transitioning { .. })
+            || self.releases_owed()
+            || c.requests.live_of_requester(bm).is_some_and(|r| r.state == ReqState::AcceptedInFlight)
+        {
+            Some(Refusal::Busy)
+        } else if !owner.is_some_and(|a| c.registry.entries.get(&a.handle).is_some_and(|e| e.request_capable)) {
+            Some(Refusal::UnsupportedHolder)
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
+            c.requests.refuse(bm, client_request_id, why, now);
+            self.refresh_next_deadline(&c);
+            return;
+        }
+        let holder = owner.expect("Owned: checked above");
+        let (fb, fa) = self.directory.identities_of(b, holder.handle);
+        let nil = Uuid::nil();
+        let ids = TrustedIds {
+            requester_session: fb.as_ref().and_then(|i| i.control_plane_session).unwrap_or(nil),
+            requester_technician: fb.as_ref().and_then(|i| i.technician_id).unwrap_or(nil),
+            holder_session: fa.as_ref().and_then(|i| i.control_plane_session).unwrap_or(nil),
+            holder_technician: fa.as_ref().and_then(|i| i.technician_id).unwrap_or(nil),
+        };
+        if let Some(why) = c.requests.bound_refusal(bm, holder, &ids, now) {
+            c.requests.refuse(bm, client_request_id, why, now);
+            self.refresh_next_deadline(&c);
+            return;
+        }
+        // A prior pending/shown request of this requester is replaced in the same critical section,
+        // BEFORE the new `requested` is queued (an accepted_in_flight one refused `busy` above).
+        if let Some(prev) = c.requests.live_of_requester(bm).map(|r| r.request_id) {
+            settle_req(&mut c, prev, Outcome::Replaced, now);
+        }
+        let req = Request {
+            request_id: Uuid::new_v4(),
+            client_request_id,
+            requester: bm,
+            holder,
+            epoch: c.arbiter.epoch(),
+            ids,
+            state: ReqState::PendingDelivery,
+            admitted_at: now,
+            deadline: None,
+            transition: None,
+            plain_to_requester: None,
+        };
+        // Queued in this order when the guard drops: `requested`, `Pending`, the prompt. If the
+        // `requested` seal cannot be queued the request is NOT admitted (`flush_directives`).
+        c.requests.admit(req, now);
+        self.refresh_next_deadline(&c);
+    }
+
+    /// The requester's `WithdrawInputControlRequest`: `cancelled` while pending/shown; otherwise the
+    /// current state or recorded result is queued, changing nothing. Dropped like `request_input`.
+    pub(crate) fn withdraw_request(&self, b: u64, client_request_id: Uuid, now: Instant) {
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
+        let Some(be) = c.registry.entries.get(&b) else { return };
+        if !be.request_capable {
+            return;
+        }
+        let bm = Member { handle: b, incarnation: be.incarnation };
+        let reply = match c.requests.reply_for_key(bm, client_request_id) {
+            Some(RequestReply::Pending { request_id, state, .. }) if state != ReqState::AcceptedInFlight => {
+                // `settle` queues the `Result{cancelled}` itself: nothing more to say.
+                settle_req(&mut c, request_id, Outcome::Cancelled, now);
+                self.refresh_next_deadline(&c);
+                return;
+            }
+            Some(other) => other,
+            None => RequestReply::Result { client_request_id, request_id: None, outcome: Resolved::Unknown },
+        };
+        send_reply(&mut c, b, reply);
+    }
+
+    /// The holder's viewer rendered the prompt: `shown`. Ignored for an unknown id or another holder.
+    pub(crate) fn prompt_shown(&self, holder: u64, request_id: Uuid, now: Instant) {
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
+        let Some(inc) = c.registry.entries.get(&holder).map(|e| e.incarnation) else { return };
+        let am = Member { handle: holder, incarnation: inc };
+        if let Some(r) = c.requests.find_mut(request_id) {
+            if r.holder == am && r.state == ReqState::PendingDelivery {
+                r.state = ReqState::Shown;
+            }
+        }
+        self.refresh_next_deadline(&c);
+    }
+
+    /// The holder's `AnswerInputControlRequest` (docs/73 2.2.3). `holder` is the transport's own
+    /// handle, never taken from the message. `gate` is the verdict of the holder's `HandSlot` and the
+    /// machine permit, taken by the host BEFORE this call.
+    pub(crate) fn answer_request(
+        &self,
+        holder: u64,
+        request_id: Uuid,
+        accept: bool,
+        gate: AcceptGate,
+        now: Instant,
+    ) -> AnswerResult {
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
+        // An unregistered session, or one that never announced `InputRequestCapable`, gets nothing at all.
+        let Some(inc) = c
+            .registry
+            .entries
+            .get(&holder)
+            .filter(|e| e.request_capable)
+            .map(|e| e.incarnation)
+        else {
+            return AnswerResult::NoEffect;
+        };
+        let am = Member { handle: holder, incarnation: inc };
+        let found = c.requests.find(request_id).filter(|r| r.holder == am).map(|r| (r.state, r.plain_to_requester));
+        let Some((state, plain_to)) = found else {
+            // After terminal, or not this holder's: Withdrawn naming the recorded outcome, else unknown.
+            let reason = c
+                .requests
+                .recorded_for_holder(request_id, am)
+                .map_or(WithdrawReason::Unknown, WithdrawReason::Outcome);
+            c.requests.push(Directive::ToHolder { to: holder, msg: HolderMsg::Withdrawn { request_id, reason } });
+            return AnswerResult::Withdrawn;
+        };
+        if state == ReqState::AcceptedInFlight {
+            return AnswerResult::NoEffect;
+        }
+        // A valid answer establishes `shown` (a lost PromptShown must not become `undelivered`).
+        if let Some(r) = c.requests.find_mut(request_id) {
+            r.state = ReqState::Shown;
+        }
+        let result = if !accept {
+            settle_req(&mut c, request_id, Outcome::Declined, now);
+            AnswerResult::Declined
+        } else if gate == AcceptGate::Unavailable {
+            if plain_to.is_some() && matches!(c.arbiter.mode(), Mode::Transitioning { .. }) {
+                // The busy slot is the holder's own plain hand TO the requester: its commit ends this
+                // request `already_satisfied` (or `holder_changed` if it aborts).
+                AnswerResult::Ignored
+            } else {
+                if let Some(r) = c.requests.find_mut(request_id) {
+                    r.state = ReqState::AcceptedInFlight;
+                    r.deadline = Some(now + REQUEST_HAND_DEADLINE);
+                }
+                settle_req(&mut c, request_id, Outcome::Failed, now);
+                AnswerResult::FailedBusy
+            }
+        } else {
+            let deadline = now + REQUEST_HAND_DEADLINE;
+            if let Some(r) = c.requests.find_mut(request_id) {
+                r.state = ReqState::AcceptedInFlight;
+                r.deadline = Some(deadline);
+            }
+            AnswerResult::Consumed { request_id, deadline }
+        };
+        self.refresh_next_deadline(&c);
+        result
+    }
+
+    /// The hand job's pre-check, run BEFORE it cancels anyone's typing (docs/73 2.2.4 item 1, like the plain
+    /// job): the request must still be the consumed one and the hand must already be valid. A refusal settles
+    /// the request `failed` (the job is the only decider of a consumed request) and nothing was touched.
+    pub(crate) fn precheck_request_hand(&self, request_id: Uuid, now: Instant) -> Result<(), RequestBeginError> {
+        let (holder, requester) = {
+            let mut c = self.lock_core();
+            self.sweep_locked(&mut c, now);
+            match c.requests.find(request_id) {
+                Some(r) if r.state == ReqState::AcceptedInFlight && r.transition.is_none() => (r.holder, r.requester),
+                _ => return Err(RequestBeginError::Discarded),
+            }
+        };
+        if let Err(r) = self.check_by_handle(holder.handle, requester.handle) {
+            tracing::warn!(?r, "input request: the accepted hand was refused before anything was touched");
+            let mut c = self.lock_core();
+            settle_req(&mut c, request_id, Outcome::Failed, now);
+            self.refresh_next_deadline(&c);
+            return Err(RequestBeginError::Refused(r));
+        }
+        Ok(())
+    }
+
+    /// The job's begin for a CONSUMED request (replaces `begin_by_handle`, docs/73 2.2.4 item 1).
+    /// Sender, target and deadline come from the request record. The caller has already run
+    /// `cancel_typing(false)` (the coordinator lives in the host). The dispatch gate is taken with
+    /// `try_write` polled every 1 ms until the deadline; on timeout nothing has begun. Every refusal
+    /// settles the request `failed`: the job is the only decider of a consumed request.
+    pub(crate) fn begin_request_by_handle(&self, request_id: Uuid, now: Instant) -> Result<Transition, RequestBeginError> {
+        let (holder, requester, deadline) = {
+            let mut c = self.lock_core();
+            self.sweep_locked(&mut c, now);
+            match c.requests.find(request_id) {
+                Some(r) if r.state == ReqState::AcceptedInFlight && r.transition.is_none() && r.deadline.is_some() => {
+                    (r.holder, r.requester, r.deadline.expect("checked"))
+                }
+                _ => return Err(RequestBeginError::Discarded),
+            }
+        };
+        let fail = |why: RequestBeginError| -> Result<Transition, RequestBeginError> {
+            let mut c = self.lock_core();
+            settle_req(&mut c, request_id, Outcome::Failed, now);
+            self.refresh_next_deadline(&c);
+            Err(why)
+        };
+        if let Err(r) = self.check_by_handle(holder.handle, requester.handle) {
+            tracing::warn!(?r, "input request: the accepted hand was refused before it began");
+            return fail(RequestBeginError::Refused(r));
+        }
+        let _gate = loop {
+            match self.dispatch_gate.try_write() {
+                Ok(g) => break g,
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        tracing::warn!("input request: the dispatch gate was not obtainable before the deadline; nothing began");
+                        return fail(RequestBeginError::GateTimeout);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        };
+        let mut c = self.lock_core();
+        let still = c
+            .requests
+            .find(request_id)
+            .is_some_and(|r| r.state == ReqState::AcceptedInFlight && r.transition.is_none());
+        if !still {
+            return Err(RequestBeginError::Discarded);
+        }
+        // The gate may have been obtained only at the very edge of (or past) the deadline: a hand that
+        // began now could never commit in time. Nothing begins, the mode is untouched.
+        if Instant::now() >= deadline {
+            tracing::warn!("input request: the dispatch gate was obtained only at the deadline; nothing began");
+            settle_req(&mut c, request_id, Outcome::Failed, now);
+            self.refresh_next_deadline(&c);
+            return Err(RequestBeginError::GateTimeout);
+        }
+        match self.begin_locked(&mut c, holder.handle, requester.handle, Some(deadline)) {
+            Ok(t) => {
+                if let Some(r) = c.requests.find_mut(request_id) {
+                    r.transition = Some(t.id);
+                }
+                self.finish_locked(&mut c, now);
+                Ok(t)
+            }
+            Err(r) => {
+                settle_req(&mut c, request_id, Outcome::Failed, now);
+                self.finish_locked(&mut c, now);
+                Err(RequestBeginError::Refused(r))
+            }
+        }
+    }
+
+    /// Compare-by-id abort of a REQUEST-DRIVEN transition (docs/73 2.2.4 item 3). A commit that won
+    /// the race is reported from the hub-level `last_commit` (`AlreadyCommitted`, no state change);
+    /// otherwise the epoch advances and the mode is `Blocked`, published before any request is
+    /// settled `failed`. A plain transition is never aborted here: it answers `Stale`.
+    pub(crate) fn abort_transition(&self, id: u64, reason: AbortReason, now: Instant) -> AbortOutcome {
+        let mut c = self.lock_core();
+        let in_flight = matches!(c.arbiter.mode(), Mode::Transitioning { id: cur, .. } if *cur == id);
+        self.sweep_locked(&mut c, now);
+        if id != 0 && c.last_commit.id == id {
+            let out = AbortOutcome::AlreadyCommitted {
+                who: c.last_commit.who.expect("an Owned commit records its owner"),
+                epoch: c.last_commit.epoch,
+            };
+            self.finish_locked(&mut c, now);
+            return out;
+        }
+        // The sweep in this very call may have aborted this id (its deadline had passed): that is
+        // still "Aborted" for the caller, not `Stale`.
+        let swept = in_flight && !matches!(c.arbiter.mode(), Mode::Transitioning { id: cur, .. } if *cur == id);
+        if swept || self.abort_locked(&mut c, id, reason) {
+            self.finish_locked(&mut c, now);
+            AbortOutcome::Aborted
+        } else {
+            AbortOutcome::Stale
+        }
+    }
+
+    /// The hand job's wrapper lost its worker (`spawn_blocking` join error): abort by request id.
+    /// Before a transition id exists the request just settles `failed`.
+    pub(crate) fn abort_request(&self, request_id: Uuid, now: Instant) -> Option<AbortOutcome> {
+        let tid = {
+            let mut c = self.lock_core();
+            self.sweep_locked(&mut c, now);
+            let r = c.requests.find(request_id)?;
+            if r.state != ReqState::AcceptedInFlight {
+                return None;
+            }
+            match r.transition {
+                Some(t) => t,
+                None => {
+                    settle_req(&mut c, request_id, Outcome::Failed, now);
+                    self.refresh_next_deadline(&c);
+                    return Some(AbortOutcome::Aborted);
+                }
+            }
+        };
+        Some(self.abort_transition(tid, AbortReason::WorkerLost, now))
+    }
+
+    /// Queue what a `granted` settle deferred. Prefer [`complete_grant`], which orders it after the
+    /// hand's own audit directives.
+    pub(crate) fn finish_granted(&self, request_id: Uuid) -> bool {
+        self.lock_core().requests.finish_granted(request_id)
+    }
+
+    /// The hand job after a commit (`Owned` or `AlreadyCommitted`): `seal_handoff` (queues
+    /// `input_control_handed` to both parties), and ONLY THEN the request's `closed{granted}`,
+    /// `Result{granted}` and `Withdrawn{granted}`, so on the requester's chain `requested < handed <
+    /// closed` by construction.
+    pub(crate) fn complete_grant(&self, request_id: Option<Uuid>, from: u64, to: u64, epoch: u64) {
+        self.seal_handoff(from, to, epoch);
+        if let Some(id) = request_id {
+            self.finish_granted(id);
+        }
+    }
+
+    /// A participant's directory entry was removed (called AFTER the directory lock was released, so
+    /// the order stays core -> directory). It marks the session departed for the request layer and
+    /// aborts a request-driven hand that has this session as a party, before the ordered Release
+    /// sentinel reaches `teardown_by_handle` (which is then idempotent).
+    pub(crate) fn member_left(&self, handle: u64) {
+        let now = Instant::now();
+        let mut c = self.lock_core();
+        self.sweep_locked(&mut c, now);
+        if let Some(e) = c.registry.entries.get_mut(&handle) {
+            e.left = true;
+        }
+        if let Some(g) = c.arbiter.guard() {
+            if g.from.handle == handle || g.to.handle == handle {
+                self.abort_locked(&mut c, g.id, AbortReason::PartyLeft);
+            }
+        }
+        self.finish_locked(&mut c, now);
+        // A departed session leaves no cache entries, refusals included, however it left.
+        c.requests.drop_cache_of_handle(handle);
+    }
+
+    /// Test/diagnostic: number of live requests.
+    #[cfg(test)]
+    pub(crate) fn live_requests(&self) -> usize {
+        self.lock_core().requests.live.len()
+    }
+}
+
+/// How a request-driven hand ended, as the hand job reports it (the request itself is settled by the hub).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RequestHandOutcome {
+    Granted { epoch: u64 },
+    Failed,
+}
+
 /// Why [`SharedCapture::hand_input_control`] did not return a commit outcome.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HandError {
@@ -1280,6 +2146,9 @@ pub(crate) struct DirectoryRegistration {
 impl Drop for DirectoryRegistration {
     fn drop(&mut self) {
         self.hub.directory.remove_if_handle(&self.signaling_id, self.handle);
+        // After the directory lock was released (core -> directory order): the request layer hears of
+        // the departure now, before the ordered Release sentinel reaches `teardown_by_handle`.
+        self.hub.member_left(self.handle);
     }
 }
 
@@ -1848,6 +2717,66 @@ impl SharedCapture {
         done_rx.recv().map_err(|_| HandError::FenceAborted)
     }
 
+    /// The hand job of a REQUEST-DRIVEN accept (docs/73 2.2.4), mirroring [`hand_input_control`]: stop typing
+    /// without waiting, begin through the hub (`begin_request_by_handle`: gate polled to the deadline, request
+    /// settled `failed` on any refusal), await the typist barrier, queue the fence, then wait for its commit at
+    /// most until `deadline`. On a timeout, a refused enqueue or a vanished capture thread the hub is asked
+    /// (`resolve_after_wait`): a commit that won the race is still a grant. On a grant, `complete_grant` queues
+    /// `input_control_handed` for both parties and only then the request's `closed`/`Result`/`Withdrawn`.
+    pub(crate) fn hand_input_control_for_request(
+        &self,
+        holder: u64,
+        request_id: Uuid,
+        deadline: Instant,
+    ) -> RequestHandOutcome {
+        // Pre-check first: an already-invalid hand must not cancel anyone's typing.
+        if let Err(e) = self.arb.precheck_request_hand(request_id, Instant::now()) {
+            tracing::info!(?e, "input request: the accepted hand was refused by the pre-check");
+            return RequestHandOutcome::Failed;
+        }
+        self.coordinator.os_sink.cancel_typing(false);
+        let transition = match self.arb.begin_request_by_handle(request_id, Instant::now()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::info!(?e, "input request: the accepted hand did not begin");
+                return RequestHandOutcome::Failed;
+            }
+        };
+        self.coordinator.os_sink.cancel_typing(true);
+        let members: Vec<u64> = match &transition.fence {
+            FenceScope::AllParticipants(v) => v.iter().map(|m| m.handle).collect(),
+            FenceScope::Previous(m) => vec![m.handle],
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let resolution = if self
+            .control_tx
+            .send(CaptureControl::ArbFence { id: transition.id, members, done: done_tx })
+            .is_err()
+        {
+            resolve_after_wait(&self.arb, transition.id, &done_rx, AbortReason::CaptureUnavailable, Instant::now())
+        } else {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match done_rx.recv_timeout(wait) {
+                Ok(CommitOutcome::Owned { who, epoch }) => FenceResolution::Committed { who, epoch },
+                // The commit refused (target gone, superseded): the hub already settled the request.
+                Ok(_) => FenceResolution::Failed,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    resolve_after_wait(&self.arb, transition.id, &done_rx, AbortReason::Deadline, Instant::now())
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    resolve_after_wait(&self.arb, transition.id, &done_rx, AbortReason::CaptureUnavailable, Instant::now())
+                }
+            }
+        };
+        match resolution {
+            FenceResolution::Committed { who, epoch } => {
+                self.arb.complete_grant(Some(request_id), holder, who.handle, epoch);
+                RequestHandOutcome::Granted { epoch }
+            }
+            FenceResolution::Failed => RequestHandOutcome::Failed,
+        }
+    }
+
     /// Return the current atomically published `(generation, topology)` snapshot.
     ///
     /// Callers that create both a [`SessionInputSender`] and a [`crate::host::BroadcastCapturer`]
@@ -2026,6 +2955,159 @@ impl SharedCapture {
 
 // ── Capture thread ────────────────────────────────────────────────────────────────────────────────
 
+/// An in-flight hand fence (docs/61) owned by the capture thread: the members still to quiesce,
+/// then commit and report through `done`. Once SUPERSEDED (its id is no longer the in-flight
+/// transition) it answers `done` once with the stale outcome and hands its members to the single
+/// [`OwedSet`] (docs/73 2.2.4 / 2.2.8 a); it never commits.
+struct DeferredFence {
+    id: u64,
+    members: Vec<u64>,
+    /// Taken (answered) exactly once, when the fence commits or is superseded.
+    done: Option<std::sync::mpsc::Sender<CommitOutcome>>,
+}
+
+/// The capture thread's fence state: in-flight fences plus at most ONE owed set.
+#[derive(Default)]
+struct ArbFenceState {
+    fences: Vec<DeferredFence>,
+    owed: Option<OwedSet>,
+}
+
+/// Release-only debt left by superseded fences: the sessions whose key-ups may still be refused,
+/// deduplicated per handle however many fences named them, with ONE log schedule. Dropped, without
+/// another release, when the hub's `last_committed` differs from `at_commit` (any commit since: a
+/// commit from `Blocked` requires a completed fence over every participant) or the mode is `Unowned`.
+struct OwedSet {
+    at_commit: u64,
+    members: Vec<u64>,
+    since: std::time::Instant,
+    next_log: std::time::Instant,
+    /// The "still owes" line is written only once a first attempt actually left members behind.
+    announced: bool,
+}
+
+/// First owed-release error line, then repeated at this period.
+const OWED_FIRST_LOG: std::time::Duration = std::time::Duration::from_secs(30);
+const OWED_REPEAT_LOG: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// One capture-thread pass over the deferred hand fences (docs/61 stage 2, docs/73 2.2.8 a).
+///
+/// Stage 1, in-flight fences: quiesce their members, retrying refused releases every pass, and commit
+/// only once every member is clean (design D3), judged against the target's liveness at that instant.
+/// A fence found SUPERSEDED (Codex r2 H1) never commits (commit of a stale id is a no-op reporting
+/// `StaleTransition`); its members move into the owed set unless the mode is already `Owned` or
+/// `Unowned` (a later commit fenced every participant; the registry is empty and departed sessions
+/// are covered by `pending_retry_sessions`).
+///
+/// Stage 2, the owed set, runs AFTER stage 1 so a commit made in this very pass drops it before any
+/// release. One attempt per member per pass, no inner loop. The id rule is checked, and the mode is
+/// re-read, immediately before each release; while `Owned` nothing is released. Only this thread
+/// commits, so a non-Owned reading cannot be overtaken between the check and the release.
+///
+/// `cancel_typing(true)` runs at most ONCE per pass, lazily before the first release: no typing can
+/// start in between (Text is injected by this same thread, after the fences), so it is equivalent to
+/// the per-member cancel `release_keys` does, without freezing capture for several 5 s waits when a
+/// typist is stuck in `SendInput`.
+fn run_arb_fences(st: &mut ArbFenceState, arb: &InputArbiterHub, coordinator: &InputCoordinator) {
+    let now = std::time::Instant::now();
+    let cancelled = std::cell::Cell::new(false);
+    // true = released (or nothing to release)
+    let release = |m: u64| {
+        if !cancelled.replace(true) {
+            coordinator.os_sink.cancel_typing(true);
+        }
+        coordinator.release_keys_after_cancel(m)
+    };
+    let ArbFenceState { fences, owed } = st;
+    fences.retain_mut(|f| {
+        if arb.transition_in_flight(f.id) {
+            f.members.retain(|m| !release(*m));
+            if f.members.is_empty() {
+                if let Some(done) = f.done.take() {
+                    let _ = done.send(arb.commit(f.id));
+                }
+                return false;
+            }
+            return true;
+        }
+        if let Some(done) = f.done.take() {
+            let _ = done.send(arb.commit(f.id));
+        }
+        if matches!(arb.mode(), Mode::Owned { .. } | Mode::Unowned) || f.members.is_empty() {
+            return false;
+        }
+        let at = arb.last_committed();
+        if let Some(o) = owed.as_mut().filter(|o| o.at_commit == at) {
+            for m in f.members.drain(..) {
+                if !o.members.contains(&m) {
+                    o.members.push(m);
+                }
+            }
+        } else {
+            // No set, or one from before a later commit (which already settled it): start afresh.
+            let mut members: Vec<u64> = Vec::new();
+            for m in f.members.drain(..) {
+                if !members.contains(&m) {
+                    members.push(m);
+                }
+            }
+            *owed = Some(OwedSet {
+                at_commit: at,
+                members,
+                since: now,
+                next_log: now + OWED_FIRST_LOG,
+                announced: false,
+            });
+        }
+        false
+    });
+
+    if let Some(o) = owed.as_mut() {
+        let mut keep = Vec::with_capacity(o.members.len());
+        let mut dropped = false;
+        for m in std::mem::take(&mut o.members) {
+            if arb.last_committed() != o.at_commit {
+                dropped = true;
+                break;
+            }
+            match arb.mode() {
+                Mode::Unowned => {
+                    dropped = true;
+                    break;
+                }
+                Mode::Owned { .. } => keep.push(m),
+                Mode::Blocked | Mode::Transitioning { .. } => {
+                    if !release(m) {
+                        keep.push(m);
+                    }
+                }
+            }
+        }
+        if dropped || keep.is_empty() {
+            *owed = None;
+        } else {
+            o.members = keep;
+            if !o.announced {
+                o.announced = true;
+                tracing::warn!(
+                    sessions = ?o.members,
+                    "input hand-off: a superseded fence still owes key releases; retrying every pass until the OS accepts or a later commit settles input"
+                );
+            } else if now >= o.next_log {
+                o.next_log = now + OWED_REPEAT_LOG;
+                let held: Vec<(u64, Vec<u32>)> =
+                    o.members.iter().map(|m| (*m, coordinator.held_key_codes(*m))).collect();
+                tracing::error!(
+                    held_vk_codes = ?held,
+                    owed_secs = now.duration_since(o.since).as_secs(),
+                    "input hand-off: key releases are STILL refused for a superseded fence; input stays blocked until the OS accepts them"
+                );
+            }
+        }
+    }
+    arb.releases_owed.store(owed.is_some(), Ordering::SeqCst);
+}
+
 /// The shared capture loop. Runs on a dedicated thread until `stop` is set.
 ///
 /// Each iteration:
@@ -2077,8 +3159,7 @@ fn capture_thread<C: ScreenCapturer>(
     // Revocation releases that failed, retried while their revocation is current (see release_keys).
     let mut deferred_key_releases: Vec<(u64, Arc<Admission>, u64)> = Vec::new();
     // In-flight hand fences (docs/61): members still to quiesce, then commit + report via `done`.
-    let mut deferred_arb_fences: Vec<(u64, Vec<u64>, std::sync::mpsc::Sender<CommitOutcome>)> =
-        Vec::new();
+    let mut deferred_arb_fences = ArbFenceState::default();
     // What capture actually costs and delivers, logged every 10 s while sessions watch (debug).
     let mut cap_stats = CaptureStats::new();
     // The `joins` value the last successful publication answered (docs/52 §4.3).
@@ -2154,7 +3235,7 @@ fn capture_thread<C: ScreenCapturer>(
                     }
                 }
                 CaptureControl::ArbFence { id, members, done } => {
-                    deferred_arb_fences.push((id, members, done));
+                    deferred_arb_fences.fences.push(DeferredFence { id, members, done: Some(done) });
                 }
             }
         }
@@ -2171,34 +3252,10 @@ fn capture_thread<C: ScreenCapturer>(
         // docs/61 stage 2: quiesce an in-flight hand's fenced members on THIS (desktop-following)
         // thread, retrying failures each iteration — the transition commits only once every fenced
         // member is clean (design D3), judged against the target's liveness at that instant.
-        deferred_arb_fences.retain_mut(|(id, members, done)| {
-            // Abandon a SUPERSEDED fence before running any more cleanup (Codex r2 H1): if the
-            // target tore down (→ Blocked) and another controller claimed, this id is no longer
-            // in flight, and its release_keys would cancel the new owner's typing and free its
-            // fresh holds. Report the non-Owned outcome (commit returns StaleTransition here) and
-            // stop; the recovery claim commits through its own, empty, fence.
-            if !arb.transition_in_flight(*id) {
-                // Superseded. If input is now Blocked, nobody is admitted, so the holds this fence owed
-                // belong to an interval that is over and nobody holds anything fresh: release them once,
-                // best effort, rather than leave a modifier down on the guest's machine (cross-stage
-                // review). Under any newer owner, touch nothing (Codex r2 H1); the claim that ended
-                // Blocked fences every participant itself.
-                if arb.mode() == Mode::Blocked {
-                    for m in members.iter() {
-                        let _ = coordinator.release_keys(*m);
-                    }
-                }
-                let _ = done.send(arb.commit(*id));
-                return false;
-            }
-            members.retain(|m| !coordinator.release_keys(*m));
-            if members.is_empty() {
-                let _ = done.send(arb.commit(*id));
-                false
-            } else {
-                true
-            }
-        });
+        run_arb_fences(&mut deferred_arb_fences, &arb, &coordinator);
+        // docs/73 2.2.3 (c): request timers and the request-driven deadline, from this thread too, so no
+        // single stalled thread can leave a request pending forever (one atomic read when nothing is due).
+        arb.sweep_if_due(Instant::now());
 
         // 2. Retry any pending failed key-up/button-up releases.
         coordinator.retry_pending_releases();
@@ -2451,7 +3508,7 @@ mod tests {
     // ── Synthetic capturer ────────────────────────────────────────────────────────────────────────
 
     /// A capturer that emits a fixed number of frames then returns `CaptureUnavailable` forever.
-    struct SyntheticCapturer {
+    pub(super) struct SyntheticCapturer {
         frames: std::sync::Mutex<Vec<CapturedFrame>>,
         /// Number of `capture_frame` calls so far: the capture thread calls it exactly once per
         /// loop iteration, AFTER its control/input drains, so it doubles as an iteration clock
@@ -2465,7 +3522,7 @@ mod tests {
     }
 
     impl SyntheticCapturer {
-        fn with_frames(n: usize) -> Self {
+        pub(super) fn with_frames(n: usize) -> Self {
             let frames = (0..n)
                 .map(|i| CapturedFrame {
                     monitor_id: 0,
@@ -2562,7 +3619,7 @@ mod tests {
 
     /// [`SharedCapture::spawn`] with a recording coordinator: identical mux/lease/cleanup logic,
     /// only the final OS injection is replaced.
-    fn spawn_recorded<C: ScreenCapturer + Send + 'static>(
+    pub(super) fn spawn_recorded<C: ScreenCapturer + Send + 'static>(
         capturer: C,
         fps: u32,
         stop: Arc<AtomicBool>,
@@ -6118,6 +7175,340 @@ mod tests {
         thread.join().unwrap();
     }
 
+    // ── docs/73 2.2.8 (a): the owed, release-only set ────────────────────────────────────────────
+
+    /// OS sink counting key-up attempts of one code (they fail while `failing` is set) and typing
+    /// cancels.
+    struct CountingKeyUp {
+        code: u32,
+        failing: Arc<AtomicBool>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        cancels: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl InputSink for CountingKeyUp {
+        fn inject(&self, event: InputEvent) -> PlatformResult<()> {
+            if matches!(event, InputEvent::Key { code, down: false } if code == self.code) {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if self.failing.load(Ordering::SeqCst) {
+                    return Err(PlatformError::InputRefused("key-up refused".into()));
+                }
+            }
+            Ok(())
+        }
+        fn cancel_typing(&self, _wait: bool) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    const OWED_KEY: u32 = 0x53;
+    /// A key whose key-up is never refused (a second member's hold).
+    const CLEAN_KEY: u32 = 0x54;
+
+    /// A hub + coordinator driven by hand (no capture thread), so every pass is deterministic.
+    struct OwedRig {
+        hub: InputArbiterHub,
+        coord: Arc<InputCoordinator>,
+        failing: Arc<AtomicBool>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        cancels: Arc<std::sync::atomic::AtomicUsize>,
+        st: ArbFenceState,
+        done: std::sync::mpsc::Receiver<CommitOutcome>,
+    }
+
+    impl OwedRig {
+        /// Sessions 1, 2, 3 registered and eligible. Session 2 owns input and holds `OWED_KEY`;
+        /// its hand to session 1 begins (fence over session 2), then session 1 leaves, which
+        /// supersedes the fence (mode `Blocked`). The fence is queued but NOT yet run.
+        fn superseded() -> Self {
+            let failing = Arc::new(AtomicBool::new(true));
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let coord = Arc::new(InputCoordinator::with_injector(Box::new(CountingKeyUp {
+                code: OWED_KEY,
+                failing: Arc::clone(&failing),
+                attempts: Arc::clone(&attempts),
+                cancels: Arc::clone(&cancels),
+            })));
+            let hub = InputArbiterHub::new();
+            for h in 1..=3 {
+                hub.register(h);
+                hub.set_control_eligible(h, true);
+            }
+            let t = hub.begin_by_handle(1, 2).unwrap();
+            assert!(matches!(hub.commit(t.id), CommitOutcome::Owned { .. }));
+            coord.inject(2, InputEvent::Key { code: OWED_KEY, down: true }).unwrap();
+            let t = hub.begin_by_handle(2, 1).unwrap();
+            let (tx, done) = std::sync::mpsc::channel();
+            let st = ArbFenceState {
+                fences: vec![DeferredFence { id: t.id, members: vec![2], done: Some(tx) }],
+                owed: None,
+            };
+            hub.teardown_by_handle(1);
+            assert_eq!(hub.mode(), Mode::Blocked);
+            Self { hub, coord, failing, attempts, cancels, st, done }
+        }
+
+        fn pass(&mut self) {
+            run_arb_fences(&mut self.st, &self.hub, &self.coord);
+        }
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+        fn cancels(&self) -> usize {
+            self.cancels.load(Ordering::SeqCst)
+        }
+        fn held(&self) -> bool {
+            self.coord.state.lock().unwrap().key_holders.contains_key(&OWED_KEY)
+        }
+        fn nothing_queued(&self) -> bool {
+            self.st.fences.is_empty() && self.st.owed.is_none()
+        }
+        /// A claim by session 3 commits (changes `last_committed`).
+        fn claim_by_3(&self) {
+            let t = self.hub.begin_by_handle(3, 3).unwrap();
+            assert!(matches!(self.hub.commit(t.id), CommitOutcome::Owned { .. }));
+        }
+        /// A claim by session 3 begins (Transitioning) and is queued as an in-flight fence over
+        /// `members`; returns the receiver for its outcome.
+        fn begin_claim_fence(&mut self, members: Vec<u64>) -> std::sync::mpsc::Receiver<CommitOutcome> {
+            let t = self.hub.begin_by_handle(3, 3).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.st.fences.push(DeferredFence { id: t.id, members, done: Some(tx) });
+            rx
+        }
+    }
+
+    /// A refused release leaves the superseded fence owed: it answers `done` once with the stale
+    /// outcome, retries one attempt per pass, and clears the hold once the OS accepts.
+    #[test]
+    fn owed_fence_retries_refused_release_until_the_os_accepts() {
+        let mut r = OwedRig::superseded();
+        assert!(!r.hub.releases_owed());
+        r.pass();
+        assert_eq!(r.done.try_recv(), Ok(CommitOutcome::StaleTransition), "the waiting hand is answered once");
+        assert!(r.hub.releases_owed(), "an owed set exists");
+        assert_eq!(r.attempts(), 1);
+        for n in 2..=5 {
+            r.pass();
+            assert_eq!(r.attempts(), n, "exactly one attempt per pass");
+            assert!(r.held() && r.st.owed.is_some(), "still owed while refused");
+        }
+        assert!(r.done.try_recv().is_err(), "done is never answered again");
+        assert_eq!(r.hub.mode(), Mode::Blocked);
+        r.failing.store(false, Ordering::SeqCst);
+        r.pass();
+        assert!(!r.held(), "the OS accepted: the hold is cleared");
+        assert!(r.nothing_queued());
+        assert!(!r.hub.releases_owed(), "releases_owed clears with the set");
+        let a = r.attempts();
+        r.pass();
+        assert_eq!(r.attempts(), a, "nothing left to release");
+    }
+
+    /// A later commit drops the set WITHOUT another release, including when Owned was entered and
+    /// left between two passes (so the mode alone would have missed it).
+    #[test]
+    fn owed_fence_is_dropped_by_any_commit_even_if_owned_came_and_went() {
+        let mut r = OwedRig::superseded();
+        r.pass();
+        let a = r.attempts();
+        assert!(r.hub.releases_owed());
+        r.claim_by_3();
+        r.hub.teardown_by_handle(3); // Owned left again before the next pass
+        assert_eq!(r.hub.mode(), Mode::Blocked);
+        r.pass();
+        assert_eq!(r.attempts(), a, "dropped by the id rule, with no release attempt");
+        assert!(r.nothing_queued());
+        assert!(!r.hub.releases_owed());
+        assert!(r.held(), "the unreleased hold stays recorded for the later claim's fence");
+    }
+
+    /// M1: an in-flight claim with clean members and an owed set in the same pass: the claim commits
+    /// first and the owed set is then dropped with ZERO further attempts for the owed member (the
+    /// owed stage must not run before, or without regard to, a commit made in this pass).
+    #[test]
+    fn a_commit_in_the_same_pass_drops_the_owed_set_before_any_release() {
+        let mut r = OwedRig::superseded();
+        r.pass();
+        assert!(r.st.owed.is_some());
+        let a = r.attempts();
+        let rx = r.begin_claim_fence(vec![]);
+        r.pass();
+        assert!(matches!(rx.try_recv(), Ok(CommitOutcome::Owned { .. })), "the claim committed");
+        assert!(matches!(r.hub.mode(), Mode::Owned { .. }));
+        assert_eq!(r.attempts(), a, "no extra key-up attempt for the owed member");
+        assert!(r.nothing_queued() && !r.hub.releases_owed());
+    }
+
+    /// M2: a fence first observed as superseded while the mode is already Owned (a claim committed
+    /// before the first pass) is answered stale and dropped without ever releasing or becoming owed.
+    #[test]
+    fn a_fence_first_seen_superseded_under_owned_is_dropped_without_release() {
+        let mut r = OwedRig::superseded();
+        r.claim_by_3();
+        r.pass();
+        assert_eq!(r.done.try_recv(), Ok(CommitOutcome::StaleTransition));
+        assert_eq!(r.attempts(), 0);
+        assert!(r.nothing_queued());
+        assert!(!r.hub.releases_owed());
+    }
+
+    /// Registry empty (Unowned) drops the set; the departed session's keys stay covered by
+    /// `pending_retry_sessions`, which keeps retrying until the OS accepts.
+    #[test]
+    fn owed_fence_is_dropped_on_unowned_and_departed_keys_stay_retried() {
+        let mut r = OwedRig::superseded();
+        r.pass();
+        let a = r.attempts();
+        r.coord.release_session(2); // what a departing session's teardown does
+        r.hub.teardown_by_handle(3);
+        r.hub.teardown_by_handle(2);
+        assert_eq!(r.hub.mode(), Mode::Unowned);
+        let b = r.attempts();
+        assert!(b > a, "premise: release_session tried and was refused");
+        r.pass();
+        assert_eq!(r.attempts(), b, "no owed release in Unowned");
+        assert!(r.nothing_queued() && !r.hub.releases_owed());
+        assert!(r.coord.state.lock().unwrap().pending_retry_sessions.contains(&2));
+        r.failing.store(false, Ordering::SeqCst);
+        r.coord.retry_pending_releases();
+        assert!(!r.held() && !r.coord.state.lock().unwrap().pending_retry_sessions.contains(&2));
+    }
+
+    /// While the mode is Owned an owed set never releases (the mode is re-read before each
+    /// release). Such a state cannot arise through commits (they change the id), so it is built by hand
+    /// to prove the guard itself; the set is kept, not dropped, by the guard alone.
+    #[test]
+    fn owed_fence_never_releases_while_owned() {
+        let mut r = OwedRig::superseded();
+        r.st.fences.clear();
+        r.claim_by_3();
+        assert!(matches!(r.hub.mode(), Mode::Owned { .. }));
+        let now = std::time::Instant::now();
+        r.st.owed = Some(OwedSet {
+            at_commit: r.hub.last_committed(),
+            members: vec![2],
+            since: now,
+            next_log: now,
+            announced: true,
+        });
+        for _ in 0..3 {
+            r.pass();
+        }
+        assert_eq!(r.attempts(), 0, "no release under Owned");
+        assert!(r.st.owed.is_some());
+        assert!(r.hub.releases_owed());
+    }
+
+    /// The release retry also runs while a newer claim is `Transitioning` (nobody is admitted),
+    /// and the set survives that claim being superseded back to `Blocked` (no commit happened).
+    #[test]
+    fn owed_fence_survives_a_claim_that_falls_back_to_blocked() {
+        let mut r = OwedRig::superseded();
+        r.pass();
+        let _claim = r.hub.begin_by_handle(3, 3).unwrap();
+        assert!(matches!(r.hub.mode(), Mode::Transitioning { .. }));
+        let a = r.attempts();
+        r.pass();
+        assert_eq!(r.attempts(), a + 1, "retries during the newer claim's Transitioning");
+        r.hub.teardown_by_handle(3); // the claimant leaves: back to Blocked, nothing committed
+        assert_eq!(r.hub.mode(), Mode::Blocked);
+        r.pass();
+        assert_eq!(r.attempts(), a + 2);
+        assert!(r.st.owed.is_some(), "still owed");
+    }
+
+    /// L1: repeated superseded fences naming the same session merge into ONE owed set: one release
+    /// attempt per pass, not one per fence.
+    #[test]
+    fn repeated_superseded_fences_for_one_session_cost_one_attempt_per_pass() {
+        let mut r = OwedRig::superseded();
+        r.pass();
+        let mut last = r.attempts();
+        for _ in 0..3 {
+            // A claim begins and is superseded back to Blocked again, its fence naming session 2 too.
+            let t = r.hub.begin_by_handle(3, 3).unwrap();
+            r.st.fences.push(DeferredFence { id: t.id, members: vec![2], done: None });
+            r.hub.set_control_eligible(3, false); // the claimant loses eligibility: back to Blocked
+            r.hub.set_control_eligible(3, true);
+            assert_eq!(r.hub.mode(), Mode::Blocked);
+            r.pass();
+            assert_eq!(r.attempts(), last + 1, "one attempt for the merged set, not one per fence");
+            last = r.attempts();
+            assert_eq!(r.st.owed.as_ref().map(|o| o.members.clone()), Some(vec![2]), "deduplicated");
+            assert!(r.st.fences.is_empty());
+        }
+    }
+
+    /// L3: typing is cancelled at most once per pass however many members release, and not at all
+    /// when there is nothing to release.
+    #[test]
+    fn typing_is_cancelled_at_most_once_per_pass() {
+        let mut r = OwedRig::superseded();
+        r.coord.inject(3, InputEvent::Key { code: CLEAN_KEY, down: true }).unwrap();
+        r.st.fences[0].members = vec![2, 3];
+        r.pass();
+        assert_eq!(r.cancels(), 1, "two members, one cancel");
+        r.pass();
+        assert_eq!(r.cancels(), 2, "one more pass, one more cancel");
+        r.failing.store(false, Ordering::SeqCst);
+        r.pass();
+        assert_eq!(r.cancels(), 3);
+        assert!(r.nothing_queued());
+        r.pass();
+        assert_eq!(r.cancels(), 3, "an empty pass never cancels");
+    }
+
+    /// The same thing through the REAL capture thread: a stuck hand fence superseded by its target
+    /// leaving keeps retrying (`releases_owed` is up) until the OS accepts; the entry then clears.
+    #[test]
+    fn capture_thread_keeps_owed_release_until_accepted_then_clears_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let failing = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coordinator = Arc::new(InputCoordinator::with_injector(Box::new(CountingKeyUp {
+            code: OWED_KEY,
+            failing: Arc::clone(&failing),
+            attempts: Arc::clone(&attempts),
+            cancels: Arc::default(),
+        })));
+        let (cap, thread) =
+            SharedCapture::spawn_inner(SyntheticCapturer::with_frames(0), 60, Arc::clone(&stop), coordinator, false);
+        let a = cap.new_session_input();
+        let b = cap.new_session_input();
+        cap.arb.set_control_eligible(a.session_id, true);
+        cap.arb.set_control_eligible(b.session_id, true);
+        a.send(InputEvent::Key { code: OWED_KEY, down: true }).unwrap();
+        wait_for(|| holds_key(&cap, OWED_KEY, a.session_id), "A's hold");
+
+        // Poll a result slot instead of join()ing, so a regression fails fast instead of hanging.
+        let cap_hand = cap.clone();
+        let (asid, bsid) = (a.session_id, b.session_id);
+        let outcome: Arc<Mutex<Option<Result<CommitOutcome, HandError>>>> = Arc::new(Mutex::new(None));
+        let outcome_w = Arc::clone(&outcome);
+        let hand = std::thread::spawn(move || {
+            let r = cap_hand.hand_input_control(asid, bsid);
+            *outcome_w.lock().unwrap() = Some(r);
+        });
+        wait_for(|| matches!(cap.arb.mode(), Mode::Transitioning { .. }), "the hand to begin");
+        drop(b);
+        wait_for(|| cap.arb.mode() == Mode::Blocked, "Blocked after the target left");
+        wait_for(|| outcome.lock().unwrap().is_some(), "the superseded hand to resolve");
+        assert_eq!(outcome.lock().unwrap().take().unwrap(), Ok(CommitOutcome::StaleTransition));
+        hand.join().unwrap();
+        wait_for(|| cap.arb.releases_owed(), "the owed flag");
+        let seen = attempts.load(Ordering::SeqCst);
+        wait_for(|| attempts.load(Ordering::SeqCst) >= seen + 3, "retries across passes");
+        assert!(holds_key(&cap, OWED_KEY, a.session_id));
+        failing.store(false, Ordering::SeqCst);
+        wait_for(|| !cap.arb.releases_owed(), "the owed flag to clear after the OS accepted");
+        assert!(key_has_no_holder(&cap, OWED_KEY));
+        assert_eq!(cap.arb.mode(), Mode::Blocked);
+
+        stop.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+    }
+
     /// r2 H2: a stale same-session release (an old-interval key-up) must NOT free a hold the same
     /// session made after regaining ownership. Ownership goes A → B → A, then A (owner) holds Shift
     /// under the new epoch; a Shift-up stamped with a prior epoch must be dropped at the gate.
@@ -6445,4 +7836,15 @@ mod cancel_typing_tests {
         c.release_session(7);
         assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
+}
+
+#[cfg(test)]
+#[path = "shared_capture_request_tests.rs"]
+mod request_tests;
+
+/// A real capture thread over a recording (never the real keyboard) coordinator, for the host-level
+/// request-for-control tests in `request_wire`.
+#[cfg(test)]
+pub(crate) fn spawn_for_request_tests(stop: Arc<AtomicBool>) -> (SharedCapture, std::thread::JoinHandle<()>) {
+    tests::spawn_recorded(tests::SyntheticCapturer::with_frames(0), 60, stop)
 }

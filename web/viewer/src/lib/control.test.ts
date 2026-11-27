@@ -29,6 +29,7 @@ import {
   type DirectoryListing,
   type RecordingResult,
 } from "./control";
+import inputRequestVectors from "../../../../crates/protocol/testdata/input-request-control-vectors.json";
 
 const dec = (u: Uint8Array) => new TextDecoder().decode(u);
 
@@ -1735,5 +1736,68 @@ describe("ControlClient", () => {
     } finally {
       debug.mockRestore();
     }
+  });
+});
+
+describe("docs/73 request-for-control codec (shared vectors with crates/agent-core)", () => {
+  const vectors = inputRequestVectors.vectors as Array<{ name: string; wire: string }>;
+  const invalid = inputRequestVectors.invalid as Array<{ name: string; wire: string }>;
+
+  it("every vector decodes and re-encodes to exactly the same bytes", () => {
+    expect(vectors.length).toBeGreaterThanOrEqual(40);
+    for (const v of vectors) {
+      const msg = decodeControl(new TextEncoder().encode(v.wire));
+      expect(dec(encodeControl(msg)), v.name).toBe(v.wire);
+    }
+  });
+
+  it("every malformed frame is refused", () => {
+    for (const v of invalid) {
+      expect(() => decodeControl(new TextEncoder().encode(v.wire)), v.name).toThrow();
+    }
+  });
+
+  it("agent messages reach the one request handler; the client methods send the pinned bytes", () => {
+    const seen: string[] = [];
+    const sent: Uint8Array[] = [];
+    const client = new ControlClient((p) => sent.push(p), { onInputRequestMessage: (m) => seen.push(m.t) });
+    for (const v of vectors) {
+      const msg = decodeControl(new TextEncoder().encode(v.wire));
+      if (
+        msg.t === "InputRequestAvailable" ||
+        msg.t === "InputControlRequestPending" ||
+        msg.t === "InputControlRequestResult" ||
+        msg.t === "InputControlRequested" ||
+        msg.t === "InputControlRequestWithdrawn"
+      ) {
+        client.handleMessage(new TextEncoder().encode(v.wire));
+      }
+    }
+    expect(seen.length).toBeGreaterThan(30);
+    expect(new Set(seen)).toEqual(
+      new Set([
+        "InputRequestAvailable",
+        "InputControlRequestPending",
+        "InputControlRequestResult",
+        "InputControlRequested",
+        "InputControlRequestWithdrawn",
+      ]),
+    );
+    const cid = "aaaaaaaa-1111-4222-8333-444444444444";
+    const rid = "bbbbbbbb-5555-4666-8777-888888888888";
+    client.announceInputRequestCapable();
+    client.requestInputControl(cid);
+    client.requestInputControl(cid, true);
+    client.withdrawInputControlRequest(cid);
+    client.inputControlPromptShown(rid);
+    client.answerInputControlRequest(rid, true);
+    expect(sent.map(dec)).toEqual([
+      `{"t":"InputRequestCapable","c":{}}`,
+      `{"t":"RequestInputControl","c":{"client_request_id":"${cid}","retry":false}}`,
+      `{"t":"RequestInputControl","c":{"client_request_id":"${cid}","retry":true}}`,
+      `{"t":"WithdrawInputControlRequest","c":{"client_request_id":"${cid}"}}`,
+      `{"t":"InputControlPromptShown","c":{"request_id":"${rid}"}}`,
+      `{"t":"AnswerInputControlRequest","c":{"request_id":"${rid}","accept":true}}`,
+    ]);
   });
 });

@@ -361,6 +361,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 	})
+	// Keep a quiet but live peer connected (2026-11-27): a browser console sends nothing after it
+	// joins, so without a server ping its socket was reaped at readTimeout (60 s by default) and the
+	// console lost its roster and signaling id mid-session. Browsers answer pings automatically and the
+	// pong handler above refreshes the deadline. WriteControl is safe alongside the other writers. The
+	// absolute pre-auth deadline (lease) is separate, so pings never keep an unauthenticated peer alive.
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go pingLoop(conn, s.readTimeout/3, pingDone)
 
 	for {
 		_, data, err := conn.ReadMessage()
@@ -675,6 +683,29 @@ func (s *Server) handleAgentAuthResponse(self *Peer, p *AgentAuthResponse) {
 }
 
 // cleanup evicts a dropped connection from the registry and tears down its sessions.
+// pingWriteTimeout bounds one ping write so a stalled peer cannot pin the ping goroutine.
+const pingWriteTimeout = 5 * time.Second
+
+// pingLoop sends a WebSocket ping every interval until done is closed or a ping fails (the read loop
+// then ends the connection through its own deadline). interval <= 0 disables it.
+func pingLoop(conn *websocket.Conn, interval time.Duration, done <-chan struct{}) {
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(pingWriteTimeout)); err != nil {
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) cleanup(self *Peer) {
 	self.wake.disconnected.Store(true)
 	// Flush any suppressed log lines before tearing down. All dispatch calls for this

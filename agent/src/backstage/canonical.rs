@@ -269,6 +269,8 @@ impl CanonicalWriter {
 //     credential_use        : str(username), str(domain), str(purpose)
 //     consent_signal        : u8(user_notified 0|1), str(policy)
 //     input_control_handed  : uuid(from_session), uuid(from_technician), uuid(to_session), uuid(to_technician), u64be(epoch)   // docs/61
+//     input_control_requested      : uuid(request_id), uuid(requester_session), uuid(requester_technician), uuid(holder_session), uuid(holder_technician), u64be(epoch)   // docs/73
+//     input_control_request_closed : the same six fields, then str(outcome)   // docs/73; outcome one of granted|declined|expired|undelivered|cancelled|replaced|holder_changed|already_satisfied|failed|ineligible
 //   RunAs (serde tag "as"):     system : () | logged_in_user : str(username) | credential : str(username), str(domain)
 //   Direction (unit):           str("input") | str("output")
 //   Outcome (serde tag "result"): ok : () | denied : str(reason) | failed : str(error)
@@ -317,6 +319,8 @@ pub fn audit_action_name(a: &AuditAction) -> &'static str {
         RecordingStarted { .. } => "recording_started",
         RecordingStopped { .. } => "recording_stopped",
         InputControlHanded { .. } => "input_control_handed",
+        InputControlRequested { .. } => "input_control_requested",
+        InputControlRequestClosed { .. } => "input_control_request_closed",
     }
 }
 
@@ -458,6 +462,33 @@ fn encode_action(w: &mut CanonicalWriter, a: &AuditAction) {
                 .raw16(to_session.as_bytes())
                 .raw16(to_technician.as_bytes())
                 .u64(*epoch);
+        }
+        // docs/73 2.2.5. Go's `encodeAuditAction` mirrors this byte-for-byte (build step d); the shared vectors
+        // `crates/protocol/testdata/input-request-audit-vectors.json` pin it from both sides.
+        InputControlRequested { request_id, requester_session, requester_technician, holder_session, holder_technician, epoch } => {
+            w.raw16(request_id.as_bytes())
+                .raw16(requester_session.as_bytes())
+                .raw16(requester_technician.as_bytes())
+                .raw16(holder_session.as_bytes())
+                .raw16(holder_technician.as_bytes())
+                .u64(*epoch);
+        }
+        InputControlRequestClosed {
+            request_id,
+            requester_session,
+            requester_technician,
+            holder_session,
+            holder_technician,
+            epoch,
+            outcome,
+        } => {
+            w.raw16(request_id.as_bytes())
+                .raw16(requester_session.as_bytes())
+                .raw16(requester_technician.as_bytes())
+                .raw16(holder_session.as_bytes())
+                .raw16(holder_technician.as_bytes())
+                .u64(*epoch)
+                .lp_str(outcome.name());
         }
     }
 }
@@ -652,8 +683,25 @@ mod tests {
                 directory: "d".into(),
             },
             AuditAction::InputControlHanded { from_session: u, from_technician: u, to_session: u, to_technician: u, epoch: 1 },
+            AuditAction::InputControlRequested {
+                request_id: u,
+                requester_session: u,
+                requester_technician: u,
+                holder_session: u,
+                holder_technician: u,
+                epoch: 1,
+            },
+            AuditAction::InputControlRequestClosed {
+                request_id: u,
+                requester_session: u,
+                requester_technician: u,
+                holder_session: u,
+                holder_technician: u,
+                epoch: 1,
+                outcome: crate::backstage::audit::InputRequestAuditOutcome::Granted,
+            },
         ];
-        assert_eq!(actions.len(), 18, "every AuditAction variant must be covered");
+        assert_eq!(actions.len(), 20, "every AuditAction variant must be covered");
         for a in &actions {
             let v = serde_json::to_value(a).unwrap();
             assert_eq!(v["kind"].as_str().unwrap(), audit_action_name(a), "action {a:?}");

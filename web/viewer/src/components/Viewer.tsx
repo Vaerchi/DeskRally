@@ -386,6 +386,8 @@ export interface ViewerProps {
   inputPanelExtras?: ReactNode;
   disconnectLabel?: string;
   popoutControls?: ReactNode;
+  /** Drawn over the viewer element (so it also shows in full screen): the docs/73 holder prompt. */
+  overlay?: ReactNode;
   onPopoutChange?: (open: boolean) => void;
   /** Live transport. If omitted, the viewer runs in local preview mode. */
   transport?: Transport;
@@ -731,6 +733,7 @@ export function Viewer({
   tabHost,
   disconnectLabel = "Disconnect",
   popoutControls,
+  overlay,
   onPopoutChange,
   transport,
   lockSyncSupported = false,
@@ -2855,6 +2858,7 @@ export function Viewer({
 
   return (
     <div className={`viewer${mobileFs ? " viewer--mobilefs" : ""}`} ref={viewerRef}>
+      {overlay}
       {fsHint && (
         <div className="viewer__fshint" role="status" data-testid="fullscreen-hint">
           Press <kbd>Shift</kbd>+<kbd>Esc</kbd> to exit full screen

@@ -1,0 +1,395 @@
+{
+  "comment": "docs/73 2.2.5 input_control_requested / input_control_request_closed vectors. The Rust encoder asserts them in agent/src/backstage/audit.rs; the Go encoder (control-plane/audit_canonical.go) must produce the same preimage and hash. The envelope is the audit_golden_vector_v1 one (session 1111..., technician 2222..., machine 3333...), outcome ok.",
+  "invalid": [
+    {
+      "action": {
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_requested",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "requested: missing epoch"
+    },
+    {
+      "action": {
+        "epoch": "7",
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_requested",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "requested: wrong-type epoch (string)"
+    },
+    {
+      "action": {
+        "epoch": 1,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_requested",
+        "request_id": "not-a-uuid",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "requested: bad UUID"
+    },
+    {
+      "action": {
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": "granted",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: missing epoch"
+    },
+    {
+      "action": {
+        "epoch": 1,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: missing outcome"
+    },
+    {
+      "action": {
+        "epoch": 1,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": "",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: empty outcome"
+    },
+    {
+      "action": {
+        "epoch": 1,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": "bogus",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: unknown outcome"
+    },
+    {
+      "action": {
+        "epoch": 1,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": 7,
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: wrong-type outcome (number)"
+    },
+    {
+      "action": {
+        "epoch": "1",
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": "granted",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: wrong-type epoch (string)"
+    },
+    {
+      "action": {
+        "epoch": 1,
+        "holder_session": "zzzz",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": "granted",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "name": "closed: bad UUID"
+    }
+  ],
+  "vectors": [
+    {
+      "action": {
+        "epoch": 7,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_requested",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "b499b14d96dce6b5a166948687eb9da6330fb26fe60d35239c12309c60f63445",
+      "name": "requested: five distinct ids",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc09140000000017696e7075745f636f6e74726f6c5f72657175657374656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc0000000000050000000000000007000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 72623859790382856,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_requested",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "9cf99a3d233eb6eea0eb74eea64107a8b16a288b46e7acc9e829ced0e653bd47",
+      "name": "requested: all-nil ids, epoch with distinct bytes",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc09140000000017696e7075745f636f6e74726f6c5f72657175657374656400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000102030405060708000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 7,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "granted",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "888ec758e9264d24735e8fbbb19f437cfc34ef9af4ea71cd7ed905954c1041dc",
+      "name": "closed: granted, five distinct ids",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc0000000000050000000000000007000000076772616e746564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 0,
+        "holder_session": "00000000-0000-0000-0000-000000000000",
+        "holder_technician": "00000000-0000-0000-0000-000000000000",
+        "kind": "input_control_request_closed",
+        "outcome": "failed",
+        "request_id": "00000000-0000-0000-0000-000000000000",
+        "requester_session": "00000000-0000-0000-0000-000000000000",
+        "requester_technician": "00000000-0000-0000-0000-000000000000"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "4a54e1f9ac087dd456fa984bc9d366b9a637d712df03deafbfdace9a5568a4c4",
+      "name": "closed: failed, all-nil ids",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000066661696c6564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "granted",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "bc14c6c638152453dbca197aa036e63a0a0b806ad9b21017aad2d6559d772b58",
+      "name": "closed: outcome granted",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc0000000000050000000000000009000000076772616e746564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "declined",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "7ee80abb9943deecc3b823f15476f3cb04c796da2c21c48a5c171e4db8d10174",
+      "name": "closed: outcome declined",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc0000000000050000000000000009000000086465636c696e6564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "expired",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "948f24d9f45b203e7589b485feb241dafa5b2c4ee928a814767bd9974c3f544e",
+      "name": "closed: outcome expired",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc00000000000500000000000000090000000765787069726564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "undelivered",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "185e7eeaaf2a04cc0ca8027b57063cfb256223c6d23b9566ae7b93f13851ff7d",
+      "name": "closed: outcome undelivered",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc00000000000500000000000000090000000b756e64656c697665726564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "cancelled",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "be4ea1cb95ade7acc121716aa2c8864f7fac0231f678640869bd320b4ab22cbf",
+      "name": "closed: outcome cancelled",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc00000000000500000000000000090000000963616e63656c6c6564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "replaced",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "43685c918e3c47b7caaeaf5b8763623a3f7819b26bfc3fbd120604f77ebb534d",
+      "name": "closed: outcome replaced",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc0000000000050000000000000009000000087265706c61636564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "holder_changed",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "578e9d36b57f5c7a425604d490111c148695c28be663b41a56ff56d74816ce56",
+      "name": "closed: outcome holder_changed",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc00000000000500000000000000090000000e686f6c6465725f6368616e676564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "already_satisfied",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "4c84a743610b63630b14620223956f31cc39209d551018457bbc40fa492456ac",
+      "name": "closed: outcome already_satisfied",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc000000000005000000000000000900000011616c72656164795f736174697366696564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "failed",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "f489505674c14e31711204fcae8f1d6ccf6ed8f7b767402534e5d1fa0d8b4f78",
+      "name": "closed: outcome failed",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc0000000000050000000000000009000000066661696c6564000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    },
+    {
+      "action": {
+        "epoch": 9,
+        "holder_session": "44444444-aaaa-4bbb-8ccc-000000000004",
+        "holder_technician": "55555555-aaaa-4bbb-8ccc-000000000005",
+        "kind": "input_control_request_closed",
+        "outcome": "ineligible",
+        "request_id": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "requester_session": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "requester_technician": "33333333-aaaa-4bbb-8ccc-000000000003"
+      },
+      "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "hash": "f338b989cb962240d9a848a750715752be7509359cfc2d7ce16b0bbeebc20c80",
+      "name": "closed: outcome ineligible",
+      "occurred_ms": 1730000000000,
+      "preimage_hex": "524d544155444954763100000f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000311111111111111111111111111111111222222222222222222222222222222223333333333333333333333333333333300000192cc0914000000001c696e7075745f636f6e74726f6c5f726571756573745f636c6f73656411111111aaaa4bbb8ccc00000000000122222222aaaa4bbb8ccc00000000000233333333aaaa4bbb8ccc00000000000344444444aaaa4bbb8ccc00000000000455555555aaaa4bbb8ccc00000000000500000000000000090000000a696e656c696769626c65000000026f6b00000000",
+      "prev_hash": "",
+      "seq": 3
+    }
+  ]
+}

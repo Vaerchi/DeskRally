@@ -4679,3 +4679,40 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
     animation-duration: 2.8s !important;
   }
 }
+
+/* docs/73 holder prompt (components/InputRequestControl.tsx): NON-MODAL, drawn over the bottom of the viewer
+   element so it shows with every menu closed, in the minimal chrome and in full screen. Never in the top row. */
+.input-prompts {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-6);
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: calc(100% - var(--space-6) * 2);
+}
+
+.input-prompt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--pending);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  font-size: var(--fs-md);
+}
+
+.input-prompt__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.input-prompts--fixed {
+  position: fixed;
+}

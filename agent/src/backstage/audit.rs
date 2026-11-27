@@ -135,6 +135,77 @@ pub enum AuditAction {
         /// The arbitration epoch of the new ownership interval.
         epoch: u64,
     },
+    /// docs/73 2.2.5: a technician asked the current input owner for control. Sealed ONLY into the
+    /// REQUESTER's chain, when the request is admitted. The ids are the control-plane ones captured at
+    /// admission, nil where signaling vouched for none. `epoch` is the Owned epoch the request was bound to.
+    InputControlRequested {
+        /// The request's own id.
+        request_id: uuid::Uuid,
+        /// The requesting control-plane session.
+        requester_session: uuid::Uuid,
+        /// Its technician.
+        requester_technician: uuid::Uuid,
+        /// The holder's control-plane session at admission.
+        holder_session: uuid::Uuid,
+        /// Its technician.
+        holder_technician: uuid::Uuid,
+        /// The Owned epoch bound at admission (the same value on the `closed` event).
+        epoch: u64,
+    },
+    /// docs/73 2.2.5: how a request ended (see [`InputRequestAuditOutcome`]). Sealed into the requester's
+    /// chain only, exactly once per request, when the requester was still the route at the decision. A
+    /// chain may end with `input_control_requested` and no close: the outcome is then not proven by it.
+    InputControlRequestClosed {
+        /// The request's own id.
+        request_id: uuid::Uuid,
+        /// The requesting control-plane session.
+        requester_session: uuid::Uuid,
+        /// Its technician.
+        requester_technician: uuid::Uuid,
+        /// The holder's control-plane session at admission.
+        holder_session: uuid::Uuid,
+        /// Its technician.
+        holder_technician: uuid::Uuid,
+        /// The Owned epoch bound at admission.
+        epoch: u64,
+        /// How it ended.
+        outcome: InputRequestAuditOutcome,
+    },
+}
+
+/// The closed set of terminal outcomes of an admitted request-for-control (docs/73 2.2.2). A decoder that
+/// sees any other string refuses the event: a closed serde enum here, an explicit allow-list in Go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRequestAuditOutcome {
+    Granted,
+    Declined,
+    Expired,
+    Undelivered,
+    Cancelled,
+    Replaced,
+    HolderChanged,
+    AlreadySatisfied,
+    Failed,
+    Ineligible,
+}
+
+impl InputRequestAuditOutcome {
+    /// The exact wire / canonical string (serde's name).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Declined => "declined",
+            Self::Expired => "expired",
+            Self::Undelivered => "undelivered",
+            Self::Cancelled => "cancelled",
+            Self::Replaced => "replaced",
+            Self::HolderChanged => "holder_changed",
+            Self::AlreadySatisfied => "already_satisfied",
+            Self::Failed => "failed",
+            Self::Ineligible => "ineligible",
+        }
+    }
 }
 
 /// U+0000 cannot be stored in the control plane's `jsonb` audit columns (PostgreSQL rejects it
@@ -216,7 +287,9 @@ impl AuditAction {
                 strip_nul_str(directory);
             }
             // Ids and an integer only: nothing to strip.
-            AuditAction::InputControlHanded { .. } => {}
+            AuditAction::InputControlHanded { .. }
+            | AuditAction::InputControlRequested { .. }
+            | AuditAction::InputControlRequestClosed { .. } => {}
         }
     }
 }
@@ -933,6 +1006,169 @@ mod tests {
         assert_eq!(h3_hash, GOLDEN_H3_HASH, "input_control_handed (nil/byte-order) hash drift");
     }
 
+    // docs/73 2.2.5: the two request-for-control audit kinds. The vectors live in ONE shared file that the
+    // Go encoder (build step d) reads too: `crates/protocol/testdata/input-request-audit-vectors.json`.
+    // Each vector carries the action JSON with its EXACT keys, the event envelope inputs, and the expected
+    // canonical preimage and hash. Set RMT_WRITE_VECTORS=<path> to regenerate the file from `input_request_vector_inputs`.
+    const INPUT_REQUEST_AUDIT_VECTORS: &str =
+        include_str!("../../../crates/protocol/testdata/input-request-audit-vectors.json");
+
+    fn input_request_vector_inputs() -> Vec<(String, serde_json::Value)> {
+        use serde_json::json;
+        let ids = (
+            "11111111-aaaa-4bbb-8ccc-000000000001",
+            "22222222-aaaa-4bbb-8ccc-000000000002",
+            "33333333-aaaa-4bbb-8ccc-000000000003",
+            "44444444-aaaa-4bbb-8ccc-000000000004",
+            "55555555-aaaa-4bbb-8ccc-000000000005",
+        );
+        let nil = "00000000-0000-0000-0000-000000000000";
+        let mut v = vec![
+            (
+                "requested: five distinct ids".to_string(),
+                json!({"kind":"input_control_requested","request_id":ids.0,"requester_session":ids.1,"requester_technician":ids.2,"holder_session":ids.3,"holder_technician":ids.4,"epoch":7}),
+            ),
+            (
+                "requested: all-nil ids, epoch with distinct bytes".to_string(),
+                json!({"kind":"input_control_requested","request_id":nil,"requester_session":nil,"requester_technician":nil,"holder_session":nil,"holder_technician":nil,"epoch":0x0102_0304_0506_0708u64}),
+            ),
+            (
+                "closed: granted, five distinct ids".to_string(),
+                json!({"kind":"input_control_request_closed","request_id":ids.0,"requester_session":ids.1,"requester_technician":ids.2,"holder_session":ids.3,"holder_technician":ids.4,"epoch":7,"outcome":"granted"}),
+            ),
+            (
+                "closed: failed, all-nil ids".to_string(),
+                json!({"kind":"input_control_request_closed","request_id":nil,"requester_session":nil,"requester_technician":nil,"holder_session":nil,"holder_technician":nil,"epoch":0,"outcome":"failed"}),
+            ),
+        ];
+        for o in ["granted","declined","expired","undelivered","cancelled","replaced","holder_changed","already_satisfied","failed","ineligible"] {
+            v.push((
+                format!("closed: outcome {o}"),
+                json!({"kind":"input_control_request_closed","request_id":ids.0,"requester_session":ids.1,"requester_technician":ids.2,"holder_session":ids.3,"holder_technician":ids.4,"epoch":9,"outcome":o}),
+            ));
+        }
+        v
+    }
+
+    /// Actions BOTH decoders must refuse (review finding L4). Each is one defect away from a valid event.
+    /// They live in the shared file's `invalid` section; the Go test reads the same entries.
+    fn input_request_invalid_inputs() -> Vec<(String, serde_json::Value)> {
+        use serde_json::json;
+        let nil = "00000000-0000-0000-0000-000000000000";
+        let req = |extra: serde_json::Value| {
+            let mut v = json!({"kind":"input_control_requested","request_id":nil,"requester_session":nil,"requester_technician":nil,"holder_session":nil,"holder_technician":nil});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let closed = |extra: serde_json::Value| {
+            let mut v = json!({"kind":"input_control_request_closed","request_id":nil,"requester_session":nil,"requester_technician":nil,"holder_session":nil,"holder_technician":nil});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        vec![
+            ("requested: missing epoch".to_string(), req(json!({}))),
+            ("requested: wrong-type epoch (string)".to_string(), req(json!({"epoch":"7"}))),
+            ("requested: bad UUID".to_string(), req(json!({"epoch":1,"request_id":"not-a-uuid"}))),
+            ("closed: missing epoch".to_string(), closed(json!({"outcome":"granted"}))),
+            ("closed: missing outcome".to_string(), closed(json!({"epoch":1}))),
+            ("closed: empty outcome".to_string(), closed(json!({"epoch":1,"outcome":""}))),
+            ("closed: unknown outcome".to_string(), closed(json!({"epoch":1,"outcome":"bogus"}))),
+            ("closed: wrong-type outcome (number)".to_string(), closed(json!({"epoch":1,"outcome":7}))),
+            ("closed: wrong-type epoch (string)".to_string(), closed(json!({"epoch":"1","outcome":"granted"}))),
+            ("closed: bad UUID".to_string(), closed(json!({"epoch":1,"outcome":"granted","holder_session":"zzzz"}))),
+        ]
+    }
+
+    fn input_request_vector_event(action: &serde_json::Value) -> (String, String) {
+        let a: AuditAction = serde_json::from_value(action.clone()).expect("the vector action parses");
+        golden_event("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", 3, 1_730_000_000_000, a, Outcome::Ok, "")
+    }
+
+    #[test]
+    fn audit_golden_input_request_vectors_v1() {
+        if let Ok(path) = std::env::var("RMT_WRITE_VECTORS") {
+            let vectors: Vec<serde_json::Value> = input_request_vector_inputs()
+                .into_iter()
+                .map(|(name, action)| {
+                    let (pre, hash) = input_request_vector_event(&action);
+                    serde_json::json!({
+                        "name": name,
+                        "event_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+                        "seq": 3,
+                        "occurred_ms": 1_730_000_000_000i64,
+                        "prev_hash": "",
+                        "action": action,
+                        "preimage_hex": pre,
+                        "hash": hash,
+                    })
+                })
+                .collect();
+            let doc = serde_json::json!({
+                "comment": "docs/73 2.2.5 input_control_requested / input_control_request_closed vectors. The Rust encoder asserts them in agent/src/backstage/audit.rs; the Go encoder (control-plane/audit_canonical.go) must produce the same preimage and hash. The envelope is the audit_golden_vector_v1 one (session 1111..., technician 2222..., machine 3333...), outcome ok.",
+                "vectors": vectors,
+                "invalid": input_request_invalid_inputs().into_iter().map(|(name, action)| serde_json::json!({"name": name, "action": action})).collect::<Vec<_>>(),
+            });
+            std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
+            return;
+        }
+        let doc: serde_json::Value = serde_json::from_str(INPUT_REQUEST_AUDIT_VECTORS).unwrap();
+        let vectors = doc["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), input_request_vector_inputs().len(), "the file and the inputs agree");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let action = &v["action"];
+            let (pre, hash) = input_request_vector_event(action);
+            assert_eq!(pre, v["preimage_hex"].as_str().unwrap(), "{name}: preimage drift");
+            assert_eq!(hash, v["hash"].as_str().unwrap(), "{name}: hash drift");
+            // The EXACT JSON keys: re-serializing the parsed action gives back the vector''s action.
+            let a: AuditAction = serde_json::from_value(action.clone()).unwrap();
+            assert_eq!(&serde_json::to_value(&a).unwrap(), action, "{name}: key drift");
+        }
+        // The shared "invalid" section matches the inputs, and every entry is refused by the Rust decoder.
+        let invalid = doc["invalid"].as_array().expect("an invalid section");
+        let want = input_request_invalid_inputs();
+        assert_eq!(invalid.len(), want.len(), "the file and the invalid inputs agree");
+        for (v, (name, action)) in invalid.iter().zip(want.iter()) {
+            assert_eq!(v["name"].as_str().unwrap(), name);
+            assert_eq!(&v["action"], action, "{name}: invalid vector drift");
+            assert!(serde_json::from_value::<AuditAction>(v["action"].clone()).is_err(), "{name}: was accepted");
+        }
+        // Every outcome string has its own vector, and the closed enum names are the serde names.
+        for o in [
+            InputRequestAuditOutcome::Granted,
+            InputRequestAuditOutcome::Declined,
+            InputRequestAuditOutcome::Expired,
+            InputRequestAuditOutcome::Undelivered,
+            InputRequestAuditOutcome::Cancelled,
+            InputRequestAuditOutcome::Replaced,
+            InputRequestAuditOutcome::HolderChanged,
+            InputRequestAuditOutcome::AlreadySatisfied,
+            InputRequestAuditOutcome::Failed,
+            InputRequestAuditOutcome::Ineligible,
+        ] {
+            assert_eq!(serde_json::to_value(o).unwrap(), serde_json::Value::String(o.name().into()));
+            assert!(
+                vectors.iter().any(|v| v["name"] == format!("closed: outcome {}", o.name())),
+                "a vector for {}",
+                o.name()
+            );
+        }
+    }
+
+    /// An unknown, empty or wrong-type `outcome`, or a missing `epoch`, is refused rather than hashed.
+    #[test]
+    fn audit_input_request_actions_refuse_a_bad_outcome_or_a_missing_epoch() {
+        let base = |extra: &str| {
+            format!(
+                r#"{{"kind":"input_control_request_closed","request_id":"00000000-0000-0000-0000-000000000000","requester_session":"00000000-0000-0000-0000-000000000000","requester_technician":"00000000-0000-0000-0000-000000000000","holder_session":"00000000-0000-0000-0000-000000000000","holder_technician":"00000000-0000-0000-0000-000000000000"{extra}}}"#
+            )
+        };
+        assert!(serde_json::from_str::<AuditAction>(&base(r#","epoch":1,"outcome":"granted""#)).is_ok());
+        assert!(serde_json::from_str::<AuditAction>(&base(r#","epoch":1,"outcome":"bogus""#)).is_err());
+        assert!(serde_json::from_str::<AuditAction>(&base(r#","epoch":1,"outcome":"""#)).is_err());
+        assert!(serde_json::from_str::<AuditAction>(&base(r#","epoch":1,"outcome":7"#)).is_err());
+        assert!(serde_json::from_str::<AuditAction>(&base(r#","outcome":"granted""#)).is_err(), "no epoch");
+    }
     /// An EMPTY digest list and a one-element list must not hash the same, and neither may collide
     /// with a list whose elements concatenate to the same bytes.
     ///

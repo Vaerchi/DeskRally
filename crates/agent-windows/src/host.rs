@@ -1119,6 +1119,8 @@ fn multi_stream_command(args: &[String]) -> i32 {
     #[cfg(feature = "secure-test")]
     let secure_test_harness = matches!(backstage_auth, BackstageAuth::SignedBy(_));
     let ms_opts = Arc::new(MultiSessionOpts {
+        // The live e2e gate exercises request-for-control (the production default is OFF).
+        input_request_v1: true,
         // The same docs/49 end reporting as the installed helper, so the live e2e gate exercises
         // it. Reports go only for sessions signaling vouched for (a verified ticket's id).
         guest_end_reports: Some(rmt_agent_core::guest_end::GuestEndShared::new()),
@@ -3240,6 +3242,10 @@ pub struct InputHandoffWiring {
     pub(crate) handle: u64,
     /// This session's signaling session id: how the viewers name it in `session_participants`.
     pub(crate) signaling_id: String,
+    /// docs/73: the `input_request_v1` feature gate (config; default OFF in production). Off means the
+    /// announce and every request-for-control message are dropped silently and no audit kind of that
+    /// feature is ever sealed.
+    pub(crate) request_v1: bool,
 }
 
 /// The administrative bound on a session's quality (M11), read from the agent's config.
@@ -5672,6 +5678,13 @@ pub async fn serve_session_with_ice(
     let mut quality_tick = tokio::time::interval(Duration::from_secs(1));
     quality_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // docs/73 2.2.3: the request timers (10 s undelivered, 60 s expiry, the request-driven hand deadline) are
+    // swept from here every second, UNCONDITIONALLY (the stats-gated `quality_tick` cannot be reused). One
+    // of three triggers; the capture thread and every hub entry point also sweep, so no stalled thread can
+    // leave a request pending forever. Declared outside the loop for the reason spelled out above.
+    let mut request_sweep_tick = tokio::time::interval(Duration::from_secs(1));
+    request_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Minimum frame cadence (see MIN_FRAME_INTERVAL). `last_sent_at` tracks when a frame last went to
     // the encoder — REAL or re-sent — so the cadence tick can tell when the browser is about to go
     // hungry and re-send the last frame to keep its video pipeline fed. `cadence_tick` fires even
@@ -6015,6 +6028,22 @@ pub async fn serve_session_with_ice(
                 // Disable on success OR sender drop; polling a completed oneshot again panics.
                 monitor_announcement_pending = false;
                 if let Ok(monitors) = ready {
+                    // Same order as the RequestMonitors reply (1.3.41 review Low-3): canvas and pin FIRST, so a
+                    // multi-session viewer never auto-selects from the list and asks for a display the pin refuses.
+                    if let Some(ref canvas) = shared_canvas {
+                        let payload = control::encode(&ControlMessage::MonitorCanvas(canvas.clone()));
+                        if transport.send_frame(Frame::new(ChannelId::Control, payload)).await.is_err() {
+                            input_open = false;
+                        }
+                    }
+                    if let Some(ref ss) = shared_selection_state {
+                        let pinned_id = ss.lock().unwrap().monitor;
+                        let payload = control::encode(&ControlMessage::MonitorPinned { monitor_id: pinned_id });
+                        if let Err(e) = transport.send_frame(Frame::new(ChannelId::Control, payload)).await {
+                            tracing::debug!(error = %e, "initial MonitorPinned send failed");
+                            input_open = false;
+                        }
+                    }
                     tracing::info!(count = monitors.len(), "sending initial monitor list");
                     let payload = control::encode(&ControlMessage::MonitorList { monitors });
                     if let Err(e) = transport.send_frame(Frame::new(ChannelId::Control, payload)).await {
@@ -6118,6 +6147,38 @@ pub async fn serve_session_with_ice(
                         }
                         HandoffSealStep::Skip => tracing::debug!("input hand-off audit skipped: input is closed"),
                         HandoffSealStep::Unidentified => {}
+                    }
+                }
+                // docs/73 request-for-control directives, in the order the hub decided them: a control message goes
+                // on THIS transport, an audit record is sealed into THIS chain (never a peer's). The hub queues
+                // one only for a session that announced `InputRequestCapable`, and the announce is dropped
+                // unless `input_request_v1` is on, so with the feature off this arm never runs.
+                Some(crate::session_directory::HandoffOutbound::Request(d)) => {
+                    let sid_of = |h: u64| input_handoff.as_ref().and_then(|w| w.shared.arb.signaling_id_of(h));
+                    match crate::request_wire::wire_of(&d, sid_of) {
+                        Some(crate::request_wire::Wire::Control(msg)) => {
+                            let payload = control::encode(&msg);
+                            if transport.send_frame(Frame::new(ChannelId::Control, payload)).await.is_err() {
+                                input_open = false;
+                            }
+                        }
+                        Some(crate::request_wire::Wire::Seal(action)) => {
+                            match handoff_seal_step(input_open, &audit_chain, action, now_unix_ms()) {
+                                HandoffSealStep::Deliver(message) => {
+                                    let payload = file_transfer::encode(&message);
+                                    if transport.send_frame(Frame::new(ChannelId::FileTransfer, payload)).await.is_err() {
+                                        input_open = false;
+                                    }
+                                }
+                                HandoffSealStep::Broken => {
+                                    tracing::warn!("input request audit sealed but unencodable; closing input so nothing seals behind it");
+                                    input_open = false;
+                                }
+                                HandoffSealStep::Skip => tracing::debug!("input request audit skipped: input is closed"),
+                                HandoffSealStep::Unidentified => {}
+                            }
+                        }
+                        None => {}
                     }
                 }
                 // The outbound queue overflowed because THIS session's loop stopped draining it: an audit record could not be queued
@@ -8609,9 +8670,75 @@ pub async fn serve_session_with_ice(
                                 }
                             }
                         }
+                        // docs/73 request-for-control, viewer -> agent. Every reply to the requester is a hub directive
+                        // queued under `core` and sent by the handoff arm in queue order, never from here. The hub
+                        // entry points are non-blocking; only the accepted hand runs off the loop, like a plain hand.
+                        Ok(
+                            ref m @ (ControlMessage::InputRequestCapable {}
+                            | ControlMessage::RequestInputControl { .. }
+                            | ControlMessage::WithdrawInputControlRequest { .. }
+                            | ControlMessage::InputControlPromptShown { .. }
+                            | ControlMessage::AnswerInputControlRequest { .. }),
+                        ) => {
+                            if let Some(w) = &input_handoff {
+                                let ctx = crate::request_wire::InboundCtx {
+                                    hub: &w.shared.arb,
+                                    handle: w.handle,
+                                    request_v1: w.request_v1,
+                                    observer,
+                                };
+                                let acquire = || {
+                                    let permit = hand_slot.try_acquire()?;
+                                    let hub_permit = w.shared.arb.try_admit_hand()?;
+                                    Some((permit, hub_permit))
+                                };
+                                match crate::request_wire::handle_inbound(&ctx, m, Instant::now(), acquire) {
+                                    crate::request_wire::Inbound::Nothing => {}
+                                    crate::request_wire::Inbound::Reply(reply) => {
+                                        let payload = control::encode(&reply);
+                                        if transport.send_frame(Frame::new(ChannelId::Control, payload)).await.is_err() {
+                                            input_open = false;
+                                        }
+                                    }
+                                    crate::request_wire::Inbound::HolderBusy => {
+                                        let payload = control::encode(&ControlMessage::Error {
+                                            message: input_control_error("a hand-off is already in progress"),
+                                        });
+                                        if transport.send_frame(Frame::new(ChannelId::Control, payload)).await.is_err() {
+                                            input_open = false;
+                                        }
+                                    }
+                                    crate::request_wire::Inbound::SpawnHand { request_id, deadline, permits } => {
+                                        tracing::info!(from = w.handle, "input request: accepted; running the hand-off");
+                                        let shared = Arc::clone(&w.shared);
+                                        let me = w.handle;
+                                        tokio::spawn(async move {
+                                            // The permits live INSIDE the blocking job, so they are held until the
+                                            // hand returns even if this wrapper task is cancelled.
+                                            let job_shared = Arc::clone(&shared);
+                                            let joined = tokio::task::spawn_blocking(move || {
+                                                let _held = permits;
+                                                job_shared.hand_input_control_for_request(me, request_id, deadline)
+                                            })
+                                            .await;
+                                            if joined.is_err() {
+                                                // A lost worker: the hub settles the request (`worker_lost`).
+                                                tracing::error!("input request: the hand job was lost");
+                                                shared.arb.abort_request(request_id, Instant::now());
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         // These are agent→controller messages; the agent never consumes one itself.
                         // Ignore if a controller reflects one back (mirrors the file-transfer branch).
-                        Ok(ControlMessage::AdminRightsAvailable { .. })
+                        Ok(ControlMessage::InputRequestAvailable { .. })
+                        | Ok(ControlMessage::InputControlRequestPending { .. })
+                        | Ok(ControlMessage::InputControlRequestResult { .. })
+                        | Ok(ControlMessage::InputControlRequested { .. })
+                        | Ok(ControlMessage::InputControlRequestWithdrawn { .. })
+                        | Ok(ControlMessage::AdminRightsAvailable { .. })
                         | Ok(ControlMessage::InputHandoffAvailable { .. })
                         | Ok(ControlMessage::InputControlChanged { .. })
                         | Ok(ControlMessage::AdminRightsResult { .. })
@@ -8671,6 +8798,12 @@ pub async fn serve_session_with_ice(
                     video_open = false;
                 }
             },
+            // docs/73: sweep the request timers once a second (see `request_sweep_tick`).
+            _ = request_sweep_tick.tick(), if input_handoff.as_ref().is_some_and(|w| w.request_v1) => {
+                if let Some(w) = &input_handoff {
+                    w.shared.arb.sweep_requests(Instant::now());
+                }
+            }
             // M11: 1 Hz quality telemetry, only once the controller has proved it speaks quality.
             // Borrows no transport during selection, so like the clipboard-out arm it never
             // conflicts with the `recv_frame` `&mut` borrow.
@@ -10662,13 +10795,19 @@ impl BroadcastCapturer {
     /// `source` is the monitor list the canvas was built from; it is advertised by `monitors()`
     /// only when the snapshot has no topology (otherwise the snapshot stays authoritative).
     fn with_composite_canvas(mut self, canvas: Option<control::MonitorCanvas>, source: Vec<MonitorInfo>) -> Self {
-        self.canvas_monitors = if canvas.is_some() && self.initial_snapshot.topology.is_none() {
+        self.canvas_monitors = if canvas.is_some() && !self.snapshot_has_monitors() {
             source
         } else {
             Vec::new()
         };
         self.composite_canvas = canvas;
         self
+    }
+
+    /// The ONE "usable snapshot topology" predicate, shared with `monitor_canvas::composite_layout` (which also
+    /// falls back to the live list for `Some(empty)`), so the canvas and the advertised list always agree.
+    fn snapshot_has_monitors(&self) -> bool {
+        self.initial_snapshot.topology.as_ref().is_some_and(|t| !t.monitors.is_empty())
     }
 
     /// Attach this session's demand slot, so the shared producer paces to it.
@@ -10687,8 +10826,8 @@ impl ScreenCapturer for BroadcastCapturer {
         // With no topology but a composite canvas built from the live list (sign-in screen), advertise
         // that same list so the picker and the canvas agree (1.3.41; was empty -> one synthetic display).
         match &self.initial_snapshot.topology {
-            Some(t) => Ok(t.monitors.clone()),
-            None => Ok(self.canvas_monitors.clone()),
+            Some(t) if !t.monitors.is_empty() => Ok(t.monitors.clone()),
+            _ => Ok(self.canvas_monitors.clone()),
         }
     }
 
@@ -10808,6 +10947,8 @@ impl ScreenCapturer for BroadcastCapturer {
 /// that are either `Copy`, `Clone`, or behind `Arc`. Fields that MUST be fresh per session (sink,
 /// clipboard worker, guest window) are created inside [`run_multi_session_stream`]'s spawn closure.
 struct MultiSessionOpts {
+    /// docs/73: the `input_request_v1` feature gate every brokered session of this helper carries.
+    input_request_v1: bool,
     /// Retain acknowledgements and retries across reconnects for the helper lifetime.
     guest_end_reports: Option<rmt_agent_core::guest_end::GuestEndReports>,
     /// Every live session task of the helper, across signaling reconnects: a session outlives the
@@ -11266,6 +11407,7 @@ async fn run_multi_session_stream(
                     shared: std::sync::Arc::clone(&shared_c),
                     handle: arb_handle,
                     signaling_id: session_id.0.to_string(),
+                    request_v1: opts_c.input_request_v1,
                 }),
             };
 
@@ -11640,7 +11782,10 @@ fn run_helper_stream(signaling_url: String, cfg: &mut crate::config::HelperConfi
     // F2 many-tech: shared config for every brokered session spawned by this helper. Built once
     // outside the reconnect loop so the spent_grants/spent_elevations ledgers and the uninstall
     // flag survive across reconnects (same reasoning as the single-session path).
+    // One line per helper start so a support log answers "is request input control on here?" (docs/73).
+    tracing::info!(input_request_v1 = cfg.input_request_v1, "feature: request input control");
     let ms_opts = Arc::new(MultiSessionOpts {
+        input_request_v1: cfg.input_request_v1,
         session_tasks: Default::default(),
         device,
         ice: ice.clone(),
@@ -13242,6 +13387,34 @@ mod tests {
         assert_eq!(capturer.capture_composite().unwrap(),frame);
         tx.send(Arc::new(TaggedFrame {frame:CapturedFrame {width:2,..frame},selection_gen:1})).unwrap();
         assert!(capturer.capture_composite().is_err());
+    }
+
+    /// 1.3.41 review Low-1/Low-4: the live list is advertised ONLY with a canvas and no usable snapshot topology;
+    /// it never leaks into a session whose snapshot has monitors or that has no canvas (a non-composite pin).
+    #[test]
+    fn canvas_monitor_list_is_advertised_only_with_a_canvas_and_no_usable_topology() {
+        use crate::shared_capture::{SelectionState, VersionedSnapshot};
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let live = vec![
+            MonitorInfo {id:0,left:0,top:0,width:2,height:2,dpi_scale:1.0},
+            MonitorInfo {id:1,left:2,top:0,width:2,height:2,dpi_scale:1.0}];
+        let snap_mons = vec![MonitorInfo {id:0,left:0,top:0,width:2,height:2,dpi_scale:1.0}];
+        let build = |topology: Option<rmt_agent_core::TopologySnapshot>, with_canvas: bool| {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            let snap = Arc::new(VersionedSnapshot {generation:0,topology});
+            let canvas = if with_canvas { crate::monitor_canvas::composite_layout(None,&live) } else { None };
+            BroadcastCapturer::new(rx,Arc::clone(&snap),rt.handle().clone(),Arc::new(Mutex::new(snap)),
+                Arc::new(Mutex::new(SelectionState {monitor:COMPOSITE_MONITOR_ID,generation:1})))
+                .with_composite_canvas(canvas, live.clone())
+        };
+        // No canvas (e.g. a non-composite pin): never the live list.
+        assert!(build(None,false).monitors().unwrap().is_empty());
+        // A usable snapshot topology stays authoritative even with a canvas.
+        let t = rmt_agent_core::TopologySnapshot {monitors:snap_mons.clone(),names:vec![String::new()]};
+        assert_eq!(build(Some(t),true).monitors().unwrap(), snap_mons);
+        // Some(empty) is treated like None, matching composite_layout: canvas and list agree.
+        let empty = rmt_agent_core::TopologySnapshot {monitors:vec![],names:vec![]};
+        assert_eq!(build(Some(empty),true).monitors().unwrap(), live);
     }
 
     #[test]

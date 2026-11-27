@@ -28,9 +28,11 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+use std::time::Instant;
+
 /// A session's identity for arbitration: the coordinator's handle plus an incarnation that is never
 /// reused, so a message naming a dead session's recycled handle cannot act on its successor.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Member {
     pub handle: u64,
     pub incarnation: u64,
@@ -113,15 +115,35 @@ pub(crate) enum InjectionVerdict {
     Deny,
 }
 
+/// docs/73 2.2.4: a REQUEST-DRIVEN transition (begun by a holder's accept) carries a deadline and its
+/// sender. Plain docs/61 hands have no guard and keep today's behaviour in full.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RequestGuard {
+    pub id: u64,
+    pub from: Member,
+    pub to: Member,
+    pub deadline: Instant,
+}
+
+/// Result of [InputArbiter::commit_by]: the commit outcome, or the deadline abort taken instead.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum CommitStep {
+    Outcome(CommitOutcome),
+    /// The request-driven transition's deadline had passed: it was aborted (Blocked, epoch advanced)
+    /// instead of committing. A StaleTransition equivalent for every caller.
+    AbortedDeadline,
+}
+
 pub(crate) struct InputArbiter {
     mode: Mode,
     epoch: u64,
     next_transition_id: u64,
+    guard: Option<RequestGuard>,
 }
 
 impl InputArbiter {
     pub fn new() -> Self {
-        Self { mode: Mode::Unowned, epoch: 0, next_transition_id: 1 }
+        Self { mode: Mode::Unowned, epoch: 0, next_transition_id: 1, guard: None }
     }
 
     pub fn mode(&self) -> &Mode {
@@ -176,6 +198,32 @@ impl InputArbiter {
         target: Member,
         participants: &impl Participants,
     ) -> Result<Transition, HandRefusal> {
+        self.begin_hand_inner(sender, target, participants, None)
+    }
+
+    /// [egin_hand] for a request-driven hand: records the [RequestGuard] (sender, target, deadline).
+    pub fn begin_request_hand(
+        &mut self,
+        sender: Member,
+        target: Member,
+        participants: &impl Participants,
+        deadline: Instant,
+    ) -> Result<Transition, HandRefusal> {
+        self.begin_hand_inner(sender, target, participants, Some(deadline))
+    }
+
+    /// The guard of the in-flight request-driven transition, if any.
+    pub fn guard(&self) -> Option<RequestGuard> {
+        self.guard
+    }
+
+    fn begin_hand_inner(
+        &mut self,
+        sender: Member,
+        target: Member,
+        participants: &impl Participants,
+        deadline: Option<Instant>,
+    ) -> Result<Transition, HandRefusal> {
         // Validation precedes every state change. From Blocked, sender == target IS the explicit claim
         // (the only recovery for a lone surviving controller once arbitration is armed); from Unowned
         // it means nothing (free interleave already admits the sender).
@@ -196,6 +244,7 @@ impl InputArbiter {
         // stale at the gate from here on, including input of the sessions being fenced.
         self.epoch += 1;
         self.mode = Mode::Transitioning { id, to: target };
+        self.guard = deadline.map(|deadline| RequestGuard { id, from: sender, to: target, deadline });
         Ok(Transition { id, to: target, fence, epoch: self.epoch })
     }
 
@@ -206,12 +255,37 @@ impl InputArbiter {
             Mode::Transitioning { id: current, to } if *current == id => *to,
             _ => return CommitOutcome::StaleTransition,
         };
+        self.guard = None;
         if !participants.is_live(to) || !participants.is_control_eligible(to) {
             self.mode = Mode::Blocked;
             return CommitOutcome::BlockedTargetGone;
         }
         self.mode = Mode::Owned { who: to };
         CommitOutcome::Owned { who: to, epoch: self.epoch }
+    }
+
+    /// [commit] that first applies a request-driven transition's deadline: past it, the transition is
+    /// aborted instead of committed (docs/73 2.2.4 item 4), so a fence that finishes late cannot commit.
+    pub fn commit_by(&mut self, id: u64, participants: &impl Participants, now: Instant) -> CommitStep {
+        // ONE deadline comparison, shared with the hub sweep: at or past the deadline it aborts.
+        if self.guard.is_some_and(|g| g.id == id && now >= g.deadline) && self.abort_transition(id) {
+            return CommitStep::AbortedDeadline;
+        }
+        CommitStep::Outcome(self.commit(id, participants))
+    }
+
+    /// Abort the in-flight transition id: the epoch advances and the mode becomes Blocked, exactly
+    /// as a vanished target does. Compare by id; false (no change) when id is not the in-flight one.
+    /// The caller decides whether an abort is allowed (request-driven only) and settles the request.
+    pub fn abort_transition(&mut self, id: u64) -> bool {
+        if matches!(&self.mode, Mode::Transitioning { id: cur, .. } if *cur == id) {
+            self.epoch += 1;
+            self.mode = Mode::Blocked;
+            self.guard = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// A member is gone (clean end and detected crash take the SAME path).
@@ -230,9 +304,14 @@ impl InputArbiter {
                 self.mode = Mode::Blocked;
                 true
             }
-            Mode::Transitioning { to, .. } if *to == member => {
+            // A request-driven hand also aborts when its SENDER leaves (docs/73 2.2.4 item 5); a plain hand
+            // still commits after its sender leaves (the target lives).
+            Mode::Transitioning { id, to }
+                if *to == member || self.guard.is_some_and(|g| g.id == *id && g.from == member) =>
+            {
                 self.epoch += 1;
                 self.mode = Mode::Blocked;
+                self.guard = None;
                 true
             }
             _ => false,
@@ -258,6 +337,7 @@ impl InputArbiter {
         }
         self.epoch += 1;
         self.mode = Mode::Unowned;
+        self.guard = None;
         true
     }
 
@@ -528,5 +608,61 @@ mod tests {
         assert_eq!(*arb.mode(), Mode::Unowned);
         assert!(arb.epoch() > before);
         assert_eq!(arb.injection_verdict(A, 0), InjectionVerdict::Admit, "compatibility mode admits again");
+    }
+
+    // ── docs/73 2.2.4: request-driven transitions carry a deadline guard ─────────────────────────
+
+    #[test]
+    fn a_request_driven_commit_past_its_deadline_aborts_instead() {
+        let p = Fake::of(&[A, B]);
+        let now = Instant::now();
+        let mut arb = InputArbiter::new();
+        let t = arb.begin_hand(A, A, &p);
+        assert!(t.is_err(), "premise: a self hand from Unowned means nothing");
+        let t = arb.begin_hand(A, B, &p).unwrap();
+        arb.commit(t.id, &p);
+        let t = arb.begin_request_hand(B, A, &p, now + std::time::Duration::from_secs(10)).unwrap();
+        let epoch = arb.epoch();
+        assert_eq!(arb.guard().map(|g| (g.id, g.from, g.to)), Some((t.id, B, A)));
+        assert_eq!(arb.commit_by(t.id, &p, now + std::time::Duration::from_secs(11)), CommitStep::AbortedDeadline);
+        assert_eq!(*arb.mode(), Mode::Blocked);
+        assert!(arb.epoch() > epoch);
+        assert!(arb.guard().is_none());
+        assert_eq!(arb.commit(t.id, &p), CommitOutcome::StaleTransition, "a late commit is stale");
+        // Before the deadline it commits and clears the guard.
+        let t = arb.begin_hand(A, B, &p).unwrap();
+        arb.commit(t.id, &p);
+        let t = arb.begin_request_hand(B, A, &p, now + std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            arb.commit_by(t.id, &p, now + std::time::Duration::from_millis(9_999)),
+            CommitStep::Outcome(CommitOutcome::Owned { who: A, epoch: t.epoch })
+        );
+        assert!(arb.guard().is_none());
+    }
+
+    #[test]
+    fn abort_transition_compares_by_id_and_a_request_sender_leaving_aborts_but_a_plain_one_does_not() {
+        let p = Fake::of(&[A, B, C]);
+        let now = Instant::now();
+        let mut arb = InputArbiter::new();
+        let t = arb.begin_hand(A, B, &p).unwrap();
+        arb.commit(t.id, &p);
+        let t = arb.begin_request_hand(B, C, &p, now).unwrap();
+        assert!(!arb.abort_transition(t.id + 9), "another id: no change");
+        assert!(matches!(arb.mode(), Mode::Transitioning { .. }));
+        // The SENDER leaves a request-driven hand: abort, like a vanished target.
+        assert!(arb.teardown(B));
+        assert_eq!(*arb.mode(), Mode::Blocked);
+        assert!(arb.guard().is_none());
+        // A plain hand still commits after its sender leaves.
+        let t = arb.begin_hand(C, C, &p).unwrap();
+        arb.commit(t.id, &p);
+        let t = arb.begin_hand(C, A, &p).unwrap();
+        assert!(!arb.teardown(C), "sender leaving a plain hand changes nothing");
+        assert_eq!(arb.commit(t.id, &p), CommitOutcome::Owned { who: A, epoch: t.epoch });
+        // abort_transition on the plain hand's id (never called for plain hands by the hub) works by id.
+        let t = arb.begin_hand(A, B, &p).unwrap();
+        assert!(arb.abort_transition(t.id));
+        assert!(!arb.abort_transition(t.id), "already aborted");
     }
 }

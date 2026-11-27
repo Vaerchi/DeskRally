@@ -51,6 +51,10 @@ pub(crate) enum HandoffOutbound {
     /// The session's outbound queue overflowed because its loop stopped draining (an audit message could not be queued, and audit is never
     /// dropped): end this session. Delivered after everything that WAS queued, in order. The text is the logged reason.
     Disconnect(&'static str),
+    /// A request-for-control directive (docs/73), queued under the hub's `core` in decision order. The
+    /// `Audit` kind is non-droppable like `SealAudit`; the session loop maps it onto the wire / its
+    /// audit chain in build step (c) (today it is ignored there).
+    Request(crate::input_request::Directive),
 }
 
 
@@ -158,10 +162,14 @@ impl HandoffTx {
         if !s.receiver_alive || s.overflowed {
             return Err(HandoffClosed);
         }
+        let is_audit = matches!(
+            &msg,
+            HandoffOutbound::SealAudit(_) | HandoffOutbound::Request(crate::input_request::Directive::Audit { .. })
+        );
         match msg {
             HandoffOutbound::Control(c @ ControlMessage::InputControlChanged { .. }) => s.snapshot = Some(c),
             HandoffOutbound::KeepAwakeChanged => s.keep_awake_changed = true,
-            HandoffOutbound::SealAudit(a) if s.queue.len() >= MAX_PENDING_OUTBOUND => {
+            a if is_audit && s.queue.len() >= MAX_PENDING_OUTBOUND => {
                 s.overflowed = true;
                 tracing::error!(
                     pending = s.queue.len(),
@@ -328,6 +336,11 @@ impl SessionDirectory {
             .values()
             .find(|e| e.identity.handle == handle)
             .map(|e| e.identity.clone())
+    }
+
+    /// The signaling session id whose entry holds arbiter `handle`, if a live session does.
+    pub fn signaling_id_of_handle(&self, handle: u64) -> Option<String> {
+        signaling_id_of(&self.entries.lock().unwrap_or_else(|e| e.into_inner()), handle)
     }
 
     /// Both parties' identities read under ONE lock, so the record of a hand describes a single
@@ -654,5 +667,52 @@ mod tests {
         let (first, ended) = t.await.unwrap();
         assert!(matches!(first, Some(HandoffOutbound::Control(m)) if m == blocked()));
         assert!(ended);
+    }
+
+    /// N1 (b): a request AUDIT directive is non-droppable like `SealAudit` (it overflows the queue and
+    /// disconnects the session), while the other request directives are droppable and counted.
+    #[test]
+    fn request_audit_overflows_like_seal_audit_but_other_request_directives_are_dropped_and_counted() {
+        use crate::input_request::{AuditRecord, Directive, HolderMsg, RequesterMsg, Resolved, TrustedIds, WithdrawReason};
+        let nil = uuid::Uuid::nil();
+        let fill = |tx: &HandoffTx| {
+            for i in 0..MAX_PENDING_OUTBOUND {
+                tx.send(HandoffOutbound::Control(ControlMessage::Error { message: format!("fill {i}") })).unwrap();
+            }
+        };
+        // Droppable: Ok, counted, nothing disconnects.
+        let (tx, mut rx) = unbounded_channel();
+        fill(&tx);
+        let result = Directive::ToRequester {
+            to: 1,
+            msg: RequesterMsg::Result { client_request_id: nil, request_id: None, outcome: Resolved::Unknown },
+        };
+        let withdrawn = Directive::ToHolder {
+            to: 1,
+            msg: HolderMsg::Withdrawn { request_id: nil, reason: WithdrawReason::Unknown },
+        };
+        assert_eq!(tx.send(HandoffOutbound::Request(result)), Ok(()));
+        assert_eq!(tx.send(HandoffOutbound::Request(withdrawn)), Ok(()));
+        assert_eq!(rx.dropped(), 2, "both were dropped and counted");
+        let mut last = None;
+        while let Ok(m) = rx.try_recv() {
+            last = Some(m);
+        }
+        assert!(!matches!(last, Some(HandoffOutbound::Disconnect(_))), "a droppable message never disconnects");
+
+        // Audit: never dropped. The queue is full, so the session is disconnected and the send fails.
+        let (tx, mut rx) = unbounded_channel();
+        fill(&tx);
+        let audit = Directive::Audit {
+            to: 1,
+            record: AuditRecord::Requested { request_id: nil, ids: TrustedIds::default(), epoch: 0 },
+        };
+        assert_eq!(tx.send(HandoffOutbound::Request(audit)), Err(HandoffClosed));
+        assert_eq!(rx.dropped(), 0, "audit is not counted as dropped: it disconnects");
+        let mut last = None;
+        while let Ok(m) = rx.try_recv() {
+            last = Some(m);
+        }
+        assert!(matches!(last, Some(HandoffOutbound::Disconnect(_))), "the session is told to end");
     }
 }

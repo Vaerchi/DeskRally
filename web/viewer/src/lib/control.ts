@@ -483,7 +483,74 @@ export type ControlMessage =
   // docs/61, agent → controller: the AUTHORITATIVE input-ownership snapshot for the whole session,
   // sent to every participant on any change and at join/reconnect. The viewer renders only this
   // acked state. owner_session/owner_name are set only for "owned".
-  | { t: "InputControlChanged"; c: { owner_session: string | null; owner_name: string | null; mode: InputControlMode } };
+  | { t: "InputControlChanged"; c: { owner_session: string | null; owner_name: string | null; mode: InputControlMode } }
+  // docs/73 2.2.2 request-for-control. controller → agent: this viewer implements it (sent once per
+  // session after joining; an agent that does not know it drops the frame). The agent then answers
+  // InputRequestAvailable, and ONLY a session that announced is ever sent any other message below.
+  | { t: "InputRequestCapable"; c: Record<string, never> }
+  | { t: "InputRequestAvailable"; c: { available: boolean } }
+  // controller → agent: ask the owner for control; `retry` on every re-send of the same id.
+  | { t: "RequestInputControl"; c: { client_request_id: string; retry: boolean } }
+  | { t: "WithdrawInputControlRequest"; c: { client_request_id: string } }
+  // agent → controller: the CURRENT state of a live request / the final answer (sticky per id).
+  | { t: "InputControlRequestPending"; c: { client_request_id: string; request_id: string; state: InputRequestState } }
+  | { t: "InputControlRequestResult"; c: { client_request_id: string; request_id: string | null; outcome: InputRequestOutcome } }
+  // agent → holder: the prompt; holder → agent: shown, and the answer.
+  | { t: "InputControlRequested"; c: { request_id: string; from_session: string; expires_in_ms: number } }
+  | { t: "InputControlPromptShown"; c: { request_id: string } }
+  | { t: "AnswerInputControlRequest"; c: { request_id: string; accept: boolean } }
+  // agent → holder: the prompt is over (`reason` is an outcome, `requester_left` or `unknown`).
+  | { t: "InputControlRequestWithdrawn"; c: { request_id: string; reason: InputRequestOutcome } };
+
+/** docs/73: the agent → viewer request-for-control messages. */
+export type InputRequestAgentMessage = Extract<
+  ControlMessage,
+  { t: "InputRequestAvailable" | "InputControlRequestPending" | "InputControlRequestResult" | "InputControlRequested" | "InputControlRequestWithdrawn" }
+>;
+
+/** docs/73: where a live request stands. */
+export type InputRequestState = "pending_delivery" | "shown" | "accepted_in_flight";
+const INPUT_REQUEST_STATES: readonly InputRequestState[] = ["pending_delivery", "shown", "accepted_in_flight"];
+
+/**
+ * docs/73: the closed outcome set. The first ten are the terminal outcomes of an admitted request, the
+ * next six are immediate refusals (no request id), `unknown` is reply-only and `requester_left` appears
+ * only in `InputControlRequestWithdrawn`.
+ */
+export type InputRequestOutcome =
+  | "granted" | "declined" | "expired" | "undelivered" | "cancelled" | "replaced" | "holder_changed"
+  | "already_satisfied" | "failed" | "ineligible"
+  | "no_holder" | "busy" | "rate_limited" | "capacity" | "unsupported_holder"
+  | "unknown" | "requester_left";
+const INPUT_REQUEST_OUTCOMES: readonly InputRequestOutcome[] = [
+  "granted", "declined", "expired", "undelivered", "cancelled", "replaced", "holder_changed",
+  "already_satisfied", "failed", "ineligible", "no_holder", "busy", "rate_limited", "capacity",
+  "unsupported_holder", "unknown", "requester_left",
+];
+// Canonical LOWER-CASE hyphenated UUID, exactly what the agent's decoder accepts.
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** docs/73: the agent's limits on a requester's signaling id and a prompt's lifetime. */
+const MAX_SESSION_ID_BYTES = 128;
+const MAX_REQUEST_EXPIRES_IN_MS = 120_000;
+// A `request_id` is present exactly for the terminal outcomes of an admitted request, absent for immediate
+// refusals and `unknown`; `ineligible` is both (a refusal, or an admitted request whose requester lost eligibility).
+const RESULT_NEEDS_ID: readonly InputRequestOutcome[] = [
+  "granted", "declined", "expired", "undelivered", "cancelled", "replaced", "holder_changed", "already_satisfied", "failed",
+];
+const RESULT_FORBIDS_ID: readonly InputRequestOutcome[] = [
+  "no_holder", "busy", "rate_limited", "capacity", "unsupported_holder", "unknown",
+];
+function requireSessionId(v: unknown, what: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (typeof v !== "string" || new TextEncoder().encode(v).length > MAX_SESSION_ID_BYTES || /[\u0000-\u001f\u007f-\u009f]/.test(v)) {
+    throw new Error(`malformed ${what}`);
+  }
+  return v;
+}
+function requireUuid(v: unknown, what: string): string {
+  if (typeof v !== "string" || !UUID_TEXT.test(v)) throw new Error(`malformed ${what}`);
+  return v;
+}
 
 /** docs/53: the states of an admin-rights request. */
 export type AdminRightsState = "pending" | "granted" | "declined" | "unavailable" | "ended";
@@ -806,6 +873,37 @@ export function encodeControl(msg: ControlMessage): Uint8Array {
     case "InputControlChanged":
       // serde field order: owner_session, owner_name, mode.
       obj = { t: msg.t, c: { owner_session: msg.c.owner_session, owner_name: msg.c.owner_name, mode: msg.c.mode } };
+      break;
+    // docs/73: serde field order throughout.
+    case "InputRequestCapable":
+      obj = { t: msg.t, c: {} };
+      break;
+    case "InputRequestAvailable":
+      obj = { t: msg.t, c: { available: msg.c.available } };
+      break;
+    case "RequestInputControl":
+      obj = { t: msg.t, c: { client_request_id: msg.c.client_request_id, retry: msg.c.retry } };
+      break;
+    case "WithdrawInputControlRequest":
+      obj = { t: msg.t, c: { client_request_id: msg.c.client_request_id } };
+      break;
+    case "InputControlRequestPending":
+      obj = { t: msg.t, c: { client_request_id: msg.c.client_request_id, request_id: msg.c.request_id, state: msg.c.state } };
+      break;
+    case "InputControlRequestResult":
+      obj = { t: msg.t, c: { client_request_id: msg.c.client_request_id, request_id: msg.c.request_id, outcome: msg.c.outcome } };
+      break;
+    case "InputControlRequested":
+      obj = { t: msg.t, c: { request_id: msg.c.request_id, from_session: msg.c.from_session, expires_in_ms: msg.c.expires_in_ms } };
+      break;
+    case "InputControlPromptShown":
+      obj = { t: msg.t, c: { request_id: msg.c.request_id } };
+      break;
+    case "AnswerInputControlRequest":
+      obj = { t: msg.t, c: { request_id: msg.c.request_id, accept: msg.c.accept } };
+      break;
+    case "InputControlRequestWithdrawn":
+      obj = { t: msg.t, c: { request_id: msg.c.request_id, reason: msg.c.reason } };
       break;
   }
   return encoder.encode(JSON.stringify(obj));
@@ -1374,6 +1472,81 @@ export function decodeControl(bytes: Uint8Array): ControlMessage {
         },
       };
     }
+    // docs/73 request-for-control. Every id must be a canonical UUID; a malformed or unknown value throws,
+    // exactly like the agent's decoder refuses it.
+    case "InputRequestCapable":
+      return { t: "InputRequestCapable", c: {} };
+    case "InputRequestAvailable": {
+      const c = obj.c as { available?: unknown } | undefined;
+      if (!c || typeof c.available !== "boolean") throw new Error("malformed InputRequestAvailable");
+      return { t: "InputRequestAvailable", c: { available: c.available } };
+    }
+    case "RequestInputControl": {
+      const c = obj.c as { client_request_id?: unknown; retry?: unknown } | undefined;
+      if (!c || (c.retry !== undefined && typeof c.retry !== "boolean")) throw new Error("malformed RequestInputControl");
+      return { t: "RequestInputControl", c: { client_request_id: requireUuid(c.client_request_id, "RequestInputControl"), retry: c.retry === true } };
+    }
+    case "WithdrawInputControlRequest": {
+      const c = obj.c as { client_request_id?: unknown } | undefined;
+      if (!c) throw new Error("malformed WithdrawInputControlRequest");
+      return { t: "WithdrawInputControlRequest", c: { client_request_id: requireUuid(c.client_request_id, "WithdrawInputControlRequest") } };
+    }
+    case "InputControlRequestPending": {
+      const c = obj.c as { client_request_id?: unknown; request_id?: unknown; state?: unknown } | undefined;
+      if (!c || !INPUT_REQUEST_STATES.includes(c.state as InputRequestState)) throw new Error("malformed InputControlRequestPending");
+      return {
+        t: "InputControlRequestPending",
+        c: {
+          client_request_id: requireUuid(c.client_request_id, "InputControlRequestPending"),
+          request_id: requireUuid(c.request_id, "InputControlRequestPending"),
+          state: c.state as InputRequestState,
+        },
+      };
+    }
+    case "InputControlRequestResult": {
+      const c = obj.c as { client_request_id?: unknown; request_id?: unknown; outcome?: unknown } | undefined;
+      if (!c || !INPUT_REQUEST_OUTCOMES.includes(c.outcome as InputRequestOutcome) || c.outcome === "requester_left") {
+        throw new Error("malformed InputControlRequestResult");
+      }
+      const requestId = c.request_id == null ? null : requireUuid(c.request_id, "InputControlRequestResult");
+      const outcome = c.outcome as InputRequestOutcome;
+      if ((requestId === null && RESULT_NEEDS_ID.includes(outcome)) || (requestId !== null && RESULT_FORBIDS_ID.includes(outcome))) {
+        throw new Error("malformed InputControlRequestResult");
+      }
+      return {
+        t: "InputControlRequestResult",
+        c: { client_request_id: requireUuid(c.client_request_id, "InputControlRequestResult"), request_id: requestId, outcome },
+      };
+    }
+    case "InputControlRequested": {
+      const c = obj.c as { request_id?: unknown; from_session?: unknown; expires_in_ms?: unknown } | undefined;
+      if (!c || !Number.isInteger(c.expires_in_ms) || (c.expires_in_ms as number) < 0 || (c.expires_in_ms as number) > MAX_REQUEST_EXPIRES_IN_MS) {
+        throw new Error("malformed InputControlRequested");
+      }
+      return {
+        t: "InputControlRequested",
+        c: {
+          request_id: requireUuid(c.request_id, "InputControlRequested"),
+          from_session: requireSessionId(c.from_session, "InputControlRequested"),
+          expires_in_ms: c.expires_in_ms as number,
+        },
+      };
+    }
+    case "InputControlPromptShown": {
+      const c = obj.c as { request_id?: unknown } | undefined;
+      if (!c) throw new Error("malformed InputControlPromptShown");
+      return { t: "InputControlPromptShown", c: { request_id: requireUuid(c.request_id, "InputControlPromptShown") } };
+    }
+    case "AnswerInputControlRequest": {
+      const c = obj.c as { request_id?: unknown; accept?: unknown } | undefined;
+      if (!c || typeof c.accept !== "boolean") throw new Error("malformed AnswerInputControlRequest");
+      return { t: "AnswerInputControlRequest", c: { request_id: requireUuid(c.request_id, "AnswerInputControlRequest"), accept: c.accept } };
+    }
+    case "InputControlRequestWithdrawn": {
+      const c = obj.c as { request_id?: unknown; reason?: unknown } | undefined;
+      if (!c || !INPUT_REQUEST_OUTCOMES.includes(c.reason as InputRequestOutcome)) throw new Error("malformed InputControlRequestWithdrawn");
+      return { t: "InputControlRequestWithdrawn", c: { request_id: requireUuid(c.request_id, "InputControlRequestWithdrawn"), reason: c.reason as InputRequestOutcome } };
+    }
     default:
       throw new Error(`unknown control variant ${String(obj.t)}`);
   }
@@ -1709,6 +1882,8 @@ export class ControlClient {
   private readonly onInputHandoffAvailable?: (available: boolean) => void;
   /** docs/61: the authoritative snapshot of who owns input (sent on every change and at join). */
   private readonly onInputControlChanged?: (ownerSession: string | null, mode: InputControlMode) => void;
+  /** docs/73: every agent → viewer request-for-control message (only sent after `announceInputRequestCapable`). */
+  private readonly onInputRequestMessage?: (msg: InputRequestAgentMessage) => void;
   /**
    * Optional callback fired when the agent accepts a `SelectMonitor` and reports the monotonic
    * epoch (`selection_gen`) assigned to this transition.  The controller MUST register a
@@ -1787,6 +1962,7 @@ export class ControlClient {
       onAdminRightsResult?: (state: AdminRightsState, reason: string | null) => void;
       onInputHandoffAvailable?: (available: boolean) => void;
       onInputControlChanged?: (ownerSession: string | null, mode: InputControlMode) => void;
+      onInputRequestMessage?: (msg: InputRequestAgentMessage) => void;
       onSelectMonitorAccepted?: (selectionGen: number) => void;
       onMonitorPinned?: (monitorId: number) => void;
       onMonitorCanvas?: (canvas: MonitorCanvas) => void;
@@ -1827,6 +2003,7 @@ export class ControlClient {
     this.onAdminRightsResult = handlers.onAdminRightsResult;
     this.onInputHandoffAvailable = handlers.onInputHandoffAvailable;
     this.onInputControlChanged = handlers.onInputControlChanged;
+    this.onInputRequestMessage = handlers.onInputRequestMessage;
     this.onSelectMonitorAccepted = handlers.onSelectMonitorAccepted;
     this.onMonitorPinned = handlers.onMonitorPinned;
     this.onMonitorCanvas = handlers.onMonitorCanvas;
@@ -2092,6 +2269,35 @@ export class ControlClient {
     this.send(encodeControl({ t: "HandInputControl", c: { to_session: toSession } }));
   }
 
+  /**
+   * docs/73: announce that this viewer implements request-for-control. Call once per session after joining,
+   * and only from a viewer that handles every `InputRequestAgentMessage`: the agent sends none of them to a
+   * session that did not announce, because a viewer fails the whole session on an undecodable control message.
+   */
+  announceInputRequestCapable(): void {
+    this.send(encodeControl({ t: "InputRequestCapable", c: {} }));
+  }
+
+  /** docs/73: ask the input owner for control. Re-send with `retry: true` and the SAME id after 3 s without a reply. */
+  requestInputControl(clientRequestId: string, retry = false): void {
+    this.send(encodeControl({ t: "RequestInputControl", c: { client_request_id: clientRequestId, retry } }));
+  }
+
+  /** docs/73: withdraw a request that the holder has not accepted yet. */
+  withdrawInputControlRequest(clientRequestId: string): void {
+    this.send(encodeControl({ t: "WithdrawInputControlRequest", c: { client_request_id: clientRequestId } }));
+  }
+
+  /** docs/73 (holder): the prompt for `requestId` was rendered. */
+  inputControlPromptShown(requestId: string): void {
+    this.send(encodeControl({ t: "InputControlPromptShown", c: { request_id: requestId } }));
+  }
+
+  /** docs/73 (holder): accept (hand input control to the requester) or decline. */
+  answerInputControlRequest(requestId: string, accept: boolean): void {
+    this.send(encodeControl({ t: "AnswerInputControlRequest", c: { request_id: requestId, accept } }));
+  }
+
   /** The monitors most recently advertised by the agent. */
   get monitors(): readonly MonitorDesc[] {
     return this.lastMonitors;
@@ -2218,6 +2424,13 @@ export class ControlClient {
         break;
       case "InputControlChanged":
         this.onInputControlChanged?.(msg.c.owner_session, msg.c.mode);
+        break;
+      case "InputRequestAvailable":
+      case "InputControlRequestPending":
+      case "InputControlRequestResult":
+      case "InputControlRequested":
+      case "InputControlRequestWithdrawn":
+        this.onInputRequestMessage?.(msg);
         break;
       case "SelectMonitorAccepted":
         this.onSelectMonitorAccepted?.(msg.c.selection_gen);

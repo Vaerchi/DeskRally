@@ -32,6 +32,8 @@ pub(crate) mod backstage_worker;
 pub(crate) mod upload_root;
 pub(crate) mod upload_writer;
 pub(crate) mod input_arbiter;
+pub(crate) mod input_request;
+pub(crate) mod request_wire;
 pub(crate) mod session_directory;
 pub mod attend;
 pub mod attend_wait;

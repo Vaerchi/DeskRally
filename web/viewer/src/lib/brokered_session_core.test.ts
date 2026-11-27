@@ -794,3 +794,45 @@ describe("run receipt negotiation and relay", () => {
     expect(f.api.postRunReceipt).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("BrokeredSessionCore and docs/73 request-for-control", () => {
+  const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+
+  it("a bulk run never announces InputRequestCapable, and survives every new agent message anyway", async () => {
+    const f = setup();
+    // The REAL ControlClient (no makeControl): whatever it would send reaches transport.send.
+    const deps: BrokeredSessionCoreDeps = { ...f.deps, makeControl: undefined };
+    const opening = BrokeredSessionCore.open("device-1", deps);
+    void opening.then((core) => { f.cores.push(core); }, () => {});
+    await drain();
+    f.events.onStateChange?.("connected");
+    f.events.onChannelOpen?.();
+    await drain();
+    f.events.onMessage?.(ChannelId.Control, encodeControl({
+      t: "SessionPolicyInstalled",
+      c: { access: "control", view_only: false, allow_recording: true, require_recording: false, max_session_duration_seconds: 0 },
+    }));
+    const core = await opening;
+    const sentControl = f.transport.send.mock.calls
+      .filter(([channel]) => channel === ChannelId.Control)
+      .map(([, payload]) => dec(payload as Uint8Array));
+    expect(sentControl.length).toBeGreaterThan(0); // policy install, backstage features: the client does send
+    expect(sentControl.filter((s) => s.includes("InputRequestCapable"))).toEqual([]);
+    // Even if an agent sent the new messages regardless, they decode, reach no handler, and fail nothing.
+    const cid = "aaaaaaaa-1111-4222-8333-444444444444";
+    const rid = "bbbbbbbb-5555-4666-8777-888888888888";
+    for (const m of [
+      { t: "InputRequestAvailable", c: { available: true } },
+      { t: "InputControlRequestPending", c: { client_request_id: cid, request_id: rid, state: "shown" } },
+      { t: "InputControlRequestResult", c: { client_request_id: cid, request_id: rid, outcome: "granted" } },
+      { t: "InputControlRequested", c: { request_id: rid, from_session: "s-1", expires_in_ms: 30000 } },
+      { t: "InputControlRequestWithdrawn", c: { request_id: rid, reason: "declined" } },
+    ] as const) {
+      f.events.onMessage?.(ChannelId.Control, encodeControl(m));
+    }
+    await drain();
+    expect(f.api.endSession).not.toHaveBeenCalled();
+    expect(f.transport.close).not.toHaveBeenCalled();
+    expect(core.sessionId).toBe("session-1");
+  });
+});

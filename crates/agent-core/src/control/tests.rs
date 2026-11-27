@@ -1621,3 +1621,84 @@ fn run_receipt_wire_keeps_legacy_dispatch_and_uses_flat_signed_claims() {
     assert_eq!(decode(&encoded).unwrap(), receipt);
     assert_eq!(observer_rule(&receipt), ObserverRule::Refuse);
 }
+
+/// docs/73 2.2.2: every request-for-control message round-trips byte-for-byte against the vectors the
+/// viewer codec also reads (`crates/protocol/testdata/input-request-control-vectors.json`), and the
+/// malformed ones are refused at decode.
+#[test]
+fn input_request_messages_match_the_shared_vectors() {
+    let doc: serde_json::Value =
+        serde_json::from_str(include_str!("../../../protocol/testdata/input-request-control-vectors.json")).unwrap();
+    let vectors = doc["vectors"].as_array().unwrap();
+    assert!(vectors.len() >= 40, "the fixture is not empty");
+    for v in vectors {
+        let wire = v["wire"].as_str().unwrap();
+        let msg = decode(wire.as_bytes()).unwrap_or_else(|e| panic!("{}: {e}", v["name"]));
+        assert_eq!(encode(&msg), wire.as_bytes(), "{}", v["name"]);
+    }
+    for v in doc["invalid"].as_array().unwrap() {
+        assert!(decode(v["wire"].as_str().unwrap().as_bytes()).is_err(), "{} must be refused", v["name"]);
+    }
+}
+
+/// The ten terminal outcomes, the six refusals, `unknown` and `requester_left` are exactly these strings.
+#[test]
+fn input_request_outcome_strings_are_pinned() {
+    use InputRequestOutcome::*;
+    let all = [
+        (Granted, "granted"),
+        (Declined, "declined"),
+        (Expired, "expired"),
+        (Undelivered, "undelivered"),
+        (Cancelled, "cancelled"),
+        (Replaced, "replaced"),
+        (HolderChanged, "holder_changed"),
+        (AlreadySatisfied, "already_satisfied"),
+        (Failed, "failed"),
+        (Ineligible, "ineligible"),
+        (NoHolder, "no_holder"),
+        (Busy, "busy"),
+        (RateLimited, "rate_limited"),
+        (Capacity, "capacity"),
+        (UnsupportedHolder, "unsupported_holder"),
+        (Unknown, "unknown"),
+        (RequesterLeft, "requester_left"),
+    ];
+    for (o, s) in all {
+        assert_eq!(serde_json::to_string(&o).unwrap(), format!("\"{s}\""));
+    }
+}
+
+/// An observer may announce; its requests and answers reach the handler; the agent-originated ones
+/// are refused from any controller.
+#[test]
+fn input_request_messages_have_observer_rules() {
+    let id = "aaaaaaaa-1111-4222-8333-444444444444".to_string();
+    assert_eq!(observer_rule(&ControlMessage::InputRequestCapable {}), ObserverRule::Allow);
+    for m in [
+        ControlMessage::RequestInputControl { client_request_id: id.clone(), retry: false },
+        ControlMessage::WithdrawInputControlRequest { client_request_id: id.clone() },
+        ControlMessage::InputControlPromptShown { request_id: id.clone() },
+        ControlMessage::AnswerInputControlRequest { request_id: id.clone(), accept: true },
+    ] {
+        assert_eq!(observer_rule(&m), ObserverRule::ViewOnlyGated, "{m:?}");
+    }
+    for m in [
+        ControlMessage::InputRequestAvailable { available: true },
+        ControlMessage::InputControlRequestPending {
+            client_request_id: id.clone(),
+            request_id: id.clone(),
+            state: InputRequestState::Shown,
+        },
+        ControlMessage::InputControlRequestResult {
+            client_request_id: id.clone(),
+            request_id: None,
+            outcome: InputRequestOutcome::Busy,
+        },
+        ControlMessage::InputControlRequested { request_id: id.clone(), from_session: "s".into(), expires_in_ms: 1 },
+        ControlMessage::InputControlRequestWithdrawn { request_id: id, reason: InputRequestOutcome::Failed },
+    ] {
+        assert_eq!(observer_rule(&m), ObserverRule::Refuse, "{m:?}");
+    }
+}
+

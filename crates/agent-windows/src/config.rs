@@ -72,6 +72,14 @@ pub struct HelperConfig {
     /// Recordings stay in the service-owned folder; no caller paths are accepted.
     #[serde(default)]
     pub allow_cli_recording: bool,
+    /// docs/73 request-for-control: advertise and answer `InputRequestCapable`, route the request
+    /// messages, and seal the `input_control_requested` / `input_control_request_closed` audit kinds.
+    /// **OFF by default.** A release that carries this code must not emit those audit kinds before the
+    /// control plane can decode them (an old decoder refuses an unknown kind and wedges the chain), so the
+    /// operator turns it on only after the decoder ships (config.json `"input_request_v1": true`). Off means
+    /// the agent behaves exactly as before: the announce and every request message are dropped silently.
+    #[serde(default)]
+    pub input_request_v1: bool,
     /// Signaling WebSocket URL. `None`/absent ⇒ streaming disabled (proof-loop fallback).
     #[serde(default)]
     pub signaling_url: Option<String>,
@@ -863,6 +871,19 @@ mod tests {
         assert_eq!((q.max_bitrate_bps, q.max_fps, q.adaptive), (None, None, None));
     }
 
+    /// docs/73: `input_request_v1` is OFF unless the operator turns it on (a release that carries the
+    /// code must not emit the new audit kinds before the control plane can decode them).
+    #[test]
+    fn input_request_v1_defaults_off_and_is_read_from_the_config() {
+        let absent: HelperConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.input_request_v1);
+        assert!(!HelperConfig::default().input_request_v1);
+        let on: HelperConfig = serde_json::from_str(r#"{"input_request_v1": true}"#).unwrap();
+        assert!(on.input_request_v1);
+        let round: HelperConfig = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(round.input_request_v1);
+    }
+
     #[test]
     fn a_pre_m3_config_still_parses() {
         // Existing installs have none of the M3 keys; they must keep loading untouched.
@@ -907,6 +928,7 @@ mod tests {
 
         let cfg = HelperConfig {
             allow_cli_recording: true,
+            input_request_v1: true,
             signaling_url: Some("ws://loopback/ws".into()),
             device_id: Some("11111111-1111-1111-1111-111111111111".into()),
             stun: vec!["stun:example:3478".into()],

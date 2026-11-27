@@ -7,6 +7,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { ShellClient, type ShellState } from "../lib/shell_client";
+import { terminalKeyAction } from "../lib/terminal_keys";
 
 export interface TerminalPanelProps {
   machineName: string;
@@ -32,6 +33,17 @@ export function TerminalPanel({ machineName, openChannel }: TerminalPanelProps) 
     fitRef.current = fit;
     if (hostRef.current) term.open(hostRef.current);
     const sub = term.onData((d) => clientRef.current?.input(d));
+    // Paste and copy are the console's job, not the shell's (lib/terminal_keys.ts). Returning false makes xterm skip
+    // the key without cancelling it, so a paste reaches xterm's own paste handler and is sent to the shell as input.
+    term.attachCustomKeyEventHandler((e) => {
+      const action = terminalKeyAction(e, term.hasSelection());
+      if (action === "copy") {
+        e.preventDefault();
+        void navigator.clipboard?.writeText(term.getSelection()).catch(() => {});
+        return false;
+      }
+      return action === "terminal";
+    });
     const ro = new ResizeObserver(() => {
       try {
         fit.fit();
